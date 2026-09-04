@@ -37,6 +37,16 @@ def require_fields(file_name, value, paths, label):
             )
 
 
+def require_declared_property(file_name, definition, property_name, label):
+    schema = json.loads((SCHEMA_DIR / file_name).read_text())
+    properties = schema.get("definitions", {}).get(definition, {}).get("properties", {})
+    if property_name not in properties:
+        raise SystemExit(
+            f"{label} requires declared {definition}.{property_name}, "
+            f"but {file_name} does not define it"
+        )
+
+
 def request(method, params):
     return {"id": 1, "method": method, "params": params}
 
@@ -84,12 +94,15 @@ client_requests = [
             "cwd": "/workspace/work/example",
             "limit": 2,
             "sortDirection": "asc",
-            "sourceKinds": ["appServer"],
+            "sourceKinds": ["vscode"],
         },
     ),
     request("thread/name/set", {"threadId": "thread-1", "name": "example"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
+    request("thread/read", {"threadId": "thread-1"}),
+    request("thread/read", {"threadId": "thread-1"}),
+    request("thread/loaded/list", {"limit": 100}),
     request(
         "thread/turns/list",
         {"threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": "full"},
@@ -242,12 +255,14 @@ thread = {
     "createdAt": 1,
     "cwd": "/workspace/work/example",
     "ephemeral": False,
+    "historyMode": "paginated",
     "id": "thread-1",
     "modelProvider": "openai",
+    "path": "/workspace/.codex/session.jsonl",
     "preview": "example",
     "projectId": None,
     "sessionId": "session-1",
-    "source": "appServer",
+    "source": "vscode",
     "status": {"type": "idle"},
     "turns": [],
     "updatedAt": 1,
@@ -306,6 +321,16 @@ common_start = {
 validate("v2/ThreadStartResponse.json", common_start, "thread/start result")
 validate("v2/ThreadResumeResponse.json", common_start, "thread/resume result")
 validate("v2/ThreadListResponse.json", {"data": [thread]}, "thread/list result")
+validate(
+    "v2/ThreadLoadedListResponse.json",
+    {"data": ["thread-1"], "nextCursor": None},
+    "thread/loaded/list result",
+)
+validate(
+    "v2/ThreadLoadedListParams.json",
+    {"limit": 100, "cursor": "next-page"},
+    "thread/loaded/list pagination params",
+)
 validate("v2/ThreadReadResponse.json", {"thread": thread}, "thread/read result")
 validate(
     "v2/ThreadTurnsListResponse.json",
@@ -352,9 +377,24 @@ for file_name, value, paths, label in [
         "thread/list result",
     ),
     (
+        "v2/ThreadLoadedListResponse.json",
+        {"data": ["thread-1"], "nextCursor": None},
+        [["data"]],
+        "thread/loaded/list result",
+    ),
+    (
         "v2/ThreadReadResponse.json",
         {"thread": thread},
-        [["thread"], ["thread", "id"], ["thread", "cwd"]],
+        [
+            ["thread"],
+            ["thread", "id"],
+            ["thread", "cwd"],
+            ["thread", "source"],
+            ["thread", "ephemeral"],
+            ["thread", "preview"],
+            ["thread", "status"],
+            ["thread", "turns"],
+        ],
         "thread/read result",
     ),
     (
@@ -371,6 +411,13 @@ for file_name, value, paths, label in [
     ),
 ]:
     require_fields(file_name, value, paths, label)
+
+# Thread.path is intentionally nullable for remote and ephemeral Codex threads,
+# but the portal requires the property to exist and validates a non-null path at
+# runtime for its local persistent App Server threads.
+require_declared_property(
+    "v2/ThreadReadResponse.json", "Thread", "path", "thread/read result"
+)
 
 for message in server_requests:
     require_fields(

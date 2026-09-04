@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -152,7 +154,109 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestOpenThreadDoesNotReplaceMissingPersistedThread(t *testing.T) {
+	var startCalls atomic.Int32
+	done := make(chan struct{})
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		defer close(done)
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		if request["method"] != "thread/resume" {
+			return fmt.Errorf("expected thread/resume, got %v", request["method"])
+		}
+		if err := writeObject(connection, map[string]any{
+			"id":    request["id"],
+			"error": map[string]any{"code": -32001, "message": "thread not found"},
+		}); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		_, data, err := connection.Read(ctx)
+		if err != nil {
+			return nil
+		}
+		var followUp map[string]any
+		if err := json.Unmarshal(data, &followUp); err != nil {
+			return err
+		}
+		if followUp["method"] == "thread/start" {
+			startCalls.Add(1)
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.OpenThread(
+		ctx,
+		"persisted-thread",
+		"/workspace/work/example",
+		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "thread not found") {
+		t.Fatalf("missing persisted thread result = %v", err)
+	}
+	<-done
+	if startCalls.Load() != 0 {
+		t.Fatal("missing persisted thread was replaced")
+	}
+}
+
+func TestLoadedThreadIDsFollowsEveryPage(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for pageNumber := 0; pageNumber < 2; pageNumber++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != "thread/loaded/list" {
+				return fmt.Errorf("expected thread/loaded/list, got %v", request["method"])
+			}
+			params, _ := request["params"].(map[string]any)
+			if params["limit"] != float64(100) {
+				return fmt.Errorf("loaded-thread limit = %v", params["limit"])
+			}
+			result := map[string]any{"data": []any{"thread-1"}, "nextCursor": "page-2"}
+			if pageNumber == 1 {
+				if params["cursor"] != "page-2" {
+					return fmt.Errorf("loaded-thread cursor = %v", params["cursor"])
+				}
+				result = map[string]any{"data": []any{"thread-2"}, "nextCursor": nil}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ids, err := client.loadedThreadIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(ids, ",") != "thread-1,thread-2" {
+		t.Fatalf("loaded threads = %#v", ids)
+	}
+}
+
 func TestListResponsesFailClosedWhenDataIsMissing(t *testing.T) {
+	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name string
 		run  func(context.Context, *Client) error
@@ -160,7 +264,7 @@ func TestListResponsesFailClosedWhenDataIsMissing(t *testing.T) {
 		{
 			name: "thread list",
 			run: func(ctx context.Context, client *Client) error {
-				_, err := client.EnsureThread(ctx, "", "/workspace/work/example", nil)
+				_, err := client.RecoverCreatingThread(ctx, "", "/workspace/work/example", nil)
 				return err
 			},
 		},
@@ -180,7 +284,7 @@ func TestListResponsesFailClosedWhenDataIsMissing(t *testing.T) {
 		{
 			name: "initial message turns",
 			run: func(ctx context.Context, client *Client) error {
-				return client.EnsureInitialMessage(ctx, "thread-1", "initial request")
+				return client.EnsureInitialMessage(ctx, "thread-1", "/workspace/work/example", "initial request", false)
 			},
 		},
 		{
@@ -213,7 +317,7 @@ func TestListResponsesFailClosedWhenDataIsMissing(t *testing.T) {
 					switch request["method"] {
 					case "thread/read":
 						result["thread"] = map[string]any{
-							"id": "thread-1", "cwd": "/workspace/work/example",
+							"id": "thread-1", "cwd": "/workspace/work/example", "path": rollout,
 						}
 					case "thread/resume":
 						result["thread"] = map[string]any{
@@ -423,6 +527,7 @@ func TestFileChangeApprovalRequiresTheMatchingThreadItem(t *testing.T) {
 
 func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 	var turnStarted atomic.Int32
+	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
@@ -438,7 +543,18 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
 					return err
 				}
+			case "thread/read":
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"thread": freshThreadMetadata("thread-1", "/workspace/work/example", rollout),
+					},
+				}); err != nil {
+					return err
+				}
 			case "thread/turns/list":
+				if !initialExists {
+					return errors.New("history was listed before the first turn materialized it")
+				}
 				turns := []any{}
 				if initialExists {
 					turns = []any{map[string]any{"items": []any{map[string]any{
@@ -451,6 +567,9 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 			case "turn/start":
 				turnStarted.Add(1)
 				initialExists = true
+				if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+					return err
+				}
 				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
 					return err
 				}
@@ -464,14 +583,384 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := client.EnsureInitialMessage(ctx, "thread-1", "initial goal"); err != nil {
+	if err := client.EnsureInitialMessage(ctx, "thread-1", "/workspace/work/example", "initial goal", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.EnsureInitialMessage(ctx, "thread-1", "initial goal"); err != nil {
+	if err := client.EnsureInitialMessage(ctx, "thread-1", "/workspace/work/example", "initial goal", false); err != nil {
 		t.Fatal(err)
 	}
 	if turnStarted.Load() != 1 {
 		t.Fatalf("initial turn started %d times", turnStarted.Load())
+	}
+}
+
+func TestConfiguredCodexFreshThreadContract(t *testing.T) {
+	binary := os.Getenv("VPSFREE_CODEX_TEST_BINARY")
+	if binary == "" {
+		t.Skip("VPSFREE_CODEX_TEST_BINARY is not configured")
+	}
+	directory, err := os.MkdirTemp("/tmp", "workspace-codex-contract-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	home := filepath.Join(directory, "home")
+	codexHome := filepath.Join(home, ".codex")
+	cwd := filepath.Join(directory, "workspace", "work", "example")
+	for _, path := range []string{codexHome, cwd} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	socket := filepath.Join(directory, "app-server.sock")
+	command := exec.Command(binary, "app-server", "--listen", "unix://"+socket)
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "HOME=") && !strings.HasPrefix(entry, "CODEX_HOME=") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, "HOME="+home, "CODEX_HOME="+codexHome)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+		}
+		_ = command.Wait()
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if info, statErr := os.Stat(socket); statErr == nil && info.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		if command.ProcessState != nil || time.Now().After(deadline) {
+			t.Fatalf("Codex App Server did not create its socket: %s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	threadID, err := client.StartThread(ctx, cwd, map[string]string{
+		"VPSFREE_DEV_SESSION_WORKSPACE": filepath.Join(directory, "workspace"),
+	})
+	if err != nil {
+		t.Fatalf("start exact Codex thread: %v\n%s", err, output.String())
+	}
+	materialized, err := client.threadHistoryMaterialized(ctx, threadID, cwd)
+	if err != nil {
+		t.Fatalf("read exact fresh Codex thread: %v\n%s", err, output.String())
+	}
+	if materialized {
+		t.Fatal("exact Codex materialized a fresh thread before its first user turn")
+	}
+	recoveredID, err := client.RecoverCreatingThread(ctx, threadID, cwd, map[string]string{
+		"VPSFREE_DEV_SESSION_WORKSPACE": filepath.Join(directory, "workspace"),
+	})
+	if err != nil {
+		t.Fatalf("reconcile exact fresh Codex thread: %v\n%s", err, output.String())
+	}
+	if recoveredID != threadID {
+		t.Fatalf("reconciled exact fresh thread %q as %q", threadID, recoveredID)
+	}
+	const goal = "workspace portal protocol contract"
+	if err := client.EnsureInitialMessage(ctx, threadID, cwd, goal, true); err != nil {
+		t.Fatalf("start exact Codex initial turn: %v\n%s", err, output.String())
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		materialized, err = client.threadHistoryMaterialized(ctx, threadID, cwd)
+		if err == nil && materialized {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("exact Codex did not materialize initial history: %v\n%s", err, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		err = client.EnsureInitialMessage(ctx, threadID, cwd, goal, false)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("verify exact Codex initial history: %v\n%s", err, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var history struct {
+		Data []struct {
+			Items []struct {
+				Type    string `json:"type"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := client.Request(ctx, "thread/turns/list", map[string]any{
+		"threadId": threadID, "limit": 10, "sortDirection": "asc", "itemsView": "full",
+	}, &history); err != nil {
+		t.Fatalf("list exact Codex initial history: %v\n%s", err, output.String())
+	}
+	var userRequests []string
+	for _, turn := range history.Data {
+		for _, item := range turn.Items {
+			if item.Type != "userMessage" {
+				continue
+			}
+			var parts []string
+			for _, content := range item.Content {
+				if content.Type == "text" {
+					parts = append(parts, content.Text)
+				}
+			}
+			userRequests = append(userRequests, strings.TrimSpace(strings.Join(parts, "\n")))
+		}
+	}
+	if len(userRequests) != 1 || userRequests[0] != goal {
+		t.Fatalf("exact Codex initial user requests = %#v", userRequests)
+	}
+}
+
+func TestEnsureInitialMessageRejectsInvalidUnmaterializedThreads(t *testing.T) {
+	loop := filepath.Join(t.TempDir(), "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "rollout.jsonl")
+	tests := []struct {
+		name    string
+		prepare func(map[string]any)
+		message string
+	}{
+		{"wrong id", func(thread map[string]any) { thread["id"] = "thread-2" }, "wrong thread"},
+		{"wrong cwd", func(thread map[string]any) { thread["cwd"] = "/workspace/work/other" }, "working directory"},
+		{"missing path", func(thread map[string]any) { delete(thread, "path") }, "no rollout path"},
+		{"null path", func(thread map[string]any) { thread["path"] = nil }, "no rollout path"},
+		{"relative path", func(thread map[string]any) { thread["path"] = "relative/rollout.jsonl" }, "invalid rollout path"},
+		{"stat error", func(thread map[string]any) { thread["path"] = loop }, "inspect Codex thread rollout"},
+		{"nonregular path", func(thread map[string]any) { thread["path"] = directory }, "not a regular file"},
+		{"wrong source", func(thread map[string]any) { thread["source"] = "cli" }, "not a fresh idle"},
+		{"missing ephemeral", func(thread map[string]any) { delete(thread, "ephemeral") }, "not a fresh idle"},
+		{"ephemeral", func(thread map[string]any) { thread["ephemeral"] = true }, "not a fresh idle"},
+		{"wrong history mode", func(thread map[string]any) { thread["historyMode"] = "loaded" }, "not a fresh idle"},
+		{"nonempty preview", func(thread map[string]any) { thread["preview"] = "started" }, "not a fresh idle"},
+		{"active", func(thread map[string]any) {
+			thread["status"] = map[string]any{"type": "active", "activeFlags": []any{}}
+		}, "not a fresh idle"},
+		{"missing turns", func(thread map[string]any) { delete(thread, "turns") }, "not a fresh idle"},
+		{"existing turn", func(thread map[string]any) { thread["turns"] = []any{map[string]any{"id": "turn-1"}} }, "not a fresh idle"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			var turnStarted atomic.Bool
+			thread := freshThreadMetadata("thread-1", "/workspace/work/example", missing)
+			testCase.prepare(thread)
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for requestNumber := 0; requestNumber < 1; requestNumber++ {
+					request, err := readObject(connection)
+					if err != nil {
+						return err
+					}
+					switch request["method"] {
+					case "thread/resume":
+						err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}})
+					case "thread/read":
+						err = writeObject(connection, map[string]any{
+							"id": request["id"], "result": map[string]any{"thread": thread},
+						})
+					case "turn/start":
+						turnStarted.Store(true)
+						return errors.New("invalid thread started a turn")
+					default:
+						return fmt.Errorf("unexpected request %v", request["method"])
+					}
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := New(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.EnsureInitialMessage(
+				ctx, "thread-1", "/workspace/work/example", "initial goal", true,
+			)
+			if err == nil || !strings.Contains(err.Error(), testCase.message) {
+				t.Fatalf("invalid thread result = %v, want %q", err, testCase.message)
+			}
+			if turnStarted.Load() {
+				t.Fatal("invalid thread started a turn")
+			}
+		})
+	}
+}
+
+func TestEnsureInitialMessageDoesNotRepeatAfterAnAmbiguousSubmission(t *testing.T) {
+	var connections atomic.Int32
+	var turnStarted atomic.Int32
+	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		connectionNumber := connections.Add(1)
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for requestNumber := 0; requestNumber < 3; requestNumber++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			switch request["method"] {
+			case "thread/resume":
+				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}})
+			case "thread/read":
+				thread := freshThreadMetadata("thread-1", "/workspace/work/example", rollout)
+				if connectionNumber > 1 {
+					return writeObject(connection, map[string]any{
+						"id": request["id"], "result": map[string]any{"thread": thread},
+					})
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": thread},
+				})
+			case "turn/start":
+				turnStarted.Add(1)
+				return connection.Close(websocket.StatusInternalError, "lost turn/start response")
+			default:
+				return fmt.Errorf("unexpected request %v", request["method"])
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first := New(socket)
+	if err := first.EnsureInitialMessage(ctx, "thread-1", "/workspace/work/example", "initial goal", true); err == nil {
+		t.Fatal("lost turn/start response unexpectedly succeeded")
+	}
+	first.Close()
+	second := New(socket)
+	defer second.Close()
+	err := second.EnsureInitialMessage(ctx, "thread-1", "/workspace/work/example", "initial goal", false)
+	if err == nil || !strings.Contains(err.Error(), "may already have been accepted") {
+		t.Fatalf("ambiguous unmaterialized retry result = %v", err)
+	}
+	if turnStarted.Load() != 1 {
+		t.Fatalf("initial turn started %d times", turnStarted.Load())
+	}
+}
+
+func TestEnsureInitialMessageRejectsConflictingMaterializedHistory(t *testing.T) {
+	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		items   []any
+		empty   bool
+		message string
+	}{
+		{
+			"different request",
+			[]any{map[string]any{
+				"type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "different"}},
+			}},
+			false,
+			"different initial request",
+		},
+		{
+			"multiple matching user requests",
+			[]any{
+				map[string]any{"type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "initial goal"}}},
+				map[string]any{"type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "initial goal"}}},
+			},
+			false,
+			"different initial request",
+		},
+		{
+			"non-text initial request",
+			[]any{map[string]any{
+				"type": "userMessage", "content": []any{map[string]any{"type": "image", "url": "file:///tmp/input.png"}},
+			}},
+			false,
+			"non-text initial request",
+		},
+		{"missing user request", []any{map[string]any{"type": "agentMessage", "text": "reply"}}, false, "without an initial user request"},
+		{"missing initial turn", nil, true, "has no initial turn"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			var turnStarted atomic.Bool
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for requestNumber := 0; requestNumber < 3; requestNumber++ {
+					request, err := readObject(connection)
+					if err != nil {
+						return err
+					}
+					switch request["method"] {
+					case "thread/resume":
+						err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}})
+					case "thread/read":
+						err = writeObject(connection, map[string]any{
+							"id": request["id"], "result": map[string]any{
+								"thread": freshThreadMetadata("thread-1", "/workspace/work/example", rollout),
+							},
+						})
+					case "thread/turns/list":
+						turns := []any{map[string]any{"items": testCase.items}}
+						if testCase.empty {
+							turns = []any{}
+						}
+						err = writeObject(connection, map[string]any{
+							"id": request["id"], "result": map[string]any{"data": turns},
+						})
+					case "turn/start":
+						turnStarted.Store(true)
+						return errors.New("conflicting history started a turn")
+					default:
+						return fmt.Errorf("unexpected request %v", request["method"])
+					}
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := New(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.EnsureInitialMessage(
+				ctx, "thread-1", "/workspace/work/example", "initial goal", false,
+			)
+			if err == nil || !strings.Contains(err.Error(), testCase.message) {
+				t.Fatalf("conflicting history result = %v, want %q", err, testCase.message)
+			}
+			if turnStarted.Load() {
+				t.Fatal("conflicting history started a turn")
+			}
+		})
 	}
 }
 
@@ -676,76 +1165,77 @@ func TestUnsupportedServerRequestIsRejectedAndSurfaced(t *testing.T) {
 	}
 }
 
-func TestEnsureThreadRecoversCommittedStartAndSetsSessionEnvironment(t *testing.T) {
+func TestRecoverCreatingThreadRecoversCommittedStartAndSetsSessionEnvironment(t *testing.T) {
 	var started atomic.Bool
 	var connections atomic.Int32
+	recoveredRollout := filepath.Join(t.TempDir(), "rollout.jsonl")
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
-		connectionNumber := connections.Add(1)
+		connections.Add(1)
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		request, err := readObject(connection)
-		if err != nil {
-			return err
-		}
-		if request["method"] != "thread/list" {
-			return errors.New("expected thread/list reconciliation")
-		}
-		data := []any{}
-		if started.Load() {
-			data = []any{map[string]any{"id": "thread-recovered", "cwd": "/workspace/work/example"}}
-		}
-		if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"data": data}}); err != nil {
-			return err
-		}
-		if started.Load() {
-			request, err = readObject(connection)
-			if err != nil || request["method"] != "thread/resume" {
-				return fmt.Errorf("expected recovered thread/resume: %v", err)
+		threadReads := 0
+		for {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
 			}
-			params := request["params"].(map[string]any)
-			if params["threadId"] != "thread-recovered" || params["cwd"] != "/workspace/work/example" {
-				return fmt.Errorf("invalid recovered resume params: %#v", params)
+			switch request["method"] {
+			case "thread/loaded/list":
+				data := []any{}
+				if started.Load() {
+					data = []any{"thread-recovered"}
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": data, "nextCursor": nil},
+				})
+			case "thread/list":
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{}},
+				})
+			case "thread/read":
+				threadReads++
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"thread": freshThreadMetadata(
+							"thread-recovered", "/workspace/work/example", recoveredRollout,
+						),
+					},
+				})
+				if err == nil && threadReads == 2 {
+					return nil
+				}
+			case "thread/start":
+				params := request["params"].(map[string]any)
+				config := params["config"].(map[string]any)
+				policy := config["shell_environment_policy"].(map[string]any)
+				environment := policy["set"].(map[string]any)
+				for name, expected := range map[string]any{
+					"VPSFREE_DEV_SESSION_SLUG":            "example",
+					"VPSFREE_DEV_SESSION_WORKSPACE":       "/workspace",
+					"VPSFREE_DEV_SESSION_WORK_DIR":        "/workspace/work/example",
+					"VPSFREE_DEV_SESSION_WORKTREES_DIR":   "/workspace/worktrees/example",
+					"VPSFREE_DEV_SESSION_PORTAL_BASE_URL": "https://workspace.example",
+					"VPSFREE_DEV_SESSION_URL":             "https://workspace.example/example/",
+					"VPSFREE_DEV_SESSION_AUTHORITY_DIR":   "/run/authority",
+					"VPSFREE_DEV_SESSION_TMUX_SOCKET":     "/run/tmux.sock",
+					"VPSFREE_DEV_SESSION_CODEX":           "/nix/store/codex/bin/codex",
+					"VPSFREE_DEV_SESSION_CODEX_SOCKET":    "/run/codex.sock",
+					"VPSFREE_DEV_SESSION_CODEX_VERSION":   protocolFixtureVersion,
+				} {
+					if environment[name] != expected {
+						return fmt.Errorf("session environment %s = %v, want %v", name, environment[name], expected)
+					}
+				}
+				started.Store(true)
+				return connection.Close(websocket.StatusInternalError, "lost result")
+			default:
+				return fmt.Errorf("unexpected request %v", request["method"])
 			}
-			return writeObject(connection, map[string]any{
-				"id": request["id"], "result": map[string]any{"thread": map[string]any{
-					"id": "thread-recovered", "cwd": "/workspace/work/example",
-				}},
-			})
-		}
-		request, err = readObject(connection)
-		if err != nil {
-			return err
-		}
-		if request["method"] != "thread/start" {
-			return errors.New("expected thread/start")
-		}
-		params := request["params"].(map[string]any)
-		config := params["config"].(map[string]any)
-		policy := config["shell_environment_policy"].(map[string]any)
-		environment := policy["set"].(map[string]any)
-		for name, expected := range map[string]any{
-			"VPSFREE_DEV_SESSION_SLUG":            "example",
-			"VPSFREE_DEV_SESSION_WORKSPACE":       "/workspace",
-			"VPSFREE_DEV_SESSION_WORK_DIR":        "/workspace/work/example",
-			"VPSFREE_DEV_SESSION_WORKTREES_DIR":   "/workspace/worktrees/example",
-			"VPSFREE_DEV_SESSION_PORTAL_BASE_URL": "https://workspace.example",
-			"VPSFREE_DEV_SESSION_URL":             "https://workspace.example/example/",
-			"VPSFREE_DEV_SESSION_AUTHORITY_DIR":   "/run/authority",
-			"VPSFREE_DEV_SESSION_TMUX_SOCKET":     "/run/tmux.sock",
-			"VPSFREE_DEV_SESSION_CODEX":           "/nix/store/codex/bin/codex",
-			"VPSFREE_DEV_SESSION_CODEX_SOCKET":    "/run/codex.sock",
-			"VPSFREE_DEV_SESSION_CODEX_VERSION":   protocolFixtureVersion,
-		} {
-			if environment[name] != expected {
-				return fmt.Errorf("session environment %s = %v, want %v", name, environment[name], expected)
+			if err != nil {
+				return err
 			}
 		}
-		started.Store(true)
-		if connectionNumber == 1 {
-			return connection.Close(websocket.StatusInternalError, "lost result")
-		}
-		return nil
 	})
 	environment := map[string]string{
 		"VPSFREE_DEV_SESSION_SLUG": "example", "VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
@@ -762,13 +1252,13 @@ func TestEnsureThreadRecoversCommittedStartAndSetsSessionEnvironment(t *testing.
 	first := New(socket)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := first.EnsureThread(ctx, "", "/workspace/work/example", environment); err == nil {
+	if _, err := first.RecoverCreatingThread(ctx, "", "/workspace/work/example", environment); err == nil {
 		t.Fatal("lost thread/start response unexpectedly succeeded")
 	}
 	first.Close()
 	second := New(socket)
 	defer second.Close()
-	id, err := second.EnsureThread(ctx, "", "/workspace/work/example", environment)
+	id, err := second.RecoverCreatingThread(ctx, "", "/workspace/work/example", environment)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -777,7 +1267,11 @@ func TestEnsureThreadRecoversCommittedStartAndSetsSessionEnvironment(t *testing.
 	}
 }
 
-func TestEnsureThreadResumesPersistedOwnerWithRuntimeConfiguration(t *testing.T) {
+func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *testing.T) {
+	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	environment := map[string]string{
 		"VPSFREE_DEV_SESSION_SLUG":            "example",
 		"VPSFREE_DEV_SESSION_WORKSPACE":       "/workspace",
@@ -791,6 +1285,37 @@ func TestEnsureThreadResumesPersistedOwnerWithRuntimeConfiguration(t *testing.T)
 			return err
 		}
 		request, err := readObject(connection)
+		if err != nil || request["method"] != "thread/loaded/list" {
+			return fmt.Errorf("expected persisted thread/loaded/list: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{}, "nextCursor": nil},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/list" {
+			return fmt.Errorf("expected persisted thread/list: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+				"id": "thread-original", "cwd": "/workspace/work/example",
+			}}},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/read" {
+			return fmt.Errorf("expected persisted thread/read: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"thread": freshThreadMetadata("thread-original", "/workspace/work/example", rollout),
+			},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
 		if err != nil || request["method"] != "thread/resume" {
 			return fmt.Errorf("expected persisted thread/resume: %v", err)
 		}
@@ -815,7 +1340,7 @@ func TestEnsureThreadResumesPersistedOwnerWithRuntimeConfiguration(t *testing.T)
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	id, err := client.EnsureThread(
+	id, err := client.RecoverCreatingThread(
 		ctx, "thread-original", "/workspace/work/example", environment,
 	)
 	if err != nil {
@@ -823,6 +1348,110 @@ func TestEnsureThreadResumesPersistedOwnerWithRuntimeConfiguration(t *testing.T)
 	}
 	if id != "thread-original" {
 		t.Fatalf("persisted thread id = %q", id)
+	}
+}
+
+func TestRecoverCreatingThreadReplacesPersistedOwnerMissingAfterRestart(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil || request["method"] != "thread/loaded/list" {
+			return fmt.Errorf("expected restart thread/loaded/list: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{}, "nextCursor": nil},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/list" {
+			return fmt.Errorf("expected restart thread/list: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{}},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/start" {
+			return fmt.Errorf("expected replacement thread/start: %v", err)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"thread": map[string]any{
+				"id": "thread-replacement", "cwd": "/workspace/work/example",
+			}},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := client.RecoverCreatingThread(
+		ctx, "thread-vanished", "/workspace/work/example", map[string]string{
+			"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "thread-replacement" {
+		t.Fatalf("replacement thread id = %q", id)
+	}
+}
+
+func TestRecoverCreatingThreadRejectsDifferentMaterializedCandidate(t *testing.T) {
+	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
+	if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil || request["method"] != "thread/loaded/list" {
+			return fmt.Errorf("expected thread/loaded/list: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{}, "nextCursor": nil},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/list" {
+			return fmt.Errorf("expected thread/list: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+				"id": "thread-unrelated", "cwd": "/workspace/work/example",
+			}}},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/read" {
+			return fmt.Errorf("expected thread/read: %v", err)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"thread": freshThreadMetadata("thread-unrelated", "/workspace/work/example", rollout),
+			},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.RecoverCreatingThread(
+		ctx,
+		"thread-vanished",
+		"/workspace/work/example",
+		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "different materialized") {
+		t.Fatalf("different materialized candidate result = %v", err)
 	}
 }
 
@@ -1186,6 +1815,14 @@ func writeObject(connection *websocket.Conn, value any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return connection.Write(ctx, websocket.MessageText, data)
+}
+
+func freshThreadMetadata(threadID, cwd string, path any) map[string]any {
+	return map[string]any{
+		"id": threadID, "cwd": cwd, "path": path, "preview": "", "source": "vscode",
+		"ephemeral": false, "historyMode": "paginated", "status": map[string]any{"type": "idle"},
+		"turns": []any{},
+	}
 }
 
 func waitFor(t *testing.T, condition func() bool) {

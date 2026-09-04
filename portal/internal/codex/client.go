@@ -957,11 +957,84 @@ func (c *Client) ResumeThread(ctx context.Context, threadID, cwd string, environ
 	return response.Thread.ID, nil
 }
 
-func (c *Client) EnsureThread(ctx context.Context, threadID, cwd string, environment map[string]string) (string, error) {
+func (c *Client) OpenThread(ctx context.Context, threadID, cwd string, environment map[string]string) (string, error) {
 	if threadID != "" {
 		return c.ResumeThread(ctx, threadID, cwd, environment)
 	}
+	return c.StartThread(ctx, cwd, environment)
+}
 
+func (c *Client) loadedThreadIDs(ctx context.Context) ([]string, error) {
+	ids := make([]string, 0)
+	seenCursors := make(map[string]struct{})
+	var cursor string
+	for {
+		params := map[string]any{"limit": 100}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var page struct {
+			Data       *[]string `json:"data"`
+			NextCursor *string   `json:"nextCursor"`
+		}
+		if err := c.Request(ctx, "thread/loaded/list", params, &page); err != nil {
+			return nil, err
+		}
+		if page.Data == nil {
+			return nil, errors.New("thread/loaded/list returned no data")
+		}
+		for _, id := range *page.Data {
+			if id == "" {
+				return nil, errors.New("thread/loaded/list returned an empty thread id")
+			}
+			ids = append(ids, id)
+		}
+		if page.NextCursor == nil {
+			return ids, nil
+		}
+		if *page.NextCursor == "" {
+			return nil, errors.New("thread/loaded/list returned an empty pagination cursor")
+		}
+		if _, exists := seenCursors[*page.NextCursor]; exists {
+			return nil, errors.New("thread/loaded/list repeated a pagination cursor")
+		}
+		seenCursors[*page.NextCursor] = struct{}{}
+		cursor = *page.NextCursor
+	}
+}
+
+func (c *Client) RecoverCreatingThread(ctx context.Context, threadID, cwd string, environment map[string]string) (string, error) {
+	candidates := make(map[string]struct{})
+	loaded, err := c.loadedThreadIDs(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, loadedID := range loaded {
+		var metadata struct {
+			Thread struct {
+				ID     string `json:"id"`
+				Cwd    string `json:"cwd"`
+				Source string `json:"source"`
+			} `json:"thread"`
+		}
+		if err := c.Request(ctx, "thread/read", map[string]any{"threadId": loadedID}, &metadata); err != nil {
+			current, listErr := c.loadedThreadIDs(ctx)
+			if listErr == nil && !slices.Contains(current, loadedID) {
+				continue
+			}
+			return "", err
+		}
+		if metadata.Thread.ID != loadedID {
+			return "", errors.New("thread/read returned the wrong loaded thread")
+		}
+		if loadedID == threadID &&
+			(metadata.Thread.Cwd != cwd || metadata.Thread.Source != "vscode") {
+			return "", errors.New("recorded creation thread has the wrong identity")
+		}
+		if metadata.Thread.Cwd == cwd && metadata.Thread.Source == "vscode" {
+			candidates[loadedID] = struct{}{}
+		}
+	}
 	var page struct {
 		Data *[]struct {
 			ID  string `json:"id"`
@@ -969,21 +1042,34 @@ func (c *Client) EnsureThread(ctx context.Context, threadID, cwd string, environ
 		} `json:"data"`
 	}
 	if err := c.Request(ctx, "thread/list", map[string]any{
-		"cwd": cwd, "limit": 2, "sortDirection": "asc", "sourceKinds": []string{"appServer"},
+		"cwd": cwd, "limit": 2, "sortDirection": "asc", "sourceKinds": []string{"vscode"},
 	}, &page); err != nil {
 		return "", err
 	}
 	if page.Data == nil {
 		return "", errors.New("thread/list returned no data")
 	}
-	if len(*page.Data) > 1 {
-		return "", fmt.Errorf("multiple Codex threads use creation directory %s; refusing ambiguous recovery", cwd)
-	}
-	if len(*page.Data) == 1 {
-		if (*page.Data)[0].ID == "" || (*page.Data)[0].Cwd != cwd {
+	for _, candidate := range *page.Data {
+		if candidate.ID == "" || candidate.Cwd != cwd {
 			return "", errors.New("thread/list returned an invalid creation candidate")
 		}
-		return c.ResumeThread(ctx, (*page.Data)[0].ID, cwd, environment)
+		candidates[candidate.ID] = struct{}{}
+	}
+	if len(candidates) > 1 {
+		return "", fmt.Errorf("multiple Codex threads use creation directory %s; refusing ambiguous recovery", cwd)
+	}
+	for candidateID := range candidates {
+		materialized, err := c.threadHistoryMaterialized(ctx, candidateID, cwd)
+		if err != nil {
+			return "", err
+		}
+		if candidateID != threadID && materialized {
+			return "", errors.New("refusing a different materialized Codex thread as a creation replacement")
+		}
+		if !materialized {
+			return candidateID, nil
+		}
+		return c.ResumeThread(ctx, candidateID, cwd, environment)
 	}
 	return c.StartThread(ctx, cwd, environment)
 }
@@ -1203,7 +1289,18 @@ func (c *Client) Send(ctx context.Context, threadID, text string) error {
 	return c.Request(ctx, "turn/start", map[string]any{"threadId": threadID, "input": input}, nil)
 }
 
-func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, text string) error {
+func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text string, allowUnmaterializedStart bool) error {
+	materialized, err := c.threadHistoryMaterialized(ctx, threadID, cwd)
+	if err != nil {
+		return err
+	}
+	input := []map[string]any{{"type": "text", "text": text}}
+	if !materialized {
+		if !allowUnmaterializedStart {
+			return errors.New("initial request may already have been accepted by the unmaterialized Codex thread")
+		}
+		return c.Request(ctx, "turn/start", map[string]any{"threadId": threadID, "input": input}, nil)
+	}
 	if err := c.resumeThread(ctx, threadID); err != nil {
 		return err
 	}
@@ -1226,26 +1323,96 @@ func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, text string
 	if page.Data == nil {
 		return errors.New("thread/turns/list returned no data")
 	}
-	if len(*page.Data) > 0 {
-		for _, item := range (*page.Data)[0].Items {
-			if item.Type != "userMessage" {
-				continue
-			}
-			var parts []string
-			for _, content := range item.Content {
-				if content.Type == "text" {
-					parts = append(parts, content.Text)
-				}
-			}
-			if strings.TrimSpace(strings.Join(parts, "\n")) == strings.TrimSpace(text) {
-				return nil
-			}
-			return errors.New("Codex thread already has a different initial request")
+	if len(*page.Data) == 0 {
+		return errors.New("materialized Codex thread has no initial turn")
+	}
+	var initialRequests []string
+	for _, item := range (*page.Data)[0].Items {
+		if item.Type != "userMessage" {
+			continue
 		}
+		var parts []string
+		for _, content := range item.Content {
+			if content.Type != "text" {
+				return errors.New("Codex thread has a non-text initial request")
+			}
+			parts = append(parts, content.Text)
+		}
+		initialRequests = append(initialRequests, strings.TrimSpace(strings.Join(parts, "\n")))
+	}
+	if len(initialRequests) == 0 {
 		return errors.New("Codex thread already has a turn without an initial user request")
 	}
-	input := []map[string]any{{"type": "text", "text": text}}
-	return c.Request(ctx, "turn/start", map[string]any{"threadId": threadID, "input": input}, nil)
+	if len(initialRequests) != 1 || initialRequests[0] != strings.TrimSpace(text) {
+		return errors.New("Codex thread already has a different initial request")
+	}
+	return nil
+}
+
+func (c *Client) threadHistoryMaterialized(ctx context.Context, threadID, cwd string) (bool, error) {
+	var metadata struct {
+		Thread struct {
+			ID          string            `json:"id"`
+			Cwd         string            `json:"cwd"`
+			Path        *string           `json:"path"`
+			Preview     string            `json:"preview"`
+			Source      string            `json:"source"`
+			Ephemeral   *bool             `json:"ephemeral"`
+			HistoryMode string            `json:"historyMode"`
+			Status      map[string]any    `json:"status"`
+			Turns       *[]map[string]any `json:"turns"`
+		} `json:"thread"`
+	}
+	if err := c.Request(ctx, "thread/read", map[string]any{"threadId": threadID}, &metadata); err != nil {
+		return false, err
+	}
+	if metadata.Thread.ID != threadID {
+		return false, errors.New("thread/read returned the wrong thread")
+	}
+	if metadata.Thread.Cwd != cwd {
+		return false, errors.New("thread/read returned the wrong working directory")
+	}
+	if metadata.Thread.Path == nil {
+		return false, errors.New("thread/read returned no rollout path")
+	}
+	path := *metadata.Thread.Path
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return false, errors.New("thread/read returned an invalid rollout path")
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		fresh := metadata.Thread.Source == "vscode" &&
+			metadata.Thread.Ephemeral != nil && !*metadata.Thread.Ephemeral &&
+			metadata.Thread.HistoryMode == "paginated" &&
+			metadata.Thread.Preview == "" &&
+			statusValue(metadata.Thread.Status) == "idle" &&
+			metadata.Thread.Turns != nil && len(*metadata.Thread.Turns) == 0
+		if !fresh {
+			turnCount := -1
+			if metadata.Thread.Turns != nil {
+				turnCount = len(*metadata.Thread.Turns)
+			}
+			ephemeral := "missing"
+			if metadata.Thread.Ephemeral != nil {
+				ephemeral = fmt.Sprint(*metadata.Thread.Ephemeral)
+			}
+			return false, fmt.Errorf(
+				"unmaterialized Codex thread is not a fresh idle portal thread "+
+					"(source=%q ephemeral=%s historyMode=%q previewEmpty=%t status=%q turns=%d)",
+				metadata.Thread.Source, ephemeral,
+				metadata.Thread.HistoryMode, metadata.Thread.Preview == "",
+				statusValue(metadata.Thread.Status), turnCount,
+			)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect Codex thread rollout: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return false, errors.New("Codex thread rollout is not a regular file")
+	}
+	return true, nil
 }
 
 func (c *Client) Interrupt(ctx context.Context, threadID string) error {
