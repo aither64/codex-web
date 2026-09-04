@@ -40,11 +40,19 @@
     });
   });
 
-  document.querySelectorAll("button[data-tab]").forEach((button) => {
+  const tabButtons = document.querySelectorAll("button[data-tab]");
+  tabButtons.forEach((button) => {
     button.addEventListener("click", () => {
-      document.querySelectorAll("button[data-tab], .document").forEach((element) => element.classList.remove("active"));
-      button.classList.add("active");
-      document.getElementById(button.dataset.tab).classList.add("active");
+      const panel = document.getElementById(button.dataset.tab);
+      if (!panel) return;
+      tabButtons.forEach((candidate) => {
+        const selected = candidate === button;
+        candidate.classList.toggle("active", selected);
+        candidate.setAttribute("aria-selected", selected ? "true" : "false");
+      });
+      document.querySelectorAll(".tab-panel").forEach((candidate) => {
+        candidate.classList.toggle("active", candidate === panel);
+      });
     });
   });
 
