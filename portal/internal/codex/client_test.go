@@ -169,6 +169,144 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 5; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			switch index {
+			case 0:
+				if request["method"] != "model/list" {
+					return fmt.Errorf("expected model/list, got %v", request["method"])
+				}
+				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
+					"data": []any{map[string]any{
+						"id": "model-id", "model": "gpt-test", "displayName": "GPT Test",
+						"isDefault": true, "defaultReasoningEffort": "high",
+						"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "high"}},
+					}}, "nextCursor": nil,
+				}})
+			case 1, 3:
+				if request["method"] != "thread/turns/list" || params["threadId"] != "thread-source" {
+					return fmt.Errorf("expected source idle check, got %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{}},
+				})
+			case 2:
+				if request["method"] != "thread/resume" || params["model"] != "gpt-test" ||
+					params["cwd"] != "/workspace/work/source" {
+					return fmt.Errorf("invalid settings request: %#v", request)
+				}
+				config := params["config"].(map[string]any)
+				if config["model_reasoning_effort"] != "high" {
+					return fmt.Errorf("invalid reasoning setting: %#v", config)
+				}
+				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
+					"thread": map[string]any{
+						"id": "thread-source", "cwd": "/workspace/work/source",
+						"model": "gpt-test", "reasoningEffort": "high",
+					},
+				}})
+			case 4:
+				if request["method"] != "thread/fork" || params["threadId"] != "thread-source" ||
+					params["cwd"] != "/workspace/work/fork" || params["model"] != "gpt-test" {
+					return fmt.Errorf("invalid fork request: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
+					"thread": map[string]any{
+						"id": "thread-fork", "cwd": "/workspace/work/fork", "forkedFromId": "thread-source",
+					},
+				}})
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	models, err := client.ListModels(ctx)
+	if err != nil || len(models) != 1 || models[0].Model != "gpt-test" {
+		t.Fatalf("models = %#v, %v", models, err)
+	}
+	settings := ThreadSettings{Model: "gpt-test", ReasoningEffort: "high"}
+	if _, err := client.UpdateThreadSettings(ctx, "thread-source", "/workspace/work/source", settings); err != nil {
+		t.Fatal(err)
+	}
+	id, err := client.ForkThread(ctx, "thread-source", "/workspace/work/fork", map[string]string{
+		"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
+	}, settings)
+	if err != nil || id != "thread-fork" {
+		t.Fatalf("fork = %q, %v", id, err)
+	}
+}
+
+func TestRecoverForkThreadResumesMatchingPersistedFork(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 3; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			switch index {
+			case 0:
+				if request["method"] != "thread/list" || params["cwd"] != "/workspace/work/fork" {
+					return fmt.Errorf("invalid recovery lookup: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
+					"data": []any{map[string]any{
+						"id": "thread-fork", "cwd": "/workspace/work/fork", "forkedFromId": "thread-source",
+					}},
+				}})
+			case 1:
+				if request["method"] != "thread/turns/list" || params["threadId"] != "thread-fork" {
+					return fmt.Errorf("invalid fork idle check: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{}},
+				})
+			case 2:
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-fork" ||
+					params["cwd"] != "/workspace/work/fork" {
+					return fmt.Errorf("invalid recovered fork resume: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
+					"thread": map[string]any{"id": "thread-fork", "cwd": "/workspace/work/fork"},
+				}})
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := client.RecoverForkThread(
+		ctx, "thread-source", "/workspace/work/fork",
+		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"}, ThreadSettings{},
+	)
+	if err != nil || id != "thread-fork" {
+		t.Fatalf("recovered fork = %q, %v", id, err)
+	}
+}
+
 func TestOpenThreadDoesNotReplaceMissingPersistedThread(t *testing.T) {
 	var startCalls atomic.Int32
 	done := make(chan struct{})

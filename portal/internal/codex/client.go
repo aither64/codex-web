@@ -86,9 +86,11 @@ type Option struct {
 }
 
 type Transcript struct {
-	ThreadID string            `json:"threadId"`
-	Status   string            `json:"status"`
-	Entries  []TranscriptEntry `json:"entries"`
+	ThreadID        string            `json:"threadId"`
+	Status          string            `json:"status"`
+	Model           string            `json:"model,omitempty"`
+	ReasoningEffort string            `json:"reasoningEffort,omitempty"`
+	Entries         []TranscriptEntry `json:"entries"`
 }
 
 type TranscriptEntry struct {
@@ -96,7 +98,28 @@ type TranscriptEntry struct {
 	Kind    string `json:"kind"`
 	Summary string `json:"summary,omitempty"`
 	Text    string `json:"text,omitempty"`
+	HTML    string `json:"html,omitempty"`
 	Details string `json:"details,omitempty"`
+}
+
+type ThreadSettings struct {
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+}
+
+type ReasoningEffortOption struct {
+	ReasoningEffort string `json:"reasoningEffort"`
+	Description     string `json:"description"`
+}
+
+type Model struct {
+	ID                        string                  `json:"id"`
+	Model                     string                  `json:"model"`
+	DisplayName               string                  `json:"displayName"`
+	Description               string                  `json:"description"`
+	IsDefault                 bool                    `json:"isDefault"`
+	DefaultReasoningEffort    string                  `json:"defaultReasoningEffort"`
+	SupportedReasoningEfforts []ReasoningEffortOption `json:"supportedReasoningEfforts"`
 }
 
 type Client struct {
@@ -911,20 +934,37 @@ func stringValue(value any) string {
 	return result
 }
 
+func settingsParams(settings ThreadSettings, params map[string]any, config map[string]any) {
+	if settings.Model != "" {
+		params["model"] = settings.Model
+	}
+	if settings.ReasoningEffort != "" {
+		config["model_reasoning_effort"] = settings.ReasoningEffort
+	}
+}
+
 func (c *Client) StartThread(ctx context.Context, cwd string, environment map[string]string) (string, error) {
+	return c.StartThreadWithSettings(ctx, cwd, environment, ThreadSettings{})
+}
+
+func (c *Client) StartThreadWithSettings(
+	ctx context.Context, cwd string, environment map[string]string, settings ThreadSettings,
+) (string, error) {
 	var response struct {
 		Thread struct {
 			ID  string `json:"id"`
 			Cwd string `json:"cwd"`
 		} `json:"thread"`
 	}
+	config := map[string]any{
+		"shell_environment_policy": map[string]any{"set": environment},
+	}
 	params := map[string]any{
 		"cwd":                   cwd,
 		"runtimeWorkspaceRoots": []string{environment["VPSFREE_DEV_SESSION_WORKSPACE"]},
-		"config": map[string]any{
-			"shell_environment_policy": map[string]any{"set": environment},
-		},
+		"config":                config,
 	}
+	settingsParams(settings, params, config)
 	if err := c.Request(ctx, "thread/start", params, &response); err != nil {
 		return "", err
 	}
@@ -935,20 +975,28 @@ func (c *Client) StartThread(ctx context.Context, cwd string, environment map[st
 }
 
 func (c *Client) ResumeThread(ctx context.Context, threadID, cwd string, environment map[string]string) (string, error) {
+	return c.ResumeThreadWithSettings(ctx, threadID, cwd, environment, ThreadSettings{})
+}
+
+func (c *Client) ResumeThreadWithSettings(
+	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
+) (string, error) {
 	var response struct {
 		Thread struct {
 			ID  string `json:"id"`
 			Cwd string `json:"cwd"`
 		} `json:"thread"`
 	}
+	config := map[string]any{
+		"shell_environment_policy": map[string]any{"set": environment},
+	}
 	params := map[string]any{
 		"threadId":     threadID,
 		"cwd":          cwd,
 		"excludeTurns": true,
-		"config": map[string]any{
-			"shell_environment_policy": map[string]any{"set": environment},
-		},
+		"config":       config,
 	}
+	settingsParams(settings, params, config)
 	if err := c.Request(ctx, "thread/resume", params, &response); err != nil {
 		return "", err
 	}
@@ -959,10 +1007,16 @@ func (c *Client) ResumeThread(ctx context.Context, threadID, cwd string, environ
 }
 
 func (c *Client) OpenThread(ctx context.Context, threadID, cwd string, environment map[string]string) (string, error) {
+	return c.OpenThreadWithSettings(ctx, threadID, cwd, environment, ThreadSettings{})
+}
+
+func (c *Client) OpenThreadWithSettings(
+	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
+) (string, error) {
 	if threadID != "" {
-		return c.ResumeThread(ctx, threadID, cwd, environment)
+		return c.ResumeThreadWithSettings(ctx, threadID, cwd, environment, settings)
 	}
-	return c.StartThread(ctx, cwd, environment)
+	return c.StartThreadWithSettings(ctx, cwd, environment, settings)
 }
 
 func (c *Client) loadedThreadIDs(ctx context.Context) ([]string, error) {
@@ -1005,6 +1059,12 @@ func (c *Client) loadedThreadIDs(ctx context.Context) ([]string, error) {
 }
 
 func (c *Client) RecoverCreatingThread(ctx context.Context, threadID, cwd string, environment map[string]string) (string, error) {
+	return c.RecoverCreatingThreadWithSettings(ctx, threadID, cwd, environment, ThreadSettings{})
+}
+
+func (c *Client) RecoverCreatingThreadWithSettings(
+	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
+) (string, error) {
 	candidates := make(map[string]struct{})
 	loaded, err := c.loadedThreadIDs(ctx)
 	if err != nil {
@@ -1070,9 +1130,135 @@ func (c *Client) RecoverCreatingThread(ctx context.Context, threadID, cwd string
 		if !materialized {
 			return candidateID, nil
 		}
-		return c.ResumeThread(ctx, candidateID, cwd, environment)
+		return c.ResumeThreadWithSettings(ctx, candidateID, cwd, environment, settings)
 	}
-	return c.StartThread(ctx, cwd, environment)
+	return c.StartThreadWithSettings(ctx, cwd, environment, settings)
+}
+
+func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
+	models := make([]Model, 0)
+	seenCursors := make(map[string]struct{})
+	var cursor string
+	for {
+		params := map[string]any{"limit": 100, "includeHidden": false}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		var page struct {
+			Data       *[]Model `json:"data"`
+			NextCursor *string  `json:"nextCursor"`
+		}
+		if err := c.Request(ctx, "model/list", params, &page); err != nil {
+			return nil, err
+		}
+		if page.Data == nil {
+			return nil, errors.New("model/list returned no data")
+		}
+		models = append(models, (*page.Data)...)
+		if page.NextCursor == nil {
+			return models, nil
+		}
+		if *page.NextCursor == "" {
+			return nil, errors.New("model/list returned an empty pagination cursor")
+		}
+		if _, ok := seenCursors[*page.NextCursor]; ok {
+			return nil, errors.New("model/list repeated a pagination cursor")
+		}
+		seenCursors[*page.NextCursor] = struct{}{}
+		cursor = *page.NextCursor
+	}
+}
+
+func (c *Client) UpdateThreadSettings(
+	ctx context.Context, threadID, cwd string, settings ThreadSettings,
+) (ThreadSettings, error) {
+	if err := c.requireThreadTurnsIdle(ctx, threadID); err != nil {
+		return ThreadSettings{}, err
+	}
+	config := make(map[string]any)
+	params := map[string]any{"threadId": threadID, "cwd": cwd, "excludeTurns": true, "config": config}
+	settingsParams(settings, params, config)
+	var response struct {
+		Thread struct {
+			ID              string `json:"id"`
+			Cwd             string `json:"cwd"`
+			Model           string `json:"model"`
+			ReasoningEffort string `json:"reasoningEffort"`
+		} `json:"thread"`
+	}
+	if err := c.Request(ctx, "thread/resume", params, &response); err != nil {
+		return ThreadSettings{}, err
+	}
+	if response.Thread.ID != threadID || response.Thread.Cwd != cwd {
+		return ThreadSettings{}, errors.New("thread/resume returned the wrong thread or working directory")
+	}
+	return ThreadSettings{Model: response.Thread.Model, ReasoningEffort: response.Thread.ReasoningEffort}, nil
+}
+
+func (c *Client) ForkThread(
+	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
+) (string, error) {
+	if err := c.requireThreadTurnsIdle(ctx, threadID); err != nil {
+		return "", err
+	}
+	config := map[string]any{"shell_environment_policy": map[string]any{"set": environment}}
+	params := map[string]any{
+		"threadId": threadID, "cwd": cwd, "excludeTurns": true,
+		"deferGoalContinuation": true,
+		"runtimeWorkspaceRoots": []string{environment["VPSFREE_DEV_SESSION_WORKSPACE"]},
+		"config":                config,
+	}
+	settingsParams(settings, params, config)
+	var response struct {
+		Thread struct {
+			ID           string `json:"id"`
+			Cwd          string `json:"cwd"`
+			ForkedFromID string `json:"forkedFromId"`
+		} `json:"thread"`
+	}
+	if err := c.Request(ctx, "thread/fork", params, &response); err != nil {
+		return "", err
+	}
+	if response.Thread.ID == "" || response.Thread.ID == threadID || response.Thread.Cwd != cwd ||
+		response.Thread.ForkedFromID != threadID {
+		return "", errors.New("thread/fork returned invalid thread metadata")
+	}
+	return response.Thread.ID, nil
+}
+
+func (c *Client) RecoverForkThread(
+	ctx context.Context, sourceThreadID, cwd string, environment map[string]string, settings ThreadSettings,
+) (string, error) {
+	var page struct {
+		Data *[]struct {
+			ID           string `json:"id"`
+			Cwd          string `json:"cwd"`
+			ForkedFromID string `json:"forkedFromId"`
+		} `json:"data"`
+		NextCursor *string `json:"nextCursor"`
+	}
+	if err := c.Request(ctx, "thread/list", map[string]any{
+		"cwd": cwd, "limit": 2, "sortDirection": "asc", "sourceKinds": []string{"vscode"},
+	}, &page); err != nil {
+		return "", err
+	}
+	if page.Data == nil {
+		return "", errors.New("thread/list returned no data")
+	}
+	if len(*page.Data) > 1 || page.NextCursor != nil {
+		return "", fmt.Errorf("multiple Codex threads use fork directory %s; refusing ambiguous recovery", cwd)
+	}
+	if len(*page.Data) == 0 {
+		return c.ForkThread(ctx, sourceThreadID, cwd, environment, settings)
+	}
+	candidate := (*page.Data)[0]
+	if candidate.ID == "" || candidate.Cwd != cwd || candidate.ForkedFromID != sourceThreadID {
+		return "", errors.New("existing Codex thread does not match the requested conversation fork")
+	}
+	if err := c.requireThreadTurnsIdle(ctx, candidate.ID); err != nil {
+		return "", err
+	}
+	return c.ResumeThreadWithSettings(ctx, candidate.ID, cwd, environment, settings)
 }
 
 func (c *Client) SetName(ctx context.Context, threadID, name string) error {
@@ -1102,8 +1288,10 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 	}
 	slices.Reverse(*page.Data)
 	transcript := Transcript{
-		ThreadID: stringValue(metadata.Thread["id"]),
-		Status:   statusValue(metadata.Thread["status"]),
+		ThreadID:        stringValue(metadata.Thread["id"]),
+		Status:          statusValue(metadata.Thread["status"]),
+		Model:           stringValue(metadata.Thread["model"]),
+		ReasoningEffort: stringValue(metadata.Thread["reasoningEffort"]),
 	}
 	for _, turn := range *page.Data {
 		transcript.Entries = append(transcript.Entries, transcriptEntries(turn)...)

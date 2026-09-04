@@ -86,12 +86,50 @@ client_requests = [
             "config": {"shell_environment_policy": {"set": environment}},
         },
     ),
+    request(
+        "model/list",
+        {"limit": 100, "includeHidden": False},
+    ),
+    request(
+        "thread/resume",
+        {
+            "threadId": "thread-1",
+            "cwd": "/workspace/work/example",
+            "excludeTurns": True,
+            "model": "test-model",
+            "config": {"model_reasoning_effort": "high"},
+        },
+    ),
+    request(
+        "thread/fork",
+        {
+            "threadId": "thread-1",
+            "cwd": "/workspace/work/fork",
+            "runtimeWorkspaceRoots": ["/workspace"],
+            "excludeTurns": True,
+            "deferGoalContinuation": True,
+            "model": "test-model",
+            "config": {
+                "shell_environment_policy": {"set": environment},
+                "model_reasoning_effort": "high",
+            },
+        },
+    ),
     request("thread/resume", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/resume", {"threadId": "thread-1", "excludeTurns": True}),
     request(
         "thread/list",
         {
             "cwd": "/workspace/work/example",
+            "limit": 2,
+            "sortDirection": "asc",
+            "sourceKinds": ["vscode"],
+        },
+    ),
+    request(
+        "thread/list",
+        {
+            "cwd": "/workspace/work/fork",
             "limit": 2,
             "sortDirection": "asc",
             "sourceKinds": ["vscode"],
@@ -320,6 +358,32 @@ common_start = {
 }
 validate("v2/ThreadStartResponse.json", common_start, "thread/start result")
 validate("v2/ThreadResumeResponse.json", common_start, "thread/resume result")
+fork_thread = dict(thread)
+fork_thread["id"] = "thread-fork"
+fork_thread["cwd"] = "/workspace/work/fork"
+fork_thread["forkedFromId"] = "thread-1"
+validate(
+    "v2/ThreadForkResponse.json",
+    {**common_start, "cwd": "/workspace/work/fork", "thread": fork_thread},
+    "thread/fork result",
+)
+model = {
+    "id": "model-id",
+    "model": "test-model",
+    "displayName": "Test model",
+    "description": "Test model for the protocol contract.",
+    "isDefault": True,
+    "hidden": False,
+    "defaultReasoningEffort": "high",
+    "supportedReasoningEfforts": [
+        {"reasoningEffort": "high", "description": "Thorough reasoning."}
+    ],
+}
+validate(
+    "v2/ModelListResponse.json",
+    {"data": [model], "nextCursor": None},
+    "model/list result",
+)
 validate("v2/ThreadListResponse.json", {"data": [thread]}, "thread/list result")
 validate(
     "v2/ThreadLoadedListResponse.json",
@@ -371,6 +435,18 @@ for file_name, value, paths, label in [
         "thread/resume result",
     ),
     (
+        "v2/ThreadForkResponse.json",
+        {**common_start, "cwd": "/workspace/work/fork", "thread": fork_thread},
+        [["thread"], ["thread", "id"], ["thread", "cwd"]],
+        "thread/fork result",
+    ),
+    (
+        "v2/ModelListResponse.json",
+        {"data": [model], "nextCursor": None},
+        [["data"]],
+        "model/list result",
+    ),
+    (
         "v2/ThreadListResponse.json",
         {"data": [thread]},
         [["data"]],
@@ -418,6 +494,27 @@ for file_name, value, paths, label in [
 require_declared_property(
     "v2/ThreadReadResponse.json", "Thread", "path", "thread/read result"
 )
+require_declared_property(
+    "v2/ThreadReadResponse.json", "Thread", "model", "thread/read result"
+)
+require_declared_property(
+    "v2/ThreadReadResponse.json", "Thread", "reasoningEffort", "thread/read result"
+)
+require_declared_property(
+    "v2/ThreadForkResponse.json", "Thread", "forkedFromId", "thread/fork result"
+)
+require_declared_property(
+    "v2/ThreadListResponse.json", "Thread", "forkedFromId", "thread/list fork recovery result"
+)
+for field in (
+    "model",
+    "displayName",
+    "description",
+    "isDefault",
+    "defaultReasoningEffort",
+    "supportedReasoningEfforts",
+):
+    require_declared_property("v2/ModelListResponse.json", "Model", field, "model/list result")
 
 for message in server_requests:
     require_fields(

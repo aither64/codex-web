@@ -15,6 +15,17 @@
     message: (message) => request(apiPath(slug, "message"), {
       method: "POST", body: JSON.stringify({message}),
     }),
+    settings: (model, reasoningEffort) => request(apiPath(slug, "settings"), {
+      method: "POST", body: JSON.stringify({model, reasoningEffort}),
+    }),
+    fork: (name, creationDate, model, reasoningEffort) => request(apiPath(slug, "fork"), {
+      method: "POST", body: JSON.stringify({name, creationDate, model, reasoningEffort}),
+    }),
+    releaseCluster: (kind) => request(apiPath(slug, "release-cluster"), {
+      method: "POST", body: JSON.stringify({kind}),
+    }),
+    archive: () => request(apiPath(slug, "archive"), {method: "POST", body: "{}"}),
+    operation: () => request(apiPath(slug, "operation")),
     interrupt: () => request(apiPath(slug, "interrupt"), {method: "POST", body: "{}"}),
     respond: (id, payload) => request(apiPath(slug, "respond"), {
       method: "POST", body: JSON.stringify({id, ...payload}),
@@ -29,6 +40,92 @@
   const body = document.body;
   const slug = body.dataset.session;
   const interactive = body.dataset.interactive === "true";
+  const request = createRequest(fetch.bind(globalThis));
+
+  let models = [];
+  let currentModel = "";
+  let currentEffort = "";
+  let threadActive = false;
+  const modelSelects = Array.from(document.querySelectorAll("[data-model-select]"));
+  const effortSelects = Array.from(document.querySelectorAll("[data-effort-select]"));
+
+  const populateEfforts = (modelSelect, effortSelect, selected = "") => {
+    if (!effortSelect) return;
+    const model = models.find((candidate) => candidate.model === modelSelect.value);
+    effortSelect.replaceChildren();
+    const fallback = document.createElement("option");
+    fallback.value = "";
+    fallback.textContent = model ? "Model default" : "Choose a model first";
+    effortSelect.append(fallback);
+    for (const option of model?.supportedReasoningEfforts || []) {
+      const element = document.createElement("option");
+      element.value = option.reasoningEffort;
+      element.textContent = option.reasoningEffort;
+      if (option.description) element.title = option.description;
+      effortSelect.append(element);
+    }
+    const desired = selected || model?.defaultReasoningEffort || "";
+    if (Array.from(effortSelect.options).some((option) => option.value === desired)) {
+      effortSelect.value = desired;
+    }
+    effortSelect.disabled = !model || threadActive;
+  };
+
+  const applyCurrentSettings = () => {
+    modelSelects.forEach((modelSelect, index) => {
+      const effortSelect = effortSelects[index];
+      if (currentModel && Array.from(modelSelect.options).some((option) => option.value === currentModel)) {
+        modelSelect.value = currentModel;
+      }
+      populateEfforts(modelSelect, effortSelect, currentEffort);
+      if (modelSelect.closest("#codex-settings")) modelSelect.disabled = threadActive;
+    });
+    document.querySelector("#codex-settings button")?.toggleAttribute("disabled", threadActive);
+    document.getElementById("fork-open")?.toggleAttribute("disabled", threadActive);
+  };
+
+  const loadModels = async () => {
+    try {
+      models = await request("/api/models");
+      for (const modelSelect of modelSelects) {
+        const allowDefault = !modelSelect.required;
+        modelSelect.replaceChildren();
+        if (allowDefault) {
+          const fallback = document.createElement("option");
+          fallback.value = "";
+          fallback.textContent = "System default";
+          modelSelect.append(fallback);
+        }
+        for (const model of models) {
+          const option = document.createElement("option");
+          option.value = model.model;
+          option.textContent = model.displayName;
+          option.title = model.description || "";
+          modelSelect.append(option);
+        }
+        if (!currentModel) {
+          const defaultModel = models.find((model) => model.isDefault);
+          if (defaultModel) modelSelect.value = defaultModel.model;
+        }
+      }
+      applyCurrentSettings();
+    } catch (_error) {
+      for (const modelSelect of modelSelects) {
+        modelSelect.replaceChildren();
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "Model catalog unavailable";
+        modelSelect.append(option);
+        modelSelect.disabled = true;
+      }
+      for (const effortSelect of effortSelects) effortSelect.disabled = true;
+    }
+  };
+
+  modelSelects.forEach((modelSelect, index) => {
+    modelSelect.addEventListener("change", () => populateEfforts(modelSelect, effortSelects[index]));
+  });
+  if (modelSelects.length) loadModels();
 
   document.querySelectorAll("[data-copy]").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -66,10 +163,9 @@
   let refreshRunning = false;
   let refreshDirty = false;
 
-  const request = createRequest(fetch.bind(globalThis));
   const client = createSessionClient(slug, request);
 
-  const appendMessage = (kind, text, details) => {
+  const appendMessage = (kind, text, details, html) => {
     const element = document.createElement("div");
     element.className = `message ${kind}`;
     if (details) {
@@ -80,6 +176,9 @@
       pre.textContent = details;
       disclosure.append(summary, pre);
       element.append(disclosure);
+    } else if (html) {
+      element.classList.add("markdown");
+      element.innerHTML = html;
     } else {
       element.textContent = text;
     }
@@ -90,10 +189,14 @@
     if (!payload.threadId) throw new Error("Codex returned no thread");
     transcript.replaceChildren();
     for (const entry of payload.entries || []) {
-      const kind = entry.kind === "userMessage" ? "user" : entry.kind === "agentMessage" ? "agent" : entry.kind === "error" ? "error" : "event";
-      appendMessage(kind, entry.text || entry.summary || "Codex event", entry.details || "");
+      const kind = entry.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry.kind) ? "agent" : entry.kind === "error" ? "error" : "event";
+      appendMessage(kind, entry.text || entry.summary || "Codex event", entry.details || "", entry.html || "");
     }
     const threadStatus = payload.status;
+    threadActive = threadStatus === "active";
+    currentModel = payload.model || currentModel;
+    currentEffort = payload.reasoningEffort || currentEffort;
+    applyCurrentSettings();
     status.textContent = threadStatus || "Connected";
     status.className = `badge ${threadStatus === "active" ? "active" : ""}`;
     transcript.scrollTop = transcript.scrollHeight;
@@ -276,9 +379,15 @@
 
   const form = document.getElementById("message-form");
   if (form && interactive) {
+    const textarea = form.elements.message;
+    textarea.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+      event.preventDefault();
+      if (!textarea.value.trim()) return;
+      form.requestSubmit();
+    });
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const textarea = form.elements.message;
       const message = textarea.value.trim();
       if (!message) return;
       const controls = Array.from(form.querySelectorAll("button, input, select, textarea"));
@@ -300,6 +409,119 @@
       } catch (error) { alert(error.message); }
     });
   }
+
+  const settingsForm = document.getElementById("codex-settings");
+  if (settingsForm && interactive) {
+    settingsForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const controls = Array.from(settingsForm.querySelectorAll("button, select"));
+      controls.forEach((control) => { control.disabled = true; });
+      try {
+        const saved = await client.settings(
+          settingsForm.elements.model.value,
+          settingsForm.elements.effort.value,
+        );
+        currentModel = saved.model;
+        currentEffort = saved.reasoningEffort;
+        applyCurrentSettings();
+        scheduleRefresh(0);
+      } catch (error) { alert(error.message); }
+      finally { applyCurrentSettings(); }
+    });
+  }
+
+  const forkDialog = document.getElementById("fork-dialog");
+  const forkForm = document.getElementById("fork-form");
+  document.getElementById("fork-open")?.addEventListener("click", () => forkDialog.showModal());
+  forkDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => forkDialog.close());
+  if (forkForm && interactive) {
+    forkForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const controls = Array.from(forkForm.querySelectorAll("button, input, select"));
+      controls.forEach((control) => { control.disabled = true; });
+      try {
+        const result = await client.fork(
+          forkForm.elements.name.value,
+          forkForm.elements.creationDate.value,
+          forkForm.elements.model.value,
+          forkForm.elements.effort.value,
+        );
+        location.assign(result.url);
+      } catch (error) {
+        alert(error.message);
+        controls.forEach((control) => { control.disabled = false; });
+      }
+    });
+  }
+
+  document.querySelectorAll("[data-release-cluster]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const kind = button.dataset.releaseCluster;
+      if (!confirm("Stop this development cluster and remove its temporary state?")) return;
+      button.disabled = true;
+      button.textContent = "Releasing…";
+      try {
+        await client.releaseCluster(kind);
+        location.reload();
+      } catch (error) {
+        alert(error.message);
+        button.disabled = false;
+        button.textContent = "Release cluster";
+      }
+    });
+  });
+
+  document.getElementById("finish-session")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    if (!confirm("Ask Codex to finish the work and prepare this session for archival?")) return;
+    button.disabled = true;
+    try {
+      await client.message(
+        "Prepare this development session for archival. Finish the requested work, tests, reviews, pushes, and deployment. Update plan.md and state.md, and set the lifecycle to complete only when nothing remains. Do not finalize, archive, or stop the session yourself. If anything blocks completion, leave the lifecycle active and explain it.",
+      );
+      document.querySelector('[data-tab="codex"]')?.click();
+      scheduleRefresh(0);
+      button.textContent = "Preparation requested";
+    } catch (error) {
+      alert(error.message);
+      button.disabled = false;
+    }
+  });
+
+  const archiveButton = document.getElementById("archive-session");
+  const pollArchive = async () => {
+    try {
+      const operation = await client.operation();
+      if (operation.state === "complete") {
+        location.reload();
+        return;
+      }
+      if (operation.state === "failed") {
+        archiveButton.disabled = false;
+        archiveButton.textContent = "Retry archive";
+        alert(operation.error || "Archiving failed");
+        return;
+      }
+      setTimeout(pollArchive, 1200);
+    } catch (error) {
+      archiveButton.disabled = false;
+      archiveButton.textContent = "Retry archive";
+      alert(error.message);
+    }
+  };
+  archiveButton?.addEventListener("click", async () => {
+    if (!confirm("Release development clusters, archive the session, commit the archive move, and stop its runtime?")) return;
+    archiveButton.disabled = true;
+    archiveButton.textContent = "Archiving…";
+    try {
+      await client.archive();
+      pollArchive();
+    } catch (error) {
+      archiveButton.disabled = false;
+      archiveButton.textContent = "Archive session";
+      alert(error.message);
+    }
+  });
 
   scheduleRefresh(0);
   if (interactive) {
