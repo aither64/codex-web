@@ -1,0 +1,23 @@
+{
+  "method": "item/tool/requestUserInput",
+  "params": {
+    "threadId": "thread-1",
+    "turnId": "turn-1",
+    "itemId": "item-2",
+    "isBlocking": true,
+    "questions": [
+      {
+        "id": "choice",
+        "header": "Choice",
+        "question": "Choose",
+        "isOther": true,
+        "options": [
+          {
+            "label": "First",
+            "description": "first choice"
+          }
+        ]
+      }
+    ]
+  }
+}
