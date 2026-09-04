@@ -11,7 +11,7 @@
   };
   const createSessionClient = (slug, request) => ({
     thread: () => request(apiPath(slug, "thread")),
-    pending: () => request(apiPath(slug, "pending")),
+    pending: async () => (await request(apiPath(slug, "pending"))) || [],
     message: (message) => request(apiPath(slug, "message"), {
       method: "POST", body: JSON.stringify({message}),
     }),

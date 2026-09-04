@@ -21,6 +21,21 @@ import (
 
 const protocolFixtureVersion = "0.152.1"
 
+func TestEmptyPromptsAreAJSONList(t *testing.T) {
+	client := New("/tmp/codex-not-connected.sock")
+	prompts := client.Prompts("thread-1")
+	if prompts == nil {
+		t.Fatal("empty prompts are nil")
+	}
+	encoded, err := json.Marshal(prompts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != "[]" {
+		t.Fatalf("empty prompts JSON = %s", encoded)
+	}
+}
+
 func TestHandshakeAndLargeThreadHistory(t *testing.T) {
 	initialized := make(chan struct{}, 1)
 	largeText := strings.Repeat("history", 8_000)

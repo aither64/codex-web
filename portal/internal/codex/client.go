@@ -607,7 +607,8 @@ func (c *Client) broadcast(threadID string) {
 func (c *Client) Prompts(threadID string) []Prompt {
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
-	result := append([]Prompt(nil), c.notices[threadID]...)
+	result := make([]Prompt, 0, len(c.notices[threadID])+len(c.requests))
+	result = append(result, c.notices[threadID]...)
 	for _, request := range c.requests {
 		if request.claimed {
 			continue

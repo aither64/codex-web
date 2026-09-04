@@ -22,6 +22,12 @@ const client = createSessionClient("example", createRequest(fetchRequest));
   assert.equal(pending[0].id, "approval-1");
   assert.equal(pending[0].kind, "command");
 
+  const legacyEmptyClient = createSessionClient("example", async (path) => {
+    assert.match(path, /\/pending$/);
+    return null;
+  });
+  assert.deepEqual(await legacyEmptyClient.pending(), []);
+
   assert.deepEqual(await client.message("browser message"), {ok: true});
   assert.deepEqual(await client.interrupt(), {ok: true});
   assert.deepEqual(await client.respond("approval-1", {decision: "accept"}), {ok: true});
