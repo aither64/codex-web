@@ -32,14 +32,8 @@
     }),
     eventsPath: () => apiPath(slug, "events"),
   });
-  const preferredReasoningEffort = (model, preferMax = false) => {
-    if (preferMax && model?.supportedReasoningEfforts?.some(
-      (option) => option.reasoningEffort === "max",
-    )) return "max";
-    return model?.defaultReasoningEffort || "";
-  };
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = {createRequest, createSessionClient, preferredReasoningEffort};
+    module.exports = {createRequest, createSessionClient};
     return;
   }
 
@@ -70,10 +64,7 @@
       if (option.description) element.title = option.description;
       effortSelect.append(element);
     }
-    const desired = selected || preferredReasoningEffort(
-      model,
-      modelSelect.hasAttribute("data-new-session-default"),
-    );
+    const desired = selected;
     if (Array.from(effortSelect.options).some((option) => option.value === desired)) {
       effortSelect.value = desired;
     }
@@ -113,7 +104,7 @@
           option.title = model.description || "";
           modelSelect.append(option);
         }
-        if (!currentModel) {
+        if (!currentModel && modelSelect.required) {
           const defaultModel = models.find((model) => model.isDefault);
           if (defaultModel) modelSelect.value = defaultModel.model;
         }

@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const {createRequest, createSessionClient, preferredReasoningEffort} = require("./static/app.js");
+const {createRequest, createSessionClient} = require("./static/app.js");
 
 const baseURL = process.argv[2];
 if (!baseURL) throw new Error("browser contract test requires the server URL");
@@ -11,15 +11,6 @@ const fetchRequest = (path, options = {}) => fetch(new URL(path, baseURL), {
   headers: {Origin: origin, ...(options.headers || {})},
 });
 const client = createSessionClient("example", createRequest(fetchRequest));
-
-assert.equal(preferredReasoningEffort({
-  defaultReasoningEffort: "medium",
-  supportedReasoningEfforts: [{reasoningEffort: "medium"}, {reasoningEffort: "max"}],
-}, true), "max");
-assert.equal(preferredReasoningEffort({
-  defaultReasoningEffort: "high",
-  supportedReasoningEfforts: [{reasoningEffort: "high"}],
-}, true), "high");
 
 (async () => {
   const thread = await client.thread();
