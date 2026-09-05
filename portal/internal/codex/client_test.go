@@ -169,6 +169,66 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestResolveNewThreadSettingsDefaultsToMax(t *testing.T) {
+	models := []Model{
+		{
+			Model: "default", DisplayName: "Default", IsDefault: true,
+			DefaultReasoningEffort: "medium",
+			SupportedReasoningEfforts: []ReasoningEffortOption{
+				{ReasoningEffort: "medium"}, {ReasoningEffort: "max"},
+			},
+		},
+		{
+			Model: "bounded", DisplayName: "Bounded", DefaultReasoningEffort: "high",
+			SupportedReasoningEfforts: []ReasoningEffortOption{
+				{ReasoningEffort: "medium"}, {ReasoningEffort: "high"},
+			},
+		},
+	}
+
+	settings, err := ResolveNewThreadSettings(models, ThreadSettings{})
+	if err != nil || settings.Model != "default" || settings.ReasoningEffort != "max" {
+		t.Fatalf("default settings = %#v, %v", settings, err)
+	}
+	settings, err = ResolveNewThreadSettings(models, ThreadSettings{Model: "bounded"})
+	if err != nil || settings.Model != "bounded" || settings.ReasoningEffort != "high" {
+		t.Fatalf("bounded settings = %#v, %v", settings, err)
+	}
+	settings, err = ResolveNewThreadSettings(models, ThreadSettings{
+		Model: "default", ReasoningEffort: "medium",
+	})
+	if err != nil || settings.ReasoningEffort != "medium" {
+		t.Fatalf("explicit settings = %#v, %v", settings, err)
+	}
+}
+
+func TestResolveNewThreadSettingsRejectsInvalidCatalogAndSelections(t *testing.T) {
+	defaultModel := Model{
+		Model: "default", DisplayName: "Default", IsDefault: true,
+		DefaultReasoningEffort:    "medium",
+		SupportedReasoningEfforts: []ReasoningEffortOption{{ReasoningEffort: "medium"}},
+	}
+	for _, testCase := range []struct {
+		name      string
+		models    []Model
+		requested ThreadSettings
+		message   string
+	}{
+		{"no default", []Model{{Model: "other"}}, ThreadSettings{}, "no default"},
+		{"duplicate default", []Model{defaultModel, defaultModel}, ThreadSettings{}, "more than one default"},
+		{"default lacks max", []Model{defaultModel}, ThreadSettings{}, "required default reasoning effort"},
+		{"missing model", []Model{defaultModel}, ThreadSettings{Model: "missing"}, "not available"},
+		{"unsupported effort", []Model{defaultModel}, ThreadSettings{Model: "default", ReasoningEffort: "max"}, "not available"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := ResolveNewThreadSettings(testCase.models, testCase.requested)
+			if err == nil || !strings.Contains(err.Error(), testCase.message) {
+				t.Fatalf("resolution error = %v", err)
+			}
+		})
+	}
+}
+
 func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
@@ -799,9 +859,17 @@ func TestConfiguredCodexFreshThreadContract(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	threadID, err := client.StartThread(ctx, cwd, map[string]string{
+	models, err := client.ListModels(ctx)
+	if err != nil {
+		t.Fatalf("list configured Codex models: %v\n%s", err, output.String())
+	}
+	settings, err := ResolveNewThreadSettings(models, ThreadSettings{})
+	if err != nil || settings.ReasoningEffort != DefaultNewThreadReasoningEffort {
+		t.Fatalf("resolve configured Codex defaults: %#v, %v\n%s", settings, err, output.String())
+	}
+	threadID, err := client.StartThreadWithSettings(ctx, cwd, map[string]string{
 		"VPSFREE_DEV_SESSION_WORKSPACE": filepath.Join(directory, "workspace"),
-	})
+	}, settings)
 	if err != nil {
 		t.Fatalf("start exact Codex thread: %v\n%s", err, output.String())
 	}

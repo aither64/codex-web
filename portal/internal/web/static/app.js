@@ -32,8 +32,14 @@
     }),
     eventsPath: () => apiPath(slug, "events"),
   });
+  const preferredReasoningEffort = (model, preferMax = false) => {
+    if (preferMax && model?.supportedReasoningEfforts?.some(
+      (option) => option.reasoningEffort === "max",
+    )) return "max";
+    return model?.defaultReasoningEffort || "";
+  };
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = {createRequest, createSessionClient};
+    module.exports = {createRequest, createSessionClient, preferredReasoningEffort};
     return;
   }
 
@@ -64,7 +70,10 @@
       if (option.description) element.title = option.description;
       effortSelect.append(element);
     }
-    const desired = selected || model?.defaultReasoningEffort || "";
+    const desired = selected || preferredReasoningEffort(
+      model,
+      modelSelect.hasAttribute("data-new-session-default"),
+    );
     if (Array.from(effortSelect.options).some((option) => option.value === desired)) {
       effortSelect.value = desired;
     }
@@ -80,7 +89,8 @@
       populateEfforts(modelSelect, effortSelect, currentEffort);
       if (modelSelect.closest("#codex-settings")) modelSelect.disabled = threadActive;
     });
-    document.querySelector("#codex-settings button")?.toggleAttribute("disabled", threadActive);
+    document.getElementById("codex-settings-open")?.toggleAttribute("disabled", threadActive);
+    document.getElementById("codex-settings-save")?.toggleAttribute("disabled", threadActive);
     document.getElementById("fork-open")?.toggleAttribute("disabled", threadActive);
   };
 
@@ -411,6 +421,9 @@
   }
 
   const settingsForm = document.getElementById("codex-settings");
+  const settingsDialog = document.getElementById("codex-settings-dialog");
+  document.getElementById("codex-settings-open")?.addEventListener("click", () => settingsDialog.showModal());
+  settingsDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => settingsDialog.close());
   if (settingsForm && interactive) {
     settingsForm.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -424,6 +437,7 @@
         currentModel = saved.model;
         currentEffort = saved.reasoningEffort;
         applyCurrentSettings();
+        settingsDialog.close();
         scheduleRefresh(0);
       } catch (error) { alert(error.message); }
       finally { applyCurrentSettings(); }

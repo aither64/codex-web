@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	readLimit       = 64 * 1024 * 1024
-	recentTurnLimit = 20
+	readLimit                       = 64 * 1024 * 1024
+	recentTurnLimit                 = 20
+	DefaultNewThreadReasoningEffort = "max"
 )
 
 type rpcMessage struct {
@@ -120,6 +121,56 @@ type Model struct {
 	IsDefault                 bool                    `json:"isDefault"`
 	DefaultReasoningEffort    string                  `json:"defaultReasoningEffort"`
 	SupportedReasoningEfforts []ReasoningEffortOption `json:"supportedReasoningEfforts"`
+}
+
+func ResolveNewThreadSettings(models []Model, requested ThreadSettings) (ThreadSettings, error) {
+	var selected *Model
+	for index := range models {
+		candidate := &models[index]
+		if requested.Model != "" {
+			if candidate.Model == requested.Model {
+				selected = candidate
+				break
+			}
+		} else if candidate.IsDefault {
+			if selected != nil {
+				return ThreadSettings{}, errors.New("Codex model catalog has more than one default")
+			}
+			selected = candidate
+		}
+	}
+	if selected == nil {
+		if requested.Model == "" {
+			return ThreadSettings{}, errors.New("Codex model catalog has no default")
+		}
+		return ThreadSettings{}, fmt.Errorf("Codex model %q is not available", requested.Model)
+	}
+
+	supports := func(effort string) bool {
+		return slices.ContainsFunc(
+			selected.SupportedReasoningEfforts,
+			func(option ReasoningEffortOption) bool { return option.ReasoningEffort == effort },
+		)
+	}
+	effort := requested.ReasoningEffort
+	if effort == "" && supports(DefaultNewThreadReasoningEffort) {
+		effort = DefaultNewThreadReasoningEffort
+	}
+	if effort == "" && requested.Model != "" && supports(selected.DefaultReasoningEffort) {
+		effort = selected.DefaultReasoningEffort
+	}
+	if effort == "" {
+		return ThreadSettings{}, fmt.Errorf(
+			"Codex model %s does not support the required default reasoning effort %q",
+			selected.DisplayName, DefaultNewThreadReasoningEffort,
+		)
+	}
+	if !supports(effort) {
+		return ThreadSettings{}, fmt.Errorf(
+			"reasoning effort %q is not available for %s", effort, selected.DisplayName,
+		)
+	}
+	return ThreadSettings{Model: selected.Model, ReasoningEffort: effort}, nil
 }
 
 type Client struct {
