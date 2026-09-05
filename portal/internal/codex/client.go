@@ -39,6 +39,15 @@ type rpcError struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
+type rpcCallError struct {
+	code    int
+	message string
+}
+
+func (e *rpcCallError) Error() string {
+	return fmt.Sprintf("Codex RPC %d: %s", e.code, e.message)
+}
+
 type response struct {
 	result json.RawMessage
 	err    error
@@ -414,7 +423,9 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 			continue
 		}
 		if message.Error != nil {
-			call.channel <- response{err: fmt.Errorf("Codex RPC %d: %s", message.Error.Code, message.Error.Message)}
+			call.channel <- response{err: &rpcCallError{
+				code: message.Error.Code, message: message.Error.Message,
+			}}
 		} else {
 			call.channel <- response{result: message.Result}
 		}
@@ -1320,11 +1331,23 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 	var metadata struct {
 		Thread map[string]any `json:"thread"`
 	}
-	if err := c.Request(ctx, "thread/read", map[string]any{"threadId": threadID}, &metadata); err != nil {
-		return Transcript{}, err
+	if err := c.Request(ctx, "thread/read", map[string]any{
+		"threadId": threadID, "excludeTurns": true,
+	}, &metadata); err != nil {
+		return Transcript{}, fmt.Errorf("read Codex thread metadata: %w", err)
 	}
 	if metadata.Thread == nil {
 		return Transcript{}, errors.New("thread/read returned no thread")
+	}
+	if stringValue(metadata.Thread["id"]) != threadID {
+		return Transcript{}, errors.New("thread/read returned the wrong thread")
+	}
+	transcript := Transcript{
+		ThreadID:        threadID,
+		Status:          statusValue(metadata.Thread["status"]),
+		Model:           stringValue(metadata.Thread["model"]),
+		ReasoningEffort: stringValue(metadata.Thread["reasoningEffort"]),
+		Entries:         make([]TranscriptEntry, 0),
 	}
 	var page struct {
 		Data *[]map[string]any `json:"data"`
@@ -1332,29 +1355,58 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 	if err := c.Request(ctx, "thread/turns/list", map[string]any{
 		"threadId": threadID, "limit": recentTurnLimit, "sortDirection": "desc", "itemsView": "full",
 	}, &page); err != nil {
-		return Transcript{}, err
+		if freshThreadMissingSourceRollout(metadata.Thread, threadID, err) {
+			return transcript, nil
+		}
+		return Transcript{}, fmt.Errorf("read Codex thread turns: %w", err)
 	}
 	if page.Data == nil {
 		return Transcript{}, errors.New("thread/turns/list returned no data")
 	}
 	slices.Reverse(*page.Data)
-	transcript := Transcript{
-		ThreadID:        stringValue(metadata.Thread["id"]),
-		Status:          statusValue(metadata.Thread["status"]),
-		Model:           stringValue(metadata.Thread["model"]),
-		ReasoningEffort: stringValue(metadata.Thread["reasoningEffort"]),
-	}
 	for _, turn := range *page.Data {
 		transcript.Entries = append(transcript.Entries, transcriptEntries(turn)...)
 	}
 	return transcript, nil
 }
 
+func freshThreadMissingSourceRollout(thread map[string]any, threadID string, err error) bool {
+	var rpcErr *rpcCallError
+	if !errors.As(err, &rpcErr) || rpcErr.code != -32600 ||
+		rpcErr.message != "invalid paginated history lineage for "+threadID+": missing source rollout" {
+		return false
+	}
+	if stringValue(thread["id"]) != threadID || stringValue(thread["source"]) != "vscode" ||
+		stringValue(thread["historyMode"]) != "paginated" || stringValue(thread["preview"]) != "" ||
+		stringValue(thread["forkedFromId"]) != "" ||
+		!slices.Contains([]string{"idle", "notLoaded"}, statusValue(thread["status"])) {
+		return false
+	}
+	ephemeral, ok := thread["ephemeral"].(bool)
+	if !ok || ephemeral {
+		return false
+	}
+	path := stringValue(thread["path"])
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return false
+	}
+	if turns, exists := thread["turns"]; exists && turns != nil {
+		items, ok := turns.([]any)
+		if !ok || len(items) != 0 {
+			return false
+		}
+	}
+	_, statErr := os.Stat(path)
+	return errors.Is(statErr, os.ErrNotExist)
+}
+
 func (c *Client) VerifyThread(ctx context.Context, threadID, cwd string) error {
 	var metadata struct {
 		Thread map[string]any `json:"thread"`
 	}
-	if err := c.Request(ctx, "thread/read", map[string]any{"threadId": threadID}, &metadata); err != nil {
+	if err := c.Request(ctx, "thread/read", map[string]any{
+		"threadId": threadID, "excludeTurns": true,
+	}, &metadata); err != nil {
 		return err
 	}
 	if metadata.Thread == nil || stringValue(metadata.Thread["id"]) != threadID ||

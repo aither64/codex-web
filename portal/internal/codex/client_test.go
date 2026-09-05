@@ -68,6 +68,10 @@ func TestHandshakeAndLargeThreadHistory(t *testing.T) {
 		if request["method"] != "thread/read" {
 			return errors.New("expected thread/read")
 		}
+		params, _ := request["params"].(map[string]any)
+		if params["threadId"] != "thread-1" || params["excludeTurns"] != true {
+			return fmt.Errorf("invalid thread/read params: %#v", params)
+		}
 		if err := writeObject(connection, map[string]any{
 			"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": "thread-1", "status": "active"}},
 		}); err != nil {
@@ -101,6 +105,100 @@ func TestHandshakeAndLargeThreadHistory(t *testing.T) {
 	}
 	if payload.Entries[0].TurnID != "old" || payload.Entries[1].TurnID != "new" {
 		t.Fatal("descending page was not restored to chronological order")
+	}
+}
+
+func TestReadThreadTreatsFreshMissingSourceRolloutAsEmpty(t *testing.T) {
+	rollout := filepath.Join(t.TempDir(), "not-created.jsonl")
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil || request["method"] != "thread/read" {
+			return fmt.Errorf("expected thread/read: %v", err)
+		}
+		params, _ := request["params"].(map[string]any)
+		if params["threadId"] != "thread-1" || params["excludeTurns"] != true {
+			return fmt.Errorf("invalid thread/read params: %#v", params)
+		}
+		metadata := freshThreadMetadata("thread-1", "/workspace/work/example", rollout)
+		metadata["model"] = "gpt-6-astra"
+		metadata["reasoningEffort"] = "max"
+		metadata["status"] = map[string]any{"type": "notLoaded"}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"thread": metadata},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/turns/list" {
+			return fmt.Errorf("expected thread/turns/list: %v", err)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "error": map[string]any{
+				"code":    -32600,
+				"message": "invalid paginated history lineage for thread-1: missing source rollout",
+			},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	transcript, err := client.ReadThread(ctx, "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transcript.ThreadID != "thread-1" || transcript.Status != "notLoaded" ||
+		transcript.Model != "gpt-6-astra" || transcript.ReasoningEffort != "max" {
+		t.Fatalf("unexpected transcript metadata: %#v", transcript)
+	}
+	if transcript.Entries == nil || len(transcript.Entries) != 0 {
+		t.Fatalf("empty transcript entries = %#v", transcript.Entries)
+	}
+}
+
+func TestFreshMissingSourceRolloutDetectionFailsClosed(t *testing.T) {
+	missingRollout := filepath.Join(t.TempDir(), "not-created.jsonl")
+	matchingError := &rpcCallError{
+		code:    -32600,
+		message: "invalid paginated history lineage for thread-1: missing source rollout",
+	}
+	tests := map[string]func(map[string]any) error{
+		"different RPC response": func(_ map[string]any) error {
+			return &rpcCallError{code: -32600, message: "missing source rollout"}
+		},
+		"active thread": func(thread map[string]any) error {
+			thread["status"] = map[string]any{"type": "active"}
+			return matchingError
+		},
+		"terminal source": func(thread map[string]any) error {
+			thread["source"] = "cli"
+			return matchingError
+		},
+		"existing rollout": func(thread map[string]any) error {
+			if err := os.WriteFile(missingRollout, []byte("materialized\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return matchingError
+		},
+		"nonempty history": func(thread map[string]any) error {
+			thread["turns"] = []any{map[string]any{"id": "turn-1"}}
+			return matchingError
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			if name == "existing rollout" {
+				t.Cleanup(func() { _ = os.Remove(missingRollout) })
+			}
+			thread := freshThreadMetadata("thread-1", "/workspace/work/example", missingRollout)
+			err := mutate(thread)
+			if freshThreadMissingSourceRollout(thread, "thread-1", err) {
+				t.Fatal("invalid thread metadata was accepted as a fresh missing rollout")
+			}
+		})
 	}
 }
 
