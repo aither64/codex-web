@@ -32,8 +32,9 @@
     }),
     eventsPath: () => apiPath(slug, "events"),
   });
+  const automaticReasoningLabel = () => "Automatic";
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = {createRequest, createSessionClient};
+    module.exports = {automaticReasoningLabel, createRequest, createSessionClient};
     return;
   }
 
@@ -55,7 +56,7 @@
     effortSelect.replaceChildren();
     const fallback = document.createElement("option");
     fallback.value = "";
-    fallback.textContent = model ? "Model default" : "Choose a model first";
+    fallback.textContent = automaticReasoningLabel(model);
     effortSelect.append(fallback);
     for (const option of model?.supportedReasoningEfforts || []) {
       const element = document.createElement("option");
