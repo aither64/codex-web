@@ -1390,11 +1390,13 @@ func freshThreadMissingSourceRollout(thread map[string]any, threadID string, err
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return false
 	}
-	if turns, exists := thread["turns"]; exists && turns != nil {
-		items, ok := turns.([]any)
-		if !ok || len(items) != 0 {
-			return false
-		}
+	turns, exists := thread["turns"]
+	if !exists || turns == nil {
+		return false
+	}
+	items, ok := turns.([]any)
+	if !ok || len(items) != 0 {
+		return false
 	}
 	_, statErr := os.Stat(path)
 	return errors.Is(statErr, os.ErrNotExist)
@@ -1591,10 +1593,49 @@ func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text s
 		if !allowUnmaterializedStart {
 			return errors.New("initial request may already have been accepted by the unmaterialized Codex thread")
 		}
-		return c.Request(ctx, "turn/start", map[string]any{"threadId": threadID, "input": input}, nil)
+		if err := c.Request(ctx, "turn/start", map[string]any{"threadId": threadID, "input": input}, nil); err != nil {
+			return err
+		}
+		return c.waitForInitialMessage(ctx, threadID, cwd, text)
 	}
-	if err := c.resumeThread(ctx, threadID); err != nil {
+	matched, err := c.initialMessageMatches(ctx, threadID, text)
+	if err != nil {
 		return err
+	}
+	if !matched {
+		return errors.New("materialized Codex thread has no initial turn")
+	}
+	return nil
+}
+
+func (c *Client) waitForInitialMessage(ctx context.Context, threadID, cwd, text string) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		materialized, err := c.threadHistoryMaterialized(ctx, threadID, cwd)
+		if err != nil {
+			return err
+		}
+		if materialized {
+			matched, err := c.initialMessageMatches(ctx, threadID, text)
+			if err != nil {
+				return err
+			}
+			if matched {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for persisted initial Codex request: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *Client) initialMessageMatches(ctx context.Context, threadID, text string) (bool, error) {
+	if err := c.resumeThread(ctx, threadID); err != nil {
+		return false, err
 	}
 	var page struct {
 		Data *[]struct {
@@ -1610,13 +1651,13 @@ func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text s
 	if err := c.Request(ctx, "thread/turns/list", map[string]any{
 		"threadId": threadID, "limit": 1, "sortDirection": "asc", "itemsView": "full",
 	}, &page); err != nil {
-		return err
+		return false, err
 	}
 	if page.Data == nil {
-		return errors.New("thread/turns/list returned no data")
+		return false, errors.New("thread/turns/list returned no data")
 	}
 	if len(*page.Data) == 0 {
-		return errors.New("materialized Codex thread has no initial turn")
+		return false, nil
 	}
 	var initialRequests []string
 	for _, item := range (*page.Data)[0].Items {
@@ -1626,17 +1667,28 @@ func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text s
 		var parts []string
 		for _, content := range item.Content {
 			if content.Type != "text" {
-				return errors.New("Codex thread has a non-text initial request")
+				return false, errors.New("Codex thread has a non-text initial request")
 			}
 			parts = append(parts, content.Text)
 		}
 		initialRequests = append(initialRequests, strings.TrimSpace(strings.Join(parts, "\n")))
 	}
 	if len(initialRequests) == 0 {
-		return errors.New("Codex thread already has a turn without an initial user request")
+		return false, errors.New("Codex thread already has a turn without an initial user request")
 	}
 	if len(initialRequests) != 1 || initialRequests[0] != strings.TrimSpace(text) {
-		return errors.New("Codex thread already has a different initial request")
+		return false, errors.New("Codex thread already has a different initial request")
+	}
+	return true, nil
+}
+
+func (c *Client) RequireThreadMaterialized(ctx context.Context, threadID, cwd string) error {
+	materialized, err := c.threadHistoryMaterialized(ctx, threadID, cwd)
+	if err != nil {
+		return err
+	}
+	if !materialized {
+		return errors.New("recorded Codex thread has no persisted history; archive the session and start a new one")
 	}
 	return nil
 }

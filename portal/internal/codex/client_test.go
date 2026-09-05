@@ -187,6 +187,14 @@ func TestFreshMissingSourceRolloutDetectionFailsClosed(t *testing.T) {
 			thread["turns"] = []any{map[string]any{"id": "turn-1"}}
 			return matchingError
 		},
+		"missing history": func(thread map[string]any) error {
+			delete(thread, "turns")
+			return matchingError
+		},
+		"null history": func(thread map[string]any) error {
+			thread["turns"] = nil
+			return matchingError
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -844,7 +852,7 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 			return err
 		}
 		initialExists := false
-		for requestNumber := 0; requestNumber < 5; requestNumber++ {
+		for requestNumber := 0; requestNumber < 8; requestNumber++ {
 			request, err := readObject(connection)
 			if err != nil {
 				return err
@@ -878,10 +886,11 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 			case "turn/start":
 				turnStarted.Add(1)
 				initialExists = true
-				if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
 					return err
 				}
-				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
+				time.Sleep(50 * time.Millisecond)
+				if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
 					return err
 				}
 			default:
@@ -978,6 +987,10 @@ func TestConfiguredCodexFreshThreadContract(t *testing.T) {
 	if materialized {
 		t.Fatal("exact Codex materialized a fresh thread before its first user turn")
 	}
+	if err := client.RequireThreadMaterialized(ctx, threadID, cwd); err == nil ||
+		!strings.Contains(err.Error(), "no persisted history") {
+		t.Fatalf("exact fresh Codex materialization check = %v", err)
+	}
 	recoveredID, err := client.RecoverCreatingThread(ctx, threadID, cwd, map[string]string{
 		"VPSFREE_DEV_SESSION_WORKSPACE": filepath.Join(directory, "workspace"),
 	})
@@ -1001,6 +1014,9 @@ func TestConfiguredCodexFreshThreadContract(t *testing.T) {
 			t.Fatalf("exact Codex did not materialize initial history: %v\n%s", err, output.String())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if err := client.RequireThreadMaterialized(ctx, threadID, cwd); err != nil {
+		t.Fatalf("accept exact persisted Codex thread: %v\n%s", err, output.String())
 	}
 	deadline = time.Now().Add(5 * time.Second)
 	for {
