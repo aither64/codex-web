@@ -1981,7 +1981,12 @@ func handshake(connection *websocket.Conn) error {
 
 func serveUnixWebsocket(t *testing.T, handler func(*websocket.Conn) error) string {
 	t.Helper()
-	socket := filepath.Join(t.TempDir(), "app-server.sock")
+	directory, err := os.MkdirTemp("/tmp", "wpc-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(directory) })
+	socket := filepath.Join(directory, "app-server.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
