@@ -15,6 +15,12 @@ const client = createSessionClient("example", createRequest(fetchRequest));
 assert.equal(automaticReasoningLabel(), "Automatic");
 assert.equal(automaticReasoningLabel({model: "bounded"}), "Automatic");
 
+const automaticRequests = [];
+const automaticClient = createSessionClient("example", async (path, options) => {
+  automaticRequests.push({path, body: JSON.parse(options.body)});
+  return {ok: true};
+});
+
 (async () => {
   const thread = await client.thread();
   assert.equal(thread.threadId, "thread-1");
@@ -30,6 +36,19 @@ assert.equal(automaticReasoningLabel({model: "bounded"}), "Automatic");
     return null;
   });
   assert.deepEqual(await legacyEmptyClient.pending(), []);
+
+  await automaticClient.settings("model-1", "");
+  await automaticClient.fork("forked", "2026-09-05", "model-1", "");
+  assert.deepEqual(automaticRequests, [
+    {
+      path: "/api/sessions/example/settings",
+      body: {model: "model-1", reasoningEffort: ""},
+    },
+    {
+      path: "/api/sessions/example/fork",
+      body: {name: "forked", creationDate: "2026-09-05", model: "model-1", reasoningEffort: ""},
+    },
+  ]);
 
   assert.deepEqual(await client.message("browser message"), {ok: true});
   assert.deepEqual(await client.interrupt(), {ok: true});
