@@ -846,13 +846,14 @@ func TestFileChangeApprovalRequiresTheMatchingThreadItem(t *testing.T) {
 
 func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 	var turnStarted atomic.Int32
+	var historyAttempts atomic.Int32
 	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
 		initialExists := false
-		for requestNumber := 0; requestNumber < 8; requestNumber++ {
+		for requestNumber := 0; requestNumber < 14; requestNumber++ {
 			request, err := readObject(connection)
 			if err != nil {
 				return err
@@ -873,6 +874,28 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 			case "thread/turns/list":
 				if !initialExists {
 					return errors.New("history was listed before the first turn materialized it")
+				}
+				historyAttempt := historyAttempts.Add(1)
+				if historyAttempt == 1 {
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"],
+						"error": map[string]any{
+							"code": -32601, "message": "list_turns is not supported yet",
+						},
+					}); err != nil {
+						return err
+					}
+					continue
+				}
+				if historyAttempt == 2 {
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"], "result": map[string]any{
+							"data": []any{map[string]any{"items": []any{}}},
+						},
+					}); err != nil {
+						return err
+					}
+					continue
 				}
 				turns := []any{}
 				if initialExists {
@@ -1238,8 +1261,8 @@ func TestEnsureInitialMessageRejectsConflictingMaterializedHistory(t *testing.T)
 			false,
 			"non-text initial request",
 		},
-		{"missing user request", []any{map[string]any{"type": "agentMessage", "text": "reply"}}, false, "without an initial user request"},
-		{"missing initial turn", nil, true, "has no initial turn"},
+		{"missing user request", []any{map[string]any{"type": "agentMessage", "text": "reply"}}, false, "no initial user request"},
+		{"missing initial turn", nil, true, "no initial user request"},
 	}
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {

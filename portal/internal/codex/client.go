@@ -1603,7 +1603,7 @@ func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text s
 		return err
 	}
 	if !matched {
-		return errors.New("materialized Codex thread has no initial turn")
+		return errors.New("materialized Codex thread has no initial user request")
 	}
 	return nil
 }
@@ -1619,7 +1619,9 @@ func (c *Client) waitForInitialMessage(ctx context.Context, threadID, cwd, text 
 		if materialized {
 			matched, err := c.initialMessageMatches(ctx, threadID, text)
 			if err != nil {
-				return err
+				if !initialHistoryPending(err) {
+					return err
+				}
 			}
 			if matched {
 				return nil
@@ -1631,6 +1633,12 @@ func (c *Client) waitForInitialMessage(ctx context.Context, threadID, cwd, text 
 		case <-ticker.C:
 		}
 	}
+}
+
+func initialHistoryPending(err error) bool {
+	var rpcErr *rpcCallError
+	return errors.As(err, &rpcErr) && rpcErr.code == -32601 &&
+		rpcErr.message == "list_turns is not supported yet"
 }
 
 func (c *Client) initialMessageMatches(ctx context.Context, threadID, text string) (bool, error) {
@@ -1674,7 +1682,7 @@ func (c *Client) initialMessageMatches(ctx context.Context, threadID, text strin
 		initialRequests = append(initialRequests, strings.TrimSpace(strings.Join(parts, "\n")))
 	}
 	if len(initialRequests) == 0 {
-		return false, errors.New("Codex thread already has a turn without an initial user request")
+		return false, nil
 	}
 	if len(initialRequests) != 1 || initialRequests[0] != strings.TrimSpace(text) {
 		return false, errors.New("Codex thread already has a different initial request")
