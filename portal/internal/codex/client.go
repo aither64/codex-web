@@ -2678,62 +2678,37 @@ type retirementThread struct {
 	Source any    `json:"source"`
 }
 
-// ListThreadActivity returns the active portal-owned threads in one paginated
-// scan. Callers still match both the recorded thread ID and working directory;
-// the list is only an activity hint and never an identity authority.
-func (c *Client) ListThreadActivity(ctx context.Context) ([]ThreadActivity, error) {
-	seenCursors := make(map[string]struct{})
-	seenIDs := make(map[string]struct{})
-	activities := make([]ThreadActivity, 0)
-	var cursor string
-	for {
-		params := map[string]any{
-			"limit": 100, "sortDirection": "desc",
-			"sourceKinds": []string{"vscode"}, "archived": false,
-		}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		var page struct {
-			Data *[]struct {
+// ListThreadActivity reads only the exact portal threads recorded by the
+// workspace. A global thread/list scan can traverse the complete rollout store
+// and block the index while an unrelated turn is active.
+func (c *Client) ListThreadActivity(
+	ctx context.Context, expected []ThreadActivity,
+) ([]ThreadActivity, error) {
+	activities := make([]ThreadActivity, 0, len(expected))
+	for _, identity := range expected {
+		var metadata struct {
+			Thread struct {
 				ID        string `json:"id"`
 				Cwd       string `json:"cwd"`
 				Source    any    `json:"source"`
 				UpdatedAt int64  `json:"updatedAt"`
-			} `json:"data"`
-			NextCursor *string `json:"nextCursor"`
+			} `json:"thread"`
 		}
-		if err := c.Request(ctx, "thread/list", params, &page); err != nil {
+		if err := c.Request(ctx, "thread/read", map[string]any{
+			"threadId": identity.ID, "excludeTurns": true,
+		}, &metadata); err != nil {
 			return nil, err
 		}
-		if page.Data == nil {
-			return nil, errors.New("thread/list returned no data")
+		thread := metadata.Thread
+		if thread.ID != identity.ID || thread.Cwd != identity.Cwd ||
+			thread.UpdatedAt < 0 || !portalThreadSource(thread.Source) {
+			return nil, errors.New("thread/read returned invalid activity metadata")
 		}
-		for _, thread := range *page.Data {
-			if thread.ID == "" || thread.Cwd == "" || thread.UpdatedAt < 0 ||
-				!portalThreadSource(thread.Source) {
-				return nil, errors.New("thread/list returned invalid activity metadata")
-			}
-			if _, duplicate := seenIDs[thread.ID]; duplicate {
-				return nil, fmt.Errorf("thread/list repeated thread %q", thread.ID)
-			}
-			seenIDs[thread.ID] = struct{}{}
-			activities = append(activities, ThreadActivity{
-				ID: thread.ID, Cwd: thread.Cwd, UpdatedAt: time.Unix(thread.UpdatedAt, 0),
-			})
-		}
-		if page.NextCursor == nil {
-			return activities, nil
-		}
-		if *page.NextCursor == "" {
-			return nil, errors.New("thread/list returned an empty activity cursor")
-		}
-		if _, duplicate := seenCursors[*page.NextCursor]; duplicate {
-			return nil, errors.New("thread/list repeated an activity cursor")
-		}
-		seenCursors[*page.NextCursor] = struct{}{}
-		cursor = *page.NextCursor
+		activities = append(activities, ThreadActivity{
+			ID: thread.ID, Cwd: thread.Cwd, UpdatedAt: time.Unix(thread.UpdatedAt, 0),
+		})
 	}
+	return activities, nil
 }
 
 func (c *Client) retirementCandidate(

@@ -141,15 +141,6 @@ client_requests = [
     request(
         "thread/list",
         {
-            "limit": 100,
-            "sortDirection": "desc",
-            "sourceKinds": ["vscode"],
-            "archived": False,
-        },
-    ),
-    request(
-        "thread/list",
-        {
             "cwd": "/workspace/work/example",
             "limit": 2,
             "sortDirection": "asc",
@@ -191,6 +182,7 @@ client_requests = [
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
+    request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/loaded/list", {"limit": 100}),

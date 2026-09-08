@@ -1284,30 +1284,26 @@ func TestTranscriptEntriesOmitEmptyReasoningSummaries(t *testing.T) {
 	}
 }
 
-func TestListThreadActivityPaginatesPortalThreads(t *testing.T) {
+func TestListThreadActivityReadsOnlyExpectedPortalThreads(t *testing.T) {
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
 		for index := 0; index < 2; index++ {
 			request, err := readObject(connection)
-			if err != nil || request["method"] != "thread/list" {
-				return fmt.Errorf("expected thread/list: %#v, %v", request, err)
+			if err != nil || request["method"] != "thread/read" {
+				return fmt.Errorf("expected thread/read: %#v, %v", request, err)
 			}
 			params, _ := request["params"].(map[string]any)
-			if params["archived"] != false || (index == 1 && params["cursor"] != "next") {
+			if params["threadId"] != fmt.Sprintf("thread-%d", index+1) ||
+				params["excludeTurns"] != true {
 				return fmt.Errorf("activity params = %#v", params)
 			}
-			result := map[string]any{"data": []any{map[string]any{
+			result := map[string]any{"thread": map[string]any{
 				"id": fmt.Sprintf("thread-%d", index+1), "cwd": fmt.Sprintf("/work/%d", index+1),
 				"source":    "vscode",
 				"updatedAt": int64(100 + index),
-			}}}
-			if index == 0 {
-				result["nextCursor"] = "next"
-			} else {
-				result["nextCursor"] = nil
-			}
+			}}
 			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
 				return err
 			}
@@ -1318,7 +1314,10 @@ func TestListThreadActivityPaginatesPortalThreads(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	activities, err := client.ListThreadActivity(ctx)
+	activities, err := client.ListThreadActivity(ctx, []ThreadActivity{
+		{ID: "thread-1", Cwd: "/work/1"},
+		{ID: "thread-2", Cwd: "/work/2"},
+	})
 	if err != nil || len(activities) != 2 || activities[1].ID != "thread-2" ||
 		activities[1].UpdatedAt.Unix() != 101 {
 		t.Fatalf("activities = %#v, %v", activities, err)
