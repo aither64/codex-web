@@ -10,12 +10,21 @@ from collections import Counter
 from jsonschema import Draft7Validator
 
 
-SCHEMA_DIR = pathlib.Path(sys.argv[1])
-CLIENT_SOURCE = (
-    pathlib.Path(sys.argv[2])
-    if len(sys.argv) > 2
-    else pathlib.Path(__file__).resolve().parents[1] / "portal/internal/codex/client.go"
-)
+COVERAGE_ONLY = len(sys.argv) > 1 and sys.argv[1] == "--coverage-only"
+if COVERAGE_ONLY:
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: codex_protocol_contract.py --coverage-only CLIENT_SOURCE")
+    SCHEMA_DIR = None
+    CLIENT_SOURCE = pathlib.Path(sys.argv[2])
+else:
+    if len(sys.argv) not in (2, 3):
+        raise SystemExit("usage: codex_protocol_contract.py SCHEMA_DIR [CLIENT_SOURCE]")
+    SCHEMA_DIR = pathlib.Path(sys.argv[1])
+    CLIENT_SOURCE = (
+        pathlib.Path(sys.argv[2])
+        if len(sys.argv) == 3
+        else pathlib.Path(__file__).resolve().parents[1] / "portal/internal/codex/client.go"
+    )
 
 
 def validate(file_name, value, label):
@@ -132,6 +141,15 @@ client_requests = [
     request(
         "thread/list",
         {
+            "limit": 100,
+            "sortDirection": "desc",
+            "sourceKinds": ["vscode"],
+            "archived": False,
+        },
+    ),
+    request(
+        "thread/list",
+        {
             "cwd": "/workspace/work/example",
             "limit": 2,
             "sortDirection": "asc",
@@ -225,8 +243,6 @@ client_requests = [
     request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
     request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
 ]
-for message in client_requests:
-    validate("ClientRequest.json", message, f"client request {message['method']}")
 client_source = CLIENT_SOURCE.read_text()
 call_pattern = re.compile(
     r'\b(?:Request|requestConnected|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z]+)*)"',
@@ -239,6 +255,10 @@ if implemented_calls != covered_calls:
         "Codex request call sites and schema corpus differ: "
         f"implemented={implemented_calls}, covered={covered_calls}"
     )
+if COVERAGE_ONLY:
+    raise SystemExit(0)
+for message in client_requests:
+    validate("ClientRequest.json", message, f"client request {message['method']}")
 
 validate("ClientNotification.json", {"method": "initialized"}, "initialized notification")
 
