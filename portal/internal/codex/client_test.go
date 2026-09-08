@@ -275,13 +275,13 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 	}
 }
 
-func TestResolveNewThreadSettingsDefaultsToMax(t *testing.T) {
+func TestResolveNewThreadSettingsDefaultsToXhigh(t *testing.T) {
 	models := []Model{
 		{
-			Model: "default", DisplayName: "Default", IsDefault: true,
+			Model: DefaultNewThreadModel, DisplayName: "GPT-6 Astra",
 			DefaultReasoningEffort: "medium",
 			SupportedReasoningEfforts: []ReasoningEffortOption{
-				{ReasoningEffort: "medium"}, {ReasoningEffort: "max"},
+				{ReasoningEffort: "medium"}, {ReasoningEffort: "xhigh"},
 			},
 		},
 		{
@@ -293,7 +293,7 @@ func TestResolveNewThreadSettingsDefaultsToMax(t *testing.T) {
 	}
 
 	settings, err := ResolveNewThreadSettings(models, ThreadSettings{})
-	if err != nil || settings.Model != "default" || settings.ReasoningEffort != "max" {
+	if err != nil || settings.Model != DefaultNewThreadModel || settings.ReasoningEffort != "xhigh" {
 		t.Fatalf("default settings = %#v, %v", settings, err)
 	}
 	settings, err = ResolveNewThreadSettings(models, ThreadSettings{Model: "bounded"})
@@ -301,7 +301,7 @@ func TestResolveNewThreadSettingsDefaultsToMax(t *testing.T) {
 		t.Fatalf("bounded settings = %#v, %v", settings, err)
 	}
 	settings, err = ResolveNewThreadSettings(models, ThreadSettings{
-		Model: "default", ReasoningEffort: "medium",
+		Model: DefaultNewThreadModel, ReasoningEffort: "medium",
 	})
 	if err != nil || settings.ReasoningEffort != "medium" {
 		t.Fatalf("explicit settings = %#v, %v", settings, err)
@@ -310,7 +310,7 @@ func TestResolveNewThreadSettingsDefaultsToMax(t *testing.T) {
 
 func TestResolveNewThreadSettingsRejectsInvalidCatalogAndSelections(t *testing.T) {
 	defaultModel := Model{
-		Model: "default", DisplayName: "Default", IsDefault: true,
+		Model: DefaultNewThreadModel, DisplayName: "GPT-6 Astra",
 		DefaultReasoningEffort:    "medium",
 		SupportedReasoningEfforts: []ReasoningEffortOption{{ReasoningEffort: "medium"}},
 	}
@@ -320,11 +320,11 @@ func TestResolveNewThreadSettingsRejectsInvalidCatalogAndSelections(t *testing.T
 		requested ThreadSettings
 		message   string
 	}{
-		{"no default", []Model{{Model: "other"}}, ThreadSettings{}, "no default"},
-		{"duplicate default", []Model{defaultModel, defaultModel}, ThreadSettings{}, "more than one default"},
-		{"default lacks max", []Model{defaultModel}, ThreadSettings{}, "required default reasoning effort"},
+		{"no default", []Model{{Model: "other"}}, ThreadSettings{}, "required default Codex model"},
+		{"duplicate default", []Model{defaultModel, defaultModel}, ThreadSettings{}, "more than one"},
+		{"default lacks xhigh", []Model{defaultModel}, ThreadSettings{}, "required default reasoning effort"},
 		{"missing model", []Model{defaultModel}, ThreadSettings{Model: "missing"}, "not available"},
-		{"unsupported effort", []Model{defaultModel}, ThreadSettings{Model: "default", ReasoningEffort: "max"}, "not available"},
+		{"unsupported effort", []Model{defaultModel}, ThreadSettings{Model: DefaultNewThreadModel, ReasoningEffort: "max"}, "not available"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			_, err := ResolveNewThreadSettings(testCase.models, testCase.requested)
@@ -336,11 +336,12 @@ func TestResolveNewThreadSettingsRejectsInvalidCatalogAndSelections(t *testing.T
 }
 
 func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
+	rollout := settingsRollout(t, "default")
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		for index := 0; index < 5; index++ {
+		for index := 0; index < 7; index++ {
 			request, err := readObject(connection)
 			if err != nil {
 				return err
@@ -358,29 +359,52 @@ func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
 						"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "high"}},
 					}}, "nextCursor": nil,
 				}})
-			case 1, 3:
+			case 1:
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-source" {
+					return fmt.Errorf("expected settings subscription, got %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"thread": map[string]any{"id": "thread-source"},
+					},
+				})
+			case 2, 3:
+				if request["method"] != "thread/read" || params["threadId"] != "thread-source" {
+					return fmt.Errorf("expected settings read, got %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": "thread-source", "model": "old-model", "reasoningEffort": "medium", "path": rollout,
+					}},
+				})
+			case 4:
+				if request["method"] != "thread/settings/update" || params["model"] != "gpt-test" ||
+					params["effort"] != "high" {
+					return fmt.Errorf("invalid settings request: %#v", request)
+				}
+				if _, exists := params["collaborationMode"]; exists {
+					return fmt.Errorf("model update overwrote collaboration mode: %#v", request)
+				}
+				if err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{},
+				}); err == nil {
+					err = writeObject(connection, map[string]any{
+						"method": "thread/settings/updated", "params": map[string]any{
+							"threadId": "thread-source", "threadSettings": map[string]any{
+								"model": "gpt-test", "effort": "high",
+								"collaborationMode": map[string]any{"mode": "default"},
+							},
+						},
+					})
+				}
+			case 5:
 				if request["method"] != "thread/turns/list" || params["threadId"] != "thread-source" {
 					return fmt.Errorf("expected source idle check, got %#v", request)
 				}
 				err = writeObject(connection, map[string]any{
 					"id": request["id"], "result": map[string]any{"data": []any{}},
 				})
-			case 2:
-				if request["method"] != "thread/resume" || params["model"] != "gpt-test" ||
-					params["cwd"] != "/workspace/work/source" {
-					return fmt.Errorf("invalid settings request: %#v", request)
-				}
-				config := params["config"].(map[string]any)
-				if config["model_reasoning_effort"] != "high" {
-					return fmt.Errorf("invalid reasoning setting: %#v", config)
-				}
-				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
-					"thread": map[string]any{
-						"id": "thread-source", "cwd": "/workspace/work/source",
-						"model": "gpt-test", "reasoningEffort": "high",
-					},
-				}})
-			case 4:
+			case 6:
 				if request["method"] != "thread/fork" || params["threadId"] != "thread-source" ||
 					params["cwd"] != "/workspace/work/fork" || params["model"] != "gpt-test" {
 					return fmt.Errorf("invalid fork request: %#v", request)
@@ -405,15 +429,1152 @@ func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
 	if err != nil || len(models) != 1 || models[0].Model != "gpt-test" {
 		t.Fatalf("models = %#v, %v", models, err)
 	}
-	settings := ThreadSettings{Model: "gpt-test", ReasoningEffort: "high"}
-	if _, err := client.UpdateThreadSettings(ctx, "thread-source", "/workspace/work/source", settings); err != nil {
+	model, effort := "gpt-test", "high"
+	update := ThreadSettingsUpdate{Model: &model, ReasoningEffort: &effort}
+	if _, err := client.UpdateThreadSettings(ctx, "thread-source", update); err != nil {
 		t.Fatal(err)
 	}
+	settings := ThreadSettings{Model: model, ReasoningEffort: effort}
 	id, err := client.ForkThread(ctx, "thread-source", "/workspace/work/fork", map[string]string{
 		"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
 	}, settings)
 	if err != nil || id != "thread-fork" {
 		t.Fatalf("fork = %q, %v", id, err)
+	}
+}
+
+func TestCollaborationModesAndNotifications(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil || request["method"] != "collaborationMode/list" {
+			return fmt.Errorf("expected collaborationMode/list: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{
+				map[string]any{"name": "Plan", "mode": "plan", "reasoning_effort": "medium"},
+				map[string]any{"name": "Default", "mode": "default"},
+				map[string]any{"name": "Review", "mode": "review"},
+			}},
+		}); err != nil {
+			return err
+		}
+		if err := writeObject(connection, map[string]any{
+			"method": "thread/settings/updated", "params": map[string]any{
+				"threadId": "thread-1", "threadSettings": map[string]any{
+					"model": "gpt-6-astra", "effort": "xhigh",
+					"collaborationMode": map[string]any{"mode": "plan"},
+				},
+			},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/read" {
+			return fmt.Errorf("expected thread/read: %v", err)
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"thread": map[string]any{
+				"id": "thread-1", "status": "idle", "model": "terminal-model", "reasoningEffort": "high",
+			}},
+		}); err != nil {
+			return err
+		}
+		request, err = readObject(connection)
+		if err != nil || request["method"] != "thread/turns/list" {
+			return fmt.Errorf("expected thread/turns/list: %v", err)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{}},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	modes, err := client.ListCollaborationModes(ctx)
+	if err != nil || len(modes) != 2 || modes[0].Mode != "plan" || modes[1].Mode != "default" {
+		t.Fatalf("collaboration modes = %#v, %v", modes, err)
+	}
+	thread, err := client.ReadThread(ctx, "thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thread.Model != "terminal-model" || thread.ReasoningEffort != "high" ||
+		thread.CollaborationMode != "plan" {
+		t.Fatalf("cached thread settings = %#v", thread)
+	}
+}
+
+func TestCollaborationModeFromRolloutUsesLatestPersistedSettings(t *testing.T) {
+	path := settingsRollout(t, "default")
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := map[string]any{
+		"type": "event_msg", "payload": map[string]any{
+			"type": "thread_settings_applied",
+			"thread_settings": map[string]any{
+				"collaboration_mode": map[string]any{"mode": "plan"},
+			},
+		},
+	}
+	data, err := json.Marshal(entry)
+	if err == nil {
+		_, err = file.Write(append(data, '\n'))
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode, err := collaborationModeFromRollout(path)
+	if err != nil || mode != "plan" {
+		t.Fatalf("latest rollout mode = %q, %v", mode, err)
+	}
+}
+
+func TestCollaborationModeUpdatePreservesModelAndReasoningEffort(t *testing.T) {
+	rollout := settingsRollout(t, "default")
+	updateAcknowledged := make(chan struct{})
+	sendInterleavedNotification := make(chan struct{})
+	interleavedNotificationObserved := make(chan struct{})
+	sendMatchingNotification := make(chan struct{})
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		if err := writeObject(connection, map[string]any{
+			"method": "thread/settings/updated", "params": map[string]any{
+				"threadId": "thread-1", "threadSettings": map[string]any{
+					"model": "stale-model", "effort": "medium",
+					"collaborationMode": map[string]any{"mode": "default"},
+				},
+			},
+		}); err != nil {
+			return err
+		}
+		for index := 0; index < 4; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			if index == 0 {
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("expected settings subscription: %#v", request)
+				}
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"thread": map[string]any{"id": "thread-1"},
+					},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			if index == 1 || index == 2 {
+				if request["method"] != "thread/read" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("expected settings read: %#v", request)
+				}
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": "thread-1", "model": "gpt-6-astra", "reasoningEffort": "xhigh", "path": rollout,
+					}},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			mode, _ := params["collaborationMode"].(map[string]any)
+			settings, _ := mode["settings"].(map[string]any)
+			if request["method"] != "thread/settings/update" || mode["mode"] != "plan" ||
+				settings["model"] != "gpt-6-astra" || settings["reasoning_effort"] != "xhigh" {
+				return fmt.Errorf("mode update changed current settings: %#v", request)
+			}
+			if _, exists := params["model"]; exists {
+				return fmt.Errorf("mode update redundantly overwrote model: %#v", request)
+			}
+			if _, exists := params["effort"]; exists {
+				return fmt.Errorf("mode update redundantly overwrote effort: %#v", request)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{},
+			}); err != nil {
+				return err
+			}
+			close(updateAcknowledged)
+			<-sendInterleavedNotification
+			if err := writeObject(connection, map[string]any{
+				"method": "thread/settings/updated", "params": map[string]any{
+					"threadId": "thread-1", "threadSettings": map[string]any{
+						"model": "other-model", "effort": "high",
+						"collaborationMode": map[string]any{"mode": "plan"},
+					},
+				},
+			}); err != nil {
+				return err
+			}
+			close(interleavedNotificationObserved)
+			<-sendMatchingNotification
+			return writeObject(connection, map[string]any{
+				"method": "thread/settings/updated", "params": map[string]any{
+					"threadId": "thread-1", "threadSettings": map[string]any{
+						"model": "gpt-6-astra", "effort": "xhigh",
+						"collaborationMode": map[string]any{"mode": "plan"},
+					},
+				},
+			})
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	defer closeTestChannel(sendInterleavedNotification)
+	defer closeTestChannel(sendMatchingNotification)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mode := "plan"
+	type result struct {
+		settings ThreadSettings
+		err      error
+	}
+	resultChannel := make(chan result, 1)
+	go func() {
+		settings, err := client.UpdateThreadSettings(
+			ctx, "thread-1", ThreadSettingsUpdate{CollaborationMode: &mode},
+		)
+		resultChannel <- result{settings: settings, err: err}
+	}()
+	select {
+	case <-updateAcknowledged:
+	case <-ctx.Done():
+		t.Fatal("settings update was not acknowledged")
+	}
+	select {
+	case result := <-resultChannel:
+		t.Fatalf("settings update returned before notification: %#v, %v", result.settings, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sendInterleavedNotification)
+	select {
+	case <-interleavedNotificationObserved:
+	case <-ctx.Done():
+		t.Fatal("interleaved settings notification was not delivered")
+	}
+	select {
+	case result := <-resultChannel:
+		t.Fatalf("settings update accepted an interleaved snapshot: %#v, %v", result.settings, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sendMatchingNotification)
+	var outcome result
+	select {
+	case outcome = <-resultChannel:
+	case <-ctx.Done():
+		t.Fatal("settings update did not return after notification")
+	}
+	settings, err := outcome.settings, outcome.err
+	if err != nil || settings.Model != "gpt-6-astra" ||
+		settings.ReasoningEffort != "xhigh" || settings.CollaborationMode != "plan" {
+		t.Fatalf("updated settings = %#v, %v", settings, err)
+	}
+}
+
+func TestCollaborationModeUpdateUsesAStableSettingsSnapshot(t *testing.T) {
+	rollout := settingsRollout(t, "default")
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 6; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			if index == 0 {
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("expected settings subscription: %#v", request)
+				}
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			if index < 5 {
+				if request["method"] != "thread/read" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("expected stable settings read: %#v", request)
+				}
+				model, effort := "gpt-new", "xhigh"
+				if index == 1 {
+					model, effort = "gpt-old", "medium"
+				}
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": "thread-1", "model": model, "reasoningEffort": effort, "path": rollout,
+					}},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			mode, _ := params["collaborationMode"].(map[string]any)
+			settings, _ := mode["settings"].(map[string]any)
+			if request["method"] != "thread/settings/update" || mode["mode"] != "plan" ||
+				settings["model"] != "gpt-new" || settings["reasoning_effort"] != "xhigh" {
+				return fmt.Errorf("mode update used a torn settings snapshot: %#v", request)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{},
+			}); err != nil {
+				return err
+			}
+			return writeObject(connection, map[string]any{
+				"method": "thread/settings/updated", "params": map[string]any{
+					"threadId": "thread-1", "threadSettings": map[string]any{
+						"model": "gpt-new", "effort": "xhigh",
+						"collaborationMode": map[string]any{"mode": "plan"},
+					},
+				},
+			})
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mode := "plan"
+	settings, err := client.UpdateThreadSettings(
+		ctx, "thread-1", ThreadSettingsUpdate{CollaborationMode: &mode},
+	)
+	if err != nil || settings.Model != "gpt-new" ||
+		settings.ReasoningEffort != "xhigh" || settings.CollaborationMode != "plan" {
+		t.Fatalf("updated stable settings = %#v, %v", settings, err)
+	}
+}
+
+func TestSettingsUpdateRejectsClearingReasoningEffort(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "missing.sock")
+	client := New(socket)
+	defer client.Close()
+	ctx := context.Background()
+	model, automatic := "gpt-new", ""
+	_, err := client.UpdateThreadSettings(
+		ctx,
+		"thread-1",
+		ThreadSettingsUpdate{Model: &model, ReasoningEffort: &automatic},
+	)
+	if err == nil || !strings.Contains(err.Error(), "cannot clear reasoning effort") {
+		t.Fatalf("automatic settings error = %v", err)
+	}
+}
+
+func TestNoOpCollaborationModeUpdateReturnsWithoutWaitingForANotification(t *testing.T) {
+	rollout := settingsRollout(t, "default")
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, method := range []string{"thread/resume", "thread/read", "thread/read"} {
+			request, err := readObject(connection)
+			if err != nil || request["method"] != method {
+				return fmt.Errorf("request %d = %#v, %v", index, request, err)
+			}
+			result := map[string]any{}
+			if method == "thread/read" {
+				result["thread"] = map[string]any{
+					"id": "thread-1", "model": "gpt-6-astra", "reasoningEffort": "xhigh", "path": rollout,
+				}
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": result,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mode := "default"
+	settings, err := client.UpdateThreadSettings(
+		ctx,
+		"thread-1",
+		ThreadSettingsUpdate{CollaborationMode: &mode},
+	)
+	if err != nil || settings.CollaborationMode != mode {
+		t.Fatalf("no-op settings = %#v, %v", settings, err)
+	}
+}
+
+func TestQueueUsesFIFOAppServerContracts(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 10; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			switch index {
+			case 0, 1:
+				if request["method"] != "thread/queue/list" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("invalid queue list: %#v", request)
+				}
+				if index == 1 && params["cursor"] != "next" {
+					return fmt.Errorf("invalid queue cursor: %#v", params)
+				}
+				result := map[string]any{
+					"data": []any{map[string]any{
+						"id": "queued-1", "clientUserMessageId": "client-1",
+						"input": []any{map[string]any{"type": "text", "text": "first"}},
+					}},
+					"nextCursor": "next",
+				}
+				if index == 1 {
+					result = map[string]any{
+						"data": []any{map[string]any{
+							"id": "queued-2", "clientUserMessageId": "client-2",
+							"input": []any{map[string]any{"type": "text", "text": "second"}},
+						}},
+						"nextCursor": nil,
+					}
+				}
+				err = writeObject(connection, map[string]any{"id": request["id"], "result": result})
+			case 2:
+				if request["method"] != "thread/queue/add" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("invalid queue add: %#v", request)
+				}
+				clientID, _ := params["clientUserMessageId"].(string)
+				if clientID == "" {
+					return errors.New("queue add omitted client message id")
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "error": map[string]any{
+						"code": -32603, "message": "response was lost after queue persistence",
+					},
+				})
+			case 3:
+				if request["method"] != "thread/queue/list" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("invalid queue reconciliation: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+						"id": "queued-3", "clientUserMessageId": "queue-attempt-1",
+						"input": []any{map[string]any{"type": "text", "text": "third"}},
+					}}, "nextCursor": nil},
+				})
+			case 4:
+				if request["method"] != "thread/queue/list" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("invalid queue delete lookup: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+						"id": "queued-1", "clientUserMessageId": "client-1",
+						"input": []any{map[string]any{"type": "text", "text": "first"}},
+					}}, "nextCursor": nil},
+				})
+			case 5:
+				if request["method"] != "thread/queue/delete" || params["queuedSubmissionId"] != "queued-1" {
+					return fmt.Errorf("invalid queue delete: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"deleted": true},
+				})
+			case 6:
+				if request["method"] != "thread/queue/list" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("invalid start target lookup: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+						"id": "queued-2", "clientUserMessageId": "client-2",
+						"input": []any{map[string]any{"type": "text", "text": "second"}},
+					}}, "nextCursor": nil},
+				})
+			case 7:
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("invalid queue resume: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": "thread-1"}},
+				})
+			case 8:
+				if request["method"] != "thread/items/list" || params["threadId"] != "thread-1" {
+					return fmt.Errorf("invalid queue start reconciliation: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{}, "nextCursor": nil},
+				})
+			case 9:
+				if request["method"] != "thread/queue/start" || params["threadId"] != "thread-1" ||
+					params["queuedSubmissionId"] != "queued-2" {
+					return fmt.Errorf("invalid queue start: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"turn": map[string]any{
+						"id": "turn-1", "status": "inProgress",
+					}},
+				})
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entries, err := client.ListQueue(ctx, "thread-1")
+	if err != nil || len(entries) != 2 || entries[0].Text != "first" || entries[1].Text != "second" {
+		t.Fatalf("queue = %#v, %v", entries, err)
+	}
+	queued, err := client.Queue(ctx, "thread-1", "third", "queue-attempt-1")
+	if err != nil || queued.ID != "queued-3" || queued.Text != "third" {
+		t.Fatalf("queued = %#v, %v", queued, err)
+	}
+	if err := client.DeleteQueueEntry(ctx, "thread-1", "queued-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.StartQueue(ctx, "thread-1", "queued-2"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSendReturnsAClientCorrelatedReceipt(t *testing.T) {
+	tests := []struct {
+		name       string
+		activeTurn string
+		method     string
+		steered    bool
+	}{
+		{name: "idle thread", method: "turn/start"},
+		{name: "active turn", activeTurn: "turn-active", method: "turn/steer", steered: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for index, expected := range []string{
+					"thread/items/list", "thread/resume", "thread/turns/list", test.method,
+					"thread/items/list",
+				} {
+					request, err := readObject(connection)
+					if err != nil {
+						return err
+					}
+					if request["method"] != expected {
+						return fmt.Errorf("request %d = %#v, want %s", index, request, expected)
+					}
+					params := request["params"].(map[string]any)
+					result := map[string]any{}
+					switch index {
+					case 0:
+						result = map[string]any{"data": []any{}, "nextCursor": nil}
+					case 2:
+						turns := []any{}
+						if test.activeTurn != "" {
+							turns = append(turns, map[string]any{
+								"id": test.activeTurn, "status": "inProgress",
+							})
+						}
+						result = map[string]any{"data": turns}
+					case 3:
+						if params["threadId"] != "thread-1" ||
+							params["clientUserMessageId"] != "client-message-1" {
+							return fmt.Errorf("uncorrelated message request: %#v", request)
+						}
+						if test.steered {
+							if params["expectedTurnId"] != test.activeTurn {
+								return fmt.Errorf("wrong steer turn: %#v", request)
+							}
+							result = map[string]any{"turnId": test.activeTurn}
+						} else {
+							result = map[string]any{"turn": map[string]any{"id": "turn-new"}}
+						}
+					case 4:
+						turn := "turn-new"
+						if test.steered {
+							turn = test.activeTurn
+						}
+						result = map[string]any{"data": []any{map[string]any{
+							"turnId": turn, "item": map[string]any{
+								"id": "message-1", "type": "userMessage",
+								"clientId": "client-message-1",
+								"content":  []any{map[string]any{"type": "text", "text": "message"}},
+							},
+						}}, "nextCursor": nil}
+					}
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"], "result": result,
+					}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := New(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			receipt, err := client.Send(ctx, "thread-1", "message", "client-message-1", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantTurn := "turn-new"
+			if test.steered {
+				wantTurn = test.activeTurn
+			}
+			if receipt.TurnID != wantTurn || receipt.ClientUserMessageID != "client-message-1" ||
+				receipt.Steered != test.steered {
+				t.Fatalf("send receipt = %#v", receipt)
+			}
+		})
+	}
+}
+
+func TestSendRetryReconcilesARecordedAttemptWithoutSubmittingAgain(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		if request["method"] != "thread/items/list" {
+			return fmt.Errorf("retry submitted instead of reconciling: %#v", request)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"data": []any{map[string]any{
+					"turnId": "turn-accepted", "item": map[string]any{
+						"id": "message-accepted", "type": "userMessage",
+						"clientId": "client-message-retry",
+						"content":  []any{map[string]any{"type": "text", "text": "message"}},
+					},
+				}},
+				"nextCursor": nil,
+			},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordSendAttempt(
+		"thread-1", "client-message-retry", "message", "", true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendSubmitting("thread-1", "client-message-retry"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	receipt, err := client.Send(ctx, "thread-1", "message", "client-message-retry", "")
+	if err != nil || receipt.TurnID != "turn-accepted" ||
+		receipt.ClientUserMessageID != "client-message-retry" || !receipt.Steered {
+		t.Fatalf("reconciled send = %#v, %v", receipt, err)
+	}
+}
+
+func TestSendRetryFailsClosedWhileRecordedAttemptIsAbsent(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		if request["method"] != "thread/items/list" {
+			return fmt.Errorf("retry submitted instead of reconciling: %#v", request)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"data": []any{}, "nextCursor": nil,
+			},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordSendAttempt(
+		"thread-1", "client-message-unknown", "message", "", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendSubmitting("thread-1", "client-message-unknown"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.Send(ctx, "thread-1", "message", "client-message-unknown", "")
+	var unknown *UnknownSendOutcomeError
+	if !errors.As(err, &unknown) {
+		t.Fatalf("unknown send outcome = %v", err)
+	}
+}
+
+func TestPreparedSendSurvivesRestartAndIsPrunedAfterAcceptance(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, expected := range []string{
+			"thread/resume", "thread/turns/list", "turn/start", "thread/items/list",
+		} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != expected {
+				return fmt.Errorf("request %d = %#v, want %s", index, request, expected)
+			}
+			result := map[string]any{}
+			if index == 1 {
+				result = map[string]any{"data": []any{}}
+			} else if index == 2 {
+				result = map[string]any{"turn": map[string]any{"id": "turn-plan"}}
+			} else if index == 3 {
+				result = map[string]any{"data": []any{map[string]any{
+					"turnId": "turn-plan", "item": map[string]any{
+						"id": "message-plan", "type": "userMessage", "clientId": "client-plan",
+						"content": []any{map[string]any{"type": "text", "text": "Implement the plan."}},
+					},
+				}}, "nextCursor": nil}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	first := New(socket)
+	if err := first.PrepareSend(
+		"thread-1", "Implement the plan.", "client-plan", "plan:digest", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Send(
+		ctx, "thread-1", "Implement the plan.", "client-plan", "",
+	); err == nil || !strings.Contains(err.Error(), "another action") {
+		t.Fatalf("generic replay of plan send error = %v", err)
+	}
+	if _, err := client.Send(
+		ctx, "thread-1", "Implement the plan.", "client-plan", "plan:other",
+	); err == nil || !strings.Contains(err.Error(), "another action") {
+		t.Fatalf("different-plan replay error = %v", err)
+	}
+	receipt, err := client.Send(
+		ctx, "thread-1", "Implement the plan.", "client-plan", "plan:digest",
+	)
+	if err != nil || receipt.TurnID != "turn-plan" || receipt.Steered {
+		t.Fatalf("prepared send = %#v, %v", receipt, err)
+	}
+	if _, found, err := client.sendAttempt(
+		"thread-1", "client-plan", "Implement the plan.", "plan:digest",
+	); err != nil || found {
+		t.Fatalf("accepted attempt retained = %t, %v", found, err)
+	}
+}
+
+func TestAcceptedSendIsPrunedAndAStaleRetryUsesHistory(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, expected := range []string{
+			"thread/items/list", "thread/resume", "thread/turns/list", "turn/start",
+			"thread/items/list", "thread/items/list",
+		} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != expected {
+				return fmt.Errorf("request %d = %#v, want %s", index, request, expected)
+			}
+			result := map[string]any{}
+			switch index {
+			case 0:
+				result = map[string]any{"data": []any{}, "nextCursor": nil}
+			case 2:
+				result = map[string]any{"data": []any{}}
+			case 3:
+				result = map[string]any{"turn": map[string]any{"id": "turn-1"}}
+			case 4, 5:
+				result = map[string]any{"data": []any{map[string]any{
+					"turnId": "turn-1", "item": map[string]any{
+						"id": "message-1", "type": "userMessage", "clientId": "client-1",
+						"content": []any{map[string]any{"type": "text", "text": "message"}},
+					},
+				}}, "nextCursor": nil}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := client.Send(ctx, "thread-1", "message", "client-1", "")
+	if err != nil || first.TurnID != "turn-1" {
+		t.Fatalf("first send = %#v, %v", first, err)
+	}
+	if _, found, err := client.sendAttempt("thread-1", "client-1", "message", ""); err != nil || found {
+		t.Fatalf("accepted send attempt retained = %t, %v", found, err)
+	}
+	retry, err := client.Send(ctx, "thread-1", "message", "client-1", "")
+	if err != nil || retry.TurnID != "turn-1" || retry.Steered {
+		t.Fatalf("stale retry = %#v, %v", retry, err)
+	}
+}
+
+func TestTranscriptEntriesExposeClientMessageIdentityAndPlanCompletion(t *testing.T) {
+	entries := transcriptEntries(map[string]any{
+		"id": "turn-1", "status": "completed", "items": []any{
+			map[string]any{
+				"id": "item-user", "type": "userMessage",
+				"clientId": "client-1",
+				"content":  []any{map[string]any{"type": "text", "text": "hello"}},
+			},
+			map[string]any{"id": "item-plan", "type": "plan", "text": "the plan"},
+		},
+	})
+	if len(entries) != 2 || entries[0].ClientUserMessageID != "client-1" ||
+		entries[0].ItemID != "item-user" || entries[1].TurnStatus != "completed" ||
+		entries[1].ItemID != "item-plan" {
+		t.Fatalf("transcript entries = %#v", entries)
+	}
+}
+
+func TestTranscriptEntriesOmitEmptyReasoningSummaries(t *testing.T) {
+	entries := transcriptEntries(map[string]any{
+		"id": "turn-1", "status": "completed", "items": []any{
+			map[string]any{"id": "empty", "type": "reasoning", "summary": []any{}},
+			map[string]any{"id": "blank", "type": "reasoning", "summary": []any{" \n"}},
+			map[string]any{"id": "visible", "type": "reasoning", "summary": []any{"First", "Second"}},
+		},
+	})
+	if len(entries) != 1 || entries[0].ItemID != "visible" ||
+		entries[0].Summary != "Reasoning summary" || entries[0].Text != "First\nSecond" {
+		t.Fatalf("reasoning transcript entries = %#v", entries)
+	}
+}
+
+func TestListThreadActivityPaginatesPortalThreads(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 2; index++ {
+			request, err := readObject(connection)
+			if err != nil || request["method"] != "thread/list" {
+				return fmt.Errorf("expected thread/list: %#v, %v", request, err)
+			}
+			params, _ := request["params"].(map[string]any)
+			if params["archived"] != false || (index == 1 && params["cursor"] != "next") {
+				return fmt.Errorf("activity params = %#v", params)
+			}
+			result := map[string]any{"data": []any{map[string]any{
+				"id": fmt.Sprintf("thread-%d", index+1), "cwd": fmt.Sprintf("/work/%d", index+1),
+				"source":    "vscode",
+				"updatedAt": int64(100 + index),
+			}}}
+			if index == 0 {
+				result["nextCursor"] = "next"
+			} else {
+				result["nextCursor"] = nil
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	activities, err := client.ListThreadActivity(ctx)
+	if err != nil || len(activities) != 2 || activities[1].ID != "thread-2" ||
+		activities[1].UpdatedAt.Unix() != 101 {
+		t.Fatalf("activities = %#v, %v", activities, err)
+	}
+}
+
+func TestStartQueueRejectsANonHeadSubmission(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil || request["method"] != "thread/queue/list" {
+			return fmt.Errorf("expected queue head lookup: %#v, %v", request, err)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{
+				map[string]any{
+					"id": "queued-1", "clientUserMessageId": "client-1",
+					"input": []any{map[string]any{"type": "text", "text": "first"}},
+				},
+				map[string]any{
+					"id": "queued-2", "clientUserMessageId": "client-2",
+					"input": []any{map[string]any{"type": "text", "text": "second"}},
+				},
+			}, "nextCursor": nil},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.StartQueue(ctx, "thread-1", "queued-2"); err == nil ||
+		!strings.Contains(err.Error(), "only the first queued message") {
+		t.Fatalf("non-head queue start error = %v", err)
+	}
+}
+
+func TestQueueRetryFindsAnAlreadyStartedMessage(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 5; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			var result map[string]any
+			switch index {
+			case 1, 3:
+				if request["method"] != "thread/queue/list" {
+					return fmt.Errorf("expected queue reconciliation: %#v", request)
+				}
+				result = map[string]any{"data": []any{}, "nextCursor": nil}
+			case 2:
+				if request["method"] != "thread/items/list" {
+					return fmt.Errorf("expected history reconciliation: %#v", request)
+				}
+				result = map[string]any{"data": []any{}, "nextCursor": nil}
+			case 0:
+				if request["method"] != "thread/queue/add" ||
+					params["clientUserMessageId"] != "client-retry" {
+					return fmt.Errorf("invalid queue submission: %#v", request)
+				}
+				result = map[string]any{"queuedSubmission": map[string]any{}}
+			case 4:
+				if request["method"] != "thread/items/list" {
+					return fmt.Errorf("expected retry history lookup: %#v", request)
+				}
+				result = map[string]any{"data": []any{map[string]any{
+					"turnId": "turn-1", "item": map[string]any{
+						"id": "message-1", "type": "userMessage", "clientId": "client-retry",
+						"content": []any{map[string]any{"type": "text", "text": "queued text"}},
+					},
+				}}, "nextCursor": nil}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Queue(ctx, "thread-1", "queued text", "client-retry"); err == nil ||
+		!strings.Contains(err.Error(), "unknown outcome") {
+		t.Fatalf("first queue error = %v", err)
+	}
+	entry, err := client.Queue(ctx, "thread-1", "queued text", "client-retry")
+	if err != nil || entry.ID != "message-1" || entry.ClientUserMessageID != "client-retry" {
+		t.Fatalf("reconciled queue entry = %#v, %v", entry, err)
+	}
+}
+
+func TestQueueRetryFailsClosedWhileOutcomeIsUnknown(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 5; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if index == 0 {
+				if request["method"] != "thread/queue/add" {
+					return fmt.Errorf("expected queue submission: %#v", request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"queuedSubmission": map[string]any{}},
+				})
+			} else {
+				expected := "thread/queue/list"
+				if index == 2 || index == 4 {
+					expected = "thread/items/list"
+				}
+				if request["method"] != expected {
+					return fmt.Errorf("expected %s: %#v", expected, request)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{}, "nextCursor": nil},
+				})
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Queue(ctx, "thread-1", "queued text", "client-unknown"); err == nil {
+		t.Fatal("ambiguous queue submission succeeded")
+	}
+	if _, err := client.Queue(ctx, "thread-1", "queued text", "client-unknown"); err == nil ||
+		!strings.Contains(err.Error(), "outcome is still unknown") {
+		t.Fatalf("retry error = %v", err)
+	}
+}
+
+func TestQueueAttemptsSurviveClientRestart(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "app-server.sock")
+	first := New(socket)
+	if err := first.recordQueueAttempt("thread-1", "client-1", "queued text"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.PrepareSend(
+		"thread-1", "sent text", "message-1", "plan:digest", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.recordRetirementAttempt("/workspace/work/example", "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+
+	second := New(socket)
+	defer second.Close()
+	attempted, err := second.queueAttempt("thread-1", "client-1", "queued text")
+	if err != nil || !attempted {
+		t.Fatalf("restored queue attempt = %v, %v", attempted, err)
+	}
+	if _, err := second.queueAttempt("thread-1", "client-1", "different text"); err == nil {
+		t.Fatal("restored queue attempt accepted different text")
+	}
+	messageAttempted, err := second.SendAttempted(
+		context.Background(), "thread-1", "sent text", "message-1", "plan:digest",
+	)
+	if err != nil || !messageAttempted {
+		t.Fatalf("restored send attempt = %v, %v", messageAttempted, err)
+	}
+	retiringThread, err := second.retirementAttempt("/workspace/work/example")
+	if err != nil || retiringThread != "thread-1" {
+		t.Fatalf("restored retirement attempt = %q, %v", retiringThread, err)
+	}
+	info, err := os.Stat(socket + ".submission-attempts-v2.json")
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("queue ledger mode = %v, %v", info, err)
+	}
+}
+
+func TestQueueDeletionResponseLossReconcilesAfterClientRestart(t *testing.T) {
+	directory := t.TempDir()
+	socket := filepath.Join(directory, "app-server.sock")
+	first := New(socket)
+	if err := first.recordQueueAttempt("thread-1", "client-1", "queued text"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.recordQueueDeletionAttempt("thread-1", QueueEntry{
+		ID: "queued-1", Text: "queued text", ClientUserMessageID: "client-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, acceptErr := websocket.Accept(w, r, nil)
+		if acceptErr != nil {
+			t.Errorf("accept websocket: %v", acceptErr)
+			return
+		}
+		go func() {
+			defer connection.Close(websocket.StatusNormalClosure, "")
+			if handshakeErr := handshake(connection); handshakeErr != nil {
+				t.Errorf("handshake: %v", handshakeErr)
+				return
+			}
+			for _, method := range []string{"thread/queue/list", "thread/items/list"} {
+				request, readErr := readObject(connection)
+				if readErr != nil {
+					t.Errorf("read %s: %v", method, readErr)
+					return
+				}
+				if request["method"] != method {
+					t.Errorf("request = %#v, want %s", request, method)
+					return
+				}
+				if writeErr := writeObject(connection, map[string]any{
+					"id":     request["id"],
+					"result": map[string]any{"data": []any{}, "nextCursor": nil},
+				}); writeErr != nil {
+					t.Errorf("write %s: %v", method, writeErr)
+					return
+				}
+			}
+		}()
+	})}
+	go server.Serve(listener)
+	t.Cleanup(func() { server.Close() })
+
+	second := New(socket)
+	defer second.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := second.DeleteQueueEntry(ctx, "thread-1", "queued-1"); err != nil {
+		t.Fatal(err)
+	}
+	if attempted, err := second.queueAttempt(
+		"thread-1", "client-1", "queued text",
+	); err != nil || attempted {
+		t.Fatalf("queue attempt after deletion reconciliation = %v, %v", attempted, err)
+	}
+	if _, attempted, err := second.queueDeletionAttempt(
+		"thread-1", "queued-1",
+	); err != nil || attempted {
+		t.Fatalf("deletion attempt after reconciliation = %v, %v", attempted, err)
 	}
 }
 
@@ -470,6 +1631,161 @@ func TestRecoverForkThreadResumesMatchingPersistedFork(t *testing.T) {
 	)
 	if err != nil || id != "thread-fork" {
 		t.Fatalf("recovered fork = %q, %v", id, err)
+	}
+}
+
+func TestRecoverArchivedThreadUnarchivesAndResumesExactIdentity(t *testing.T) {
+	threadID := "thread-archived"
+	cwd := "/workspace/work/revived"
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, expected := range []string{"thread/list", "thread/list", "thread/unarchive", "thread/resume"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != expected {
+				return fmt.Errorf("request %d = %#v, want %s", index, request, expected)
+			}
+			params := request["params"].(map[string]any)
+			switch index {
+			case 0, 1:
+				if params["cwd"] != cwd || params["archived"] != (index == 1) {
+					return fmt.Errorf("thread lookup %d = %#v", index, params)
+				}
+				data := []any{}
+				if index == 1 {
+					data = append(data,
+						map[string]any{"id": "older-thread", "cwd": cwd, "source": "vscode"},
+						map[string]any{"id": threadID, "cwd": cwd, "source": "vscode"},
+					)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": data},
+				})
+			case 2:
+				if params["threadId"] != threadID {
+					return fmt.Errorf("unarchive params = %#v", params)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": threadID, "cwd": cwd, "source": "vscode",
+					}},
+				})
+			case 3:
+				if params["threadId"] != threadID || params["cwd"] != cwd {
+					return fmt.Errorf("resume params = %#v", params)
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": threadID, "cwd": cwd,
+					}},
+				})
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := client.RecoverArchivedThread(
+		ctx, threadID, cwd, map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+	)
+	if err != nil || id != threadID {
+		t.Fatalf("recovered thread = %q, %v", id, err)
+	}
+}
+
+func TestRecoverArchivedThreadRetryResumesAlreadyActiveIdentity(t *testing.T) {
+	threadID := "thread-active"
+	cwd := "/workspace/work/revived"
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, expected := range []string{"thread/list", "thread/list", "thread/resume"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != expected {
+				return fmt.Errorf("request %d = %#v, want %s", index, request, expected)
+			}
+			params := request["params"].(map[string]any)
+			if index < 2 {
+				data := []any{}
+				if index == 0 {
+					data = append(data, map[string]any{"id": threadID, "cwd": cwd, "source": "vscode"})
+				} else {
+					data = append(data,
+						map[string]any{"id": "older-thread-1", "cwd": cwd, "source": "vscode"},
+						map[string]any{"id": "older-thread-2", "cwd": cwd, "source": "vscode"},
+					)
+				}
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": data},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			if params["threadId"] != threadID || params["cwd"] != cwd {
+				return fmt.Errorf("resume params = %#v", params)
+			}
+			return writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{"thread": map[string]any{
+					"id": threadID, "cwd": cwd,
+				}},
+			})
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := client.RecoverArchivedThread(ctx, threadID, cwd, nil)
+	if err != nil || id != threadID {
+		t.Fatalf("retried recovery = %q, %v", id, err)
+	}
+}
+
+func TestRecoverArchivedThreadRejectsAnotherDirectoryIdentity(t *testing.T) {
+	cwd := "/workspace/work/revived"
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 2; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			data := []any{}
+			if index == 0 {
+				data = append(data, map[string]any{"id": "thread-other", "cwd": cwd, "source": "vscode"})
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{"data": data},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.RecoverArchivedThread(ctx, "thread-expected", cwd, nil)
+	if err == nil || !strings.Contains(err.Error(), "another active Codex thread") {
+		t.Fatalf("identity error = %v", err)
 	}
 }
 
@@ -609,13 +1925,14 @@ func TestListResponsesFailClosedWhenDataIsMissing(t *testing.T) {
 		{
 			name: "active turn lookup",
 			run: func(ctx context.Context, client *Client) error {
-				return client.Send(ctx, "thread-1", "follow-up")
+				_, err := client.Send(ctx, "thread-1", "follow-up", "client-1", "")
+				return err
 			},
 		},
 		{
 			name: "thread items",
 			run: func(ctx context.Context, client *Client) error {
-				_, err := client.threadItems(ctx, "thread-1")
+				_, err := client.threadItems(ctx, "thread-1", "item-1")
 				return err
 			},
 		},
@@ -689,10 +2006,19 @@ func TestRequireThreadIdleRejectsAnActiveTurn(t *testing.T) {
 				if err != nil || request["method"] != "thread/turns/list" {
 					return fmt.Errorf("expected thread/turns/list: %v", err)
 				}
-				return writeObject(connection, map[string]any{
+				if err := writeObject(connection, map[string]any{
 					"id": request["id"], "result": map[string]any{"data": []any{
 						map[string]any{"id": "turn-1", "status": testCase.status},
 					}},
+				}); err != nil || !testCase.ok {
+					return err
+				}
+				request, err = readObject(connection)
+				if err != nil || request["method"] != "thread/queue/list" {
+					return fmt.Errorf("expected thread/queue/list: %v", err)
+				}
+				return writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{}, "nextCursor": nil},
 				})
 			})
 			client := New(socket)
@@ -704,6 +2030,191 @@ func TestRequireThreadIdleRejectsAnActiveTurn(t *testing.T) {
 				t.Fatalf("idle = %t, want %t: %v", err == nil, testCase.ok, err)
 			}
 		})
+	}
+}
+
+func TestRequireThreadIdleRejectsPendingRequestsAndQueuedMessages(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		pending bool
+		queued  bool
+		want    string
+	}{
+		{name: "pending request", pending: true, want: "pending request"},
+		{name: "queued message", queued: true, want: "queued message"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for _, method := range []string{"thread/read", "thread/turns/list"} {
+					request, err := readObject(connection)
+					if err != nil || request["method"] != method {
+						return fmt.Errorf("expected %s: %v", method, err)
+					}
+					result := map[string]any{"data": []any{}}
+					if method == "thread/read" {
+						result = map[string]any{"thread": map[string]any{
+							"id": "thread-1", "cwd": "/workspace/work/example",
+						}}
+					}
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"], "result": result,
+					}); err != nil {
+						return err
+					}
+				}
+				if testCase.pending {
+					return nil
+				}
+				request, err := readObject(connection)
+				if err != nil || request["method"] != "thread/queue/list" {
+					return fmt.Errorf("expected thread/queue/list: %v", err)
+				}
+				queue := []any{}
+				if testCase.queued {
+					queue = append(queue, map[string]any{
+						"id": "queue-1", "clientUserMessageId": "client-1",
+						"input": []any{map[string]any{"type": "text", "text": "later"}},
+					})
+				}
+				return writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"data": queue, "nextCursor": nil,
+					},
+				})
+			})
+			client := New(socket)
+			defer client.Close()
+			if testCase.pending {
+				params, err := json.Marshal(map[string]any{
+					"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+					"questions": []any{map[string]any{
+						"id": "choice", "header": "Choice", "question": "Continue?",
+						"options": []any{map[string]any{"label": "Yes", "description": "Continue."}},
+					}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				client.requests["request-1"] = PendingRequest{
+					ID: "request-1", Method: "item/tool/requestUserInput", Params: params,
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.RequireThreadIdle(ctx, "thread-1", "/workspace/work/example")
+			if err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("idle check = %v, want %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestRequireThreadIdleRejectsUnresolvedDurableSubmissionAttempts(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		queue bool
+		want  string
+	}{
+		{name: "send attempt", want: "unresolved message attempt"},
+		{name: "queue attempt", queue: true, want: "unresolved queued message attempt"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				methods := []string{"thread/read", "thread/turns/list", "thread/queue/list"}
+				if testCase.queue {
+					methods = append(methods, "thread/items/list")
+				}
+				for _, method := range methods {
+					request, err := readObject(connection)
+					if err != nil || request["method"] != method {
+						return fmt.Errorf("expected %s: %v", method, err)
+					}
+					result := map[string]any{"data": []any{}, "nextCursor": nil}
+					if method == "thread/read" {
+						result = map[string]any{"thread": map[string]any{
+							"id": "thread-1", "cwd": "/workspace/work/example",
+						}}
+					}
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"], "result": result,
+					}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := New(socket)
+			defer client.Close()
+			if testCase.queue {
+				if err := client.recordQueueAttempt("thread-1", "client-1", "queued text"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := client.recordSendAttempt(
+					"thread-1", "client-1", "message text", "", false,
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.RequireThreadIdle(ctx, "thread-1", "/workspace/work/example")
+			if err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("idle check = %v, want %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestRequireThreadIdleAcceptsAQueuedAttemptPresentInCompletedHistory(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for _, method := range []string{
+			"thread/read", "thread/turns/list", "thread/queue/list", "thread/items/list",
+		} {
+			request, err := readObject(connection)
+			if err != nil || request["method"] != method {
+				return fmt.Errorf("expected %s: %v", method, err)
+			}
+			result := map[string]any{"data": []any{}, "nextCursor": nil}
+			switch method {
+			case "thread/read":
+				result = map[string]any{"thread": map[string]any{
+					"id": "thread-1", "cwd": "/workspace/work/example",
+				}}
+			case "thread/items/list":
+				result = map[string]any{"data": []any{map[string]any{
+					"turnId": "turn-1", "item": map[string]any{
+						"id": "item-1", "type": "userMessage", "clientId": "client-1",
+						"content": []any{map[string]any{"type": "text", "text": "queued text"}},
+					},
+				}}, "nextCursor": nil}
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": result,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordQueueAttempt("thread-1", "client-1", "queued text"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RequireThreadIdle(ctx, "thread-1", "/workspace/work/example"); err != nil {
+		t.Fatalf("resolved queue attempt rejected: %v", err)
 	}
 }
 
@@ -728,7 +2239,7 @@ func TestApprovalAuthorityAndResolvedRequests(t *testing.T) {
 				"turnId": "turn-1", "item": map[string]any{
 					"id": "item-1", "type": "commandExecution", "command": "dangerous command",
 				},
-			}}},
+			}}, "nextCursor": "older-items"},
 		}); err != nil {
 			return err
 		}
@@ -847,13 +2358,14 @@ func TestFileChangeApprovalRequiresTheMatchingThreadItem(t *testing.T) {
 func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 	var turnStarted atomic.Int32
 	var historyAttempts atomic.Int32
+	var rolloutReadAttempts atomic.Int32
 	rollout := filepath.Join(t.TempDir(), "rollout.jsonl")
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
 		initialExists := false
-		for requestNumber := 0; requestNumber < 14; requestNumber++ {
+		for requestNumber := 0; requestNumber < 15; requestNumber++ {
 			request, err := readObject(connection)
 			if err != nil {
 				return err
@@ -864,6 +2376,21 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 					return err
 				}
 			case "thread/read":
+				if initialExists && rolloutReadAttempts.Add(1) == 1 {
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"], "error": map[string]any{
+							"code": -32603,
+							"message": "failed to read thread: thread-store internal error: " +
+								"failed to read session metadata " + rollout + ": rollout at " + rollout + " is empty",
+						},
+					}); err != nil {
+						return err
+					}
+					if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+						return err
+					}
+					continue
+				}
 				if err := writeObject(connection, map[string]any{
 					"id": request["id"], "result": map[string]any{
 						"thread": freshThreadMetadata("thread-1", "/workspace/work/example", rollout),
@@ -909,11 +2436,10 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 			case "turn/start":
 				turnStarted.Add(1)
 				initialExists = true
-				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
+				if err := os.WriteFile(rollout, nil, 0o600); err != nil {
 					return err
 				}
-				time.Sleep(50 * time.Millisecond)
-				if err := os.WriteFile(rollout, []byte("materialized\n"), 0o600); err != nil {
+				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
 					return err
 				}
 			default:
@@ -1108,6 +2634,9 @@ func TestEnsureInitialMessageRejectsInvalidUnmaterializedThreads(t *testing.T) {
 		{"stat error", func(thread map[string]any) { thread["path"] = loop }, "inspect Codex thread rollout"},
 		{"nonregular path", func(thread map[string]any) { thread["path"] = directory }, "not a regular file"},
 		{"wrong source", func(thread map[string]any) { thread["source"] = "cli" }, "not a fresh idle"},
+		{"structured source", func(thread map[string]any) {
+			thread["source"] = map[string]any{"custom": "other-client"}
+		}, "not a fresh idle"},
 		{"missing ephemeral", func(thread map[string]any) { delete(thread, "ephemeral") }, "not a fresh idle"},
 		{"ephemeral", func(thread map[string]any) { thread["ephemeral"] = true }, "not a fresh idle"},
 		{"wrong history mode", func(thread map[string]any) { thread["historyMode"] = "loaded" }, "not a fresh idle"},
@@ -1422,6 +2951,50 @@ func TestPromptNormalizationMatchesPinnedProtocolDefaults(t *testing.T) {
 	}
 }
 
+func TestRequestUserInputAnswerShapesMatchTheCLI(t *testing.T) {
+	prompt := Prompt{Questions: []Question{
+		{ID: "choice", IsOther: true, Options: []Option{{Label: "First"}, {Label: "Second"}}},
+		{ID: "freeform"},
+		{ID: "skipped"},
+	}}
+	valid := map[string]map[string][]string{
+		"choice":   {"answers": {"First", "user_note: because"}},
+		"freeform": {"answers": {"user_note: my answer"}},
+		"skipped":  {"answers": {}},
+	}
+	if err := validateAnswers(prompt, valid); err != nil {
+		t.Fatalf("valid answer shapes rejected: %v", err)
+	}
+	valid["choice"] = map[string][]string{"answers": {"user_note: custom"}}
+	if err := validateAnswers(prompt, valid); err != nil {
+		t.Fatalf("other answer rejected: %v", err)
+	}
+
+	invalid := []map[string]map[string][]string{
+		{
+			"choice": {"answers": {"Not offered"}}, "freeform": {"answers": {}},
+			"skipped": {"answers": {}},
+		},
+		{
+			"choice": {"answers": {"First", "plain note"}}, "freeform": {"answers": {}},
+			"skipped": {"answers": {}},
+		},
+		{
+			"choice": {"answers": {}}, "freeform": {"answers": {"plain answer"}},
+			"skipped": {"answers": {}},
+		},
+		{
+			"choice": {"answers": {}}, "freeform": {"answers": {"user_note: "}},
+			"skipped": {"answers": {}},
+		},
+	}
+	for _, answers := range invalid {
+		if err := validateAnswers(prompt, answers); err == nil {
+			t.Fatalf("invalid answers accepted: %#v", answers)
+		}
+	}
+}
+
 type protocolFixture struct {
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params"`
@@ -1520,6 +3093,505 @@ func TestUnsupportedServerRequestIsRejectedAndSurfaced(t *testing.T) {
 	waitFor(t, func() bool { return len(client.Prompts("thread-1")) == 1 })
 	if client.Prompts("thread-1")[0].Kind != "unsupported" {
 		t.Fatalf("unsupported request was not surfaced: %#v", client.Prompts("thread-1"))
+	}
+}
+
+func TestNonblockingUserInputUsesTheFixedGraceAndCanBeSnoozed(t *testing.T) {
+	response := make(chan map[string]any, 1)
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		if err := writeObject(connection, map[string]any{
+			"id": "input-1", "method": "item/tool/requestUserInput",
+			"params": map[string]any{
+				"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+				"isBlocking": false, "autoResolutionMs": 5,
+				"questions": []any{map[string]any{
+					"id": "choice", "header": "Choice", "question": "Choose",
+					"isOther": true, "options": []any{map[string]any{
+						"label": "First", "description": "Use the first option",
+					}},
+				}},
+			},
+		}); err != nil {
+			return err
+		}
+		message, err := readObject(connection)
+		if err == nil {
+			response <- message
+		}
+		return err
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(client.Prompts("thread-1")) == 1 })
+	prompt := client.Prompts("thread-1")[0]
+	if prompt.IsBlocking ||
+		prompt.AutoResolutionVisibleAtMS < time.Now().Add(40*time.Second).UnixMilli() ||
+		prompt.AutoResolutionAtMS < time.Now().Add(100*time.Second).UnixMilli() ||
+		prompt.AutoResolutionVisibleAtMS >= prompt.AutoResolutionAtMS {
+		t.Fatalf("nonblocking prompt deadline = %#v", prompt)
+	}
+	select {
+	case message := <-response:
+		t.Fatalf("prompt auto-resolved without the fixed grace: %#v", message)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := client.SnoozeUserInput(prompt.ID, "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	if prompt = client.Prompts("thread-1")[0]; !prompt.AutoResolveSnoozed {
+		t.Fatalf("snoozed prompt = %#v", prompt)
+	}
+	if err := client.RespondAnswers(ctx, prompt.ID, "thread-1", map[string]map[string][]string{
+		"choice": {"answers": nil},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message := <-response
+	result, ok := message["result"].(map[string]any)
+	answers, answersOK := result["answers"].(map[string]any)
+	if !ok || !answersOK || len(answers) != 1 {
+		t.Fatalf("manual response = %#v", message)
+	}
+}
+
+func TestRequestUserInputDefaultsMissingBlockingStateToBlocking(t *testing.T) {
+	prompt, err := normalizePrompt(PendingRequest{
+		ID:     "input-1",
+		Method: "item/tool/requestUserInput",
+		Params: json.RawMessage(`{
+			"threadId":"thread-1",
+			"questions":[{"id":"choice","header":"Choice","question":"Choose"}]
+		}`),
+		receivedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prompt.IsBlocking || prompt.AutoResolutionVisibleAtMS != 0 || prompt.AutoResolutionAtMS != 0 {
+		t.Fatalf("missing blocking state = %#v", prompt)
+	}
+}
+
+func TestRequestUserInputRejectsMalformedBlockingState(t *testing.T) {
+	_, err := normalizePrompt(PendingRequest{
+		ID:     "input-1",
+		Method: "item/tool/requestUserInput",
+		Params: json.RawMessage(`{
+			"threadId":"thread-1",
+			"isBlocking":"false",
+			"questions":[{"id":"choice","header":"Choice","question":"Choose"}]
+		}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid isBlocking") {
+		t.Fatalf("malformed blocking state error = %v", err)
+	}
+}
+
+func TestRecoverCreatingThreadIgnoresLoadedStructuredSources(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 4; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			switch index {
+			case 0:
+				if request["method"] != "thread/loaded/list" {
+					return fmt.Errorf("expected thread/loaded/list, got %v", request["method"])
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"data": []any{"thread-subagent"}, "nextCursor": nil,
+					},
+				})
+			case 1:
+				if request["method"] != "thread/read" {
+					return fmt.Errorf("expected thread/read, got %v", request["method"])
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": "thread-subagent", "cwd": "/workspace/work/other",
+						"source": map[string]any{"subAgent": map[string]any{"threadSpawn": "agent"}},
+					}},
+				})
+			case 2:
+				if request["method"] != "thread/list" {
+					return fmt.Errorf("expected thread/list, got %v", request["method"])
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{}},
+				})
+			case 3:
+				if request["method"] != "thread/start" {
+					return fmt.Errorf("expected thread/start, got %v", request["method"])
+				}
+				err = writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": "thread-new", "cwd": "/workspace/work/example",
+					}},
+				})
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	id, err := client.RecoverCreatingThread(
+		ctx, "", "/workspace/work/example",
+		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+	)
+	if err != nil || id != "thread-new" {
+		t.Fatalf("structured unrelated source recovery = %q, %v", id, err)
+	}
+}
+
+func TestRetireThreadInterruptsAnActiveTurnBeforeArchiving(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, expected := range []string{
+			"thread/list", "thread/read", "thread/turns/list", "turn/interrupt", "thread/turns/list", "thread/archive",
+		} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != expected {
+				return fmt.Errorf("request %d = %v, want %s", index, request["method"], expected)
+			}
+			params := request["params"].(map[string]any)
+			if index > 0 && params["threadId"] != "thread-1" {
+				return fmt.Errorf("wrong retirement thread: %#v", request)
+			}
+			var result any = map[string]any{}
+			switch index {
+			case 0:
+				result = map[string]any{"data": []any{map[string]any{
+					"id": "thread-1", "cwd": "/workspace/work/example", "source": "vscode",
+				}}}
+			case 1:
+				result = map[string]any{"thread": map[string]any{
+					"id": "thread-1", "cwd": "/workspace/work/example", "source": "vscode",
+				}}
+			case 2:
+				result = map[string]any{"data": []any{map[string]any{
+					"id": "turn-1", "status": "inProgress",
+				}}}
+			case 3:
+				if params["turnId"] != "turn-1" {
+					return fmt.Errorf("wrong interrupted turn: %#v", request)
+				}
+			case 4:
+				result = map[string]any{"data": []any{map[string]any{
+					"id": "turn-1", "status": "interrupted",
+				}}}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(
+		ctx, "thread-1", "/workspace/work/example", true,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetireThreadRefusesAmbiguousCwdLookup(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"data": []any{
+					map[string]any{"id": "thread-1", "cwd": "/workspace/work/example"},
+					map[string]any{"id": "thread-2", "cwd": "/workspace/work/example"},
+				},
+			},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, "", "/workspace/work/example", false); err == nil ||
+		!strings.Contains(err.Error(), "ambiguous retirement") {
+		t.Fatalf("ambiguous retirement error = %v", err)
+	}
+}
+
+func TestRetireThreadRefusesAnotherActiveThreadBesideTheExpectedOne(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"data": []any{
+					map[string]any{
+						"id": "thread-orphan", "cwd": "/workspace/work/example", "source": "vscode",
+					},
+					map[string]any{
+						"id": "thread-expected", "cwd": "/workspace/work/example", "source": "vscode",
+					},
+				},
+			},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(
+		ctx, "thread-expected", "/workspace/work/example", true,
+	); err == nil || !strings.Contains(err.Error(), "ambiguous retirement") {
+		t.Fatalf("active sibling retirement error = %v", err)
+	}
+}
+
+func TestRetireThreadTreatsMissingCwdCandidateAsAlreadyRetired(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		params := request["params"].(map[string]any)
+		if request["method"] != "thread/list" || params["archived"] != false {
+			return fmt.Errorf("request = %#v", request)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{}},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, "", "/workspace/work/example", false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRetireThreadRecoversPersistedIdentityAmongArchivedCwdCandidates(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 2; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params := request["params"].(map[string]any)
+			if request["method"] != "thread/list" || params["archived"] != (index == 1) {
+				return fmt.Errorf("request %d = %#v", index, request)
+			}
+			data := []any{}
+			if index == 1 {
+				data = append(data,
+					map[string]any{
+						"id": "thread-old", "cwd": "/workspace/work/example", "source": "vscode",
+					},
+					map[string]any{
+						"id": "thread-1", "cwd": "/workspace/work/example", "source": "vscode",
+					},
+				)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{"data": data},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordRetirementAttempt("/workspace/work/example", "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.recordQueueAttempt("thread-1", "queued-1", "queued message"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.recordSendAttempt(
+		"thread-1", "sent-1", "sent message", "", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, "", "/workspace/work/example", false); err != nil {
+		t.Fatal(err)
+	}
+	if attempted, err := client.queueAttempt("thread-1", "queued-1", "queued message"); err != nil || attempted {
+		t.Fatalf("retired queue attempt = %v, %v", attempted, err)
+	}
+	if _, attempted, err := client.sendAttempt(
+		"thread-1", "sent-1", "sent message", "",
+	); err != nil || attempted {
+		t.Fatalf("retired send attempt = %v, %v", attempted, err)
+	}
+	if threadID, err := client.retirementAttempt("/workspace/work/example"); err != nil || threadID != "" {
+		t.Fatalf("retirement attempt = %q, %v", threadID, err)
+	}
+}
+
+func TestRetireThreadFindsTheExpectedArchivedThreadAndClearsItsAttempts(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index := 0; index < 2; index++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params := request["params"].(map[string]any)
+			if request["method"] != "thread/list" || params["archived"] != (index == 1) {
+				return fmt.Errorf("request %d = %#v", index, request)
+			}
+			data := []any{}
+			if index == 1 {
+				data = append(data,
+					map[string]any{
+						"id": "thread-old", "cwd": "/workspace/work/example", "source": "vscode",
+					},
+					map[string]any{
+						"id": "thread-1", "cwd": "/workspace/work/example", "source": "vscode",
+					},
+				)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{"data": data},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordQueueAttempt("thread-1", "queued-1", "queued message"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.recordSendAttempt(
+		"thread-1", "sent-1", "sent message", "", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, "thread-1", "/workspace/work/example", false); err != nil {
+		t.Fatal(err)
+	}
+	if attempted, err := client.queueAttempt("thread-1", "queued-1", "queued message"); err != nil || attempted {
+		t.Fatalf("retired queue attempt = %v, %v", attempted, err)
+	}
+	if _, attempted, err := client.sendAttempt(
+		"thread-1", "sent-1", "sent message", "",
+	); err != nil || attempted {
+		t.Fatalf("retired send attempt = %v, %v", attempted, err)
+	}
+}
+
+func TestRetireThreadArchivesAFreshThreadWithoutARollout(t *testing.T) {
+	threadID := "thread-fresh"
+	cwd := "/workspace/work/fresh"
+	rollout := filepath.Join(t.TempDir(), "missing-rollout.jsonl")
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, expected := range []string{"thread/list", "thread/read", "thread/turns/list", "thread/archive"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != expected {
+				return fmt.Errorf("request %d = %#v, want %s", index, request, expected)
+			}
+			if index == 0 {
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+						"id": threadID, "cwd": cwd, "source": "vscode",
+					}}},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			if index == 1 {
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{"thread": map[string]any{
+						"id": threadID, "cwd": cwd, "source": "vscode", "status": "idle",
+						"historyMode": "paginated", "preview": "", "forkedFromId": "",
+						"ephemeral": false, "path": rollout, "turns": []any{},
+					}},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			if index == 2 {
+				if err := writeObject(connection, map[string]any{
+					"id": request["id"], "error": map[string]any{
+						"code":    -32600,
+						"message": "invalid paginated history lineage for " + threadID + ": missing source rollout",
+					},
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RetireThread(ctx, threadID, cwd, false); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1683,6 +3755,12 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 			return fmt.Errorf("invalid persisted resume params: %#v", params)
 		}
 		config := params["config"].(map[string]any)
+		if _, ok := config["model"]; ok {
+			return fmt.Errorf("persisted thread model was overwritten: %#v", config)
+		}
+		if _, ok := config["model_reasoning_effort"]; ok {
+			return fmt.Errorf("persisted thread reasoning was overwritten: %#v", config)
+		}
 		policy := config["shell_environment_policy"].(map[string]any)
 		set := policy["set"].(map[string]any)
 		if set["VPSFREE_DEV_SESSION_PORTAL_BASE_URL"] != "https://workspace.example" {
@@ -1698,14 +3776,22 @@ func TestRecoverCreatingThreadResumesPersistedOwnerWithRuntimeConfiguration(t *t
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	id, err := client.RecoverCreatingThread(
+	resolverCalled := false
+	id, err := client.RecoverCreatingThreadWithSettingsResolver(
 		ctx, "thread-original", "/workspace/work/example", environment,
+		func() (ThreadSettings, error) {
+			resolverCalled = true
+			return ThreadSettings{}, errors.New("the old model is no longer in the catalog")
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if id != "thread-original" {
 		t.Fatalf("persisted thread id = %q", id)
+	}
+	if resolverCalled {
+		t.Fatal("materialized recovery resolved replacement settings")
 	}
 }
 
@@ -2036,7 +4122,19 @@ func TestLastSubscriberUnsubscribesFromThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.connectionMu.Lock()
+	generation := client.generation
+	client.connectionMu.Unlock()
+	client.cacheThreadSettings("thread-1", ThreadSettings{
+		Model: "stale-model", ReasoningEffort: "medium", CollaborationMode: "default",
+	}, generation)
+	if _, _, ok := client.cachedSettings("thread-1"); !ok {
+		t.Fatal("thread settings were not cached")
+	}
 	unsubscribe()
+	if _, _, ok := client.cachedSettings("thread-1"); ok {
+		t.Fatal("last subscriber left stale thread settings cached")
+	}
 	select {
 	case <-unsubscribed:
 	case <-ctx.Done():
@@ -2044,27 +4142,57 @@ func TestLastSubscriberUnsubscribesFromThread(t *testing.T) {
 	}
 }
 
-func TestStaleUnsubscribeDoesNotDetachReplacementSubscriber(t *testing.T) {
-	secondResume := make(chan struct{}, 1)
+func TestLastSubscriberInvalidatesSettingsAfterAConcurrentWatchTransition(t *testing.T) {
+	client := New(filepath.Join(t.TempDir(), "missing.sock"))
+	defer client.Close()
+	client.watched["thread-1"] = 1
+	client.cacheThreadSettings("thread-1", ThreadSettings{
+		Model: "stale-model", ReasoningEffort: "medium", CollaborationMode: "default",
+	}, 0)
+	transition := client.watchLock("thread-1")
+	transition.Lock()
+	removed := make(chan struct{})
+	go func() {
+		client.removeWatch("thread-1")
+		close(removed)
+	}()
+	client.cacheThreadSettings("thread-1", ThreadSettings{
+		Model: "new-model", ReasoningEffort: "xhigh", CollaborationMode: "plan",
+	}, 0)
+	if _, _, ok := client.cachedSettings("thread-1"); !ok {
+		t.Fatal("concurrent transition unexpectedly invalidated settings before it completed")
+	}
+	transition.Unlock()
+	select {
+	case <-removed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("last subscriber removal did not complete")
+	}
+	if _, _, ok := client.cachedSettings("thread-1"); ok {
+		t.Fatal("last subscriber left settings cached after the watch transition")
+	}
+}
+
+func TestReplacementSubscriberPreventsUnsubscribeDuringTransition(t *testing.T) {
+	releaseServer := make(chan struct{})
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		for count := 0; count < 2; count++ {
-			request, err := readObject(connection)
-			if err != nil {
-				return err
-			}
-			if request["method"] != "thread/resume" {
-				return fmt.Errorf("expected thread/resume, got %v", request["method"])
-			}
-			if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
-				return err
-			}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
 		}
-		secondResume <- struct{}{}
+		if request["method"] != "thread/resume" {
+			return fmt.Errorf("expected thread/resume, got %v", request["method"])
+		}
+		if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}}); err != nil {
+			return err
+		}
+		<-releaseServer
 		return nil
 	})
+	defer closeTestChannel(releaseServer)
 	client := New(socket)
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2075,7 +4203,11 @@ func TestStaleUnsubscribeDoesNotDetachReplacementSubscriber(t *testing.T) {
 	}
 	transition := client.watchLock("thread-1")
 	transition.Lock()
-	unsubscribe()
+	removed := make(chan struct{})
+	go func() {
+		unsubscribe()
+		close(removed)
+	}()
 	replacement := make(chan error, 1)
 	go func() {
 		_, _, err := client.Subscribe(ctx, "thread-1")
@@ -2084,16 +4216,23 @@ func TestStaleUnsubscribeDoesNotDetachReplacementSubscriber(t *testing.T) {
 	waitFor(t, func() bool {
 		client.watchedMu.Lock()
 		defer client.watchedMu.Unlock()
-		return client.watched["thread-1"] == 1
+		return client.watched["thread-1"] == 2
 	})
 	transition.Unlock()
+	select {
+	case <-removed:
+	case <-ctx.Done():
+		t.Fatal("original subscriber was not removed")
+	}
 	if err := <-replacement; err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-secondResume:
-	case <-ctx.Done():
-		t.Fatal("replacement subscriber did not resume")
+	client.watchedMu.Lock()
+	watchers := client.watched["thread-1"]
+	generation := client.watchedGeneration["thread-1"]
+	client.watchedMu.Unlock()
+	if watchers != 1 || generation == 0 {
+		t.Fatalf("replacement subscription = %d watchers at generation %d", watchers, generation)
 	}
 }
 
@@ -2178,6 +4317,32 @@ func writeObject(connection *websocket.Conn, value any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return connection.Write(ctx, websocket.MessageText, data)
+}
+
+func closeTestChannel(channel chan struct{}) {
+	select {
+	case <-channel:
+	default:
+		close(channel)
+	}
+}
+
+func settingsRollout(t *testing.T, mode string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	entry := map[string]any{
+		"type": "turn_context", "payload": map[string]any{
+			"collaboration_mode": map[string]any{"mode": mode},
+		},
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func freshThreadMetadata(threadID, cwd string, path any) map[string]any {

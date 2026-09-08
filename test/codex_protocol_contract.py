@@ -11,6 +11,11 @@ from jsonschema import Draft7Validator
 
 
 SCHEMA_DIR = pathlib.Path(sys.argv[1])
+CLIENT_SOURCE = (
+    pathlib.Path(sys.argv[2])
+    if len(sys.argv) > 2
+    else pathlib.Path(__file__).resolve().parents[1] / "portal/internal/codex/client.go"
+)
 
 
 def validate(file_name, value, label):
@@ -90,14 +95,21 @@ client_requests = [
         "model/list",
         {"limit": 100, "includeHidden": False},
     ),
+    request("collaborationMode/list", {}),
     request(
-        "thread/resume",
+        "thread/settings/update",
         {
             "threadId": "thread-1",
-            "cwd": "/workspace/work/example",
-            "excludeTurns": True,
             "model": "test-model",
-            "config": {"model_reasoning_effort": "high"},
+            "effort": "high",
+            "collaborationMode": {
+                "mode": "plan",
+                "settings": {
+                    "model": "test-model",
+                    "reasoning_effort": "high",
+                    "developer_instructions": None,
+                },
+            },
         },
     ),
     request(
@@ -135,11 +147,34 @@ client_requests = [
             "sourceKinds": ["vscode"],
         },
     ),
+    request(
+        "thread/list",
+        {
+            "cwd": "/workspace/work/example",
+            "limit": 2,
+            "sortDirection": "asc",
+            "sourceKinds": ["vscode"],
+            "archived": False,
+        },
+    ),
+    request(
+        "thread/list",
+        {
+            "cwd": "/workspace/work/example",
+            "limit": 100,
+            "sortDirection": "asc",
+            "sourceKinds": ["vscode"],
+            "archived": True,
+            "cursor": "next-page",
+        },
+    ),
     request("thread/name/set", {"threadId": "thread-1", "name": "example"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
+    request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
+    request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/loaded/list", {"limit": 100}),
     request(
         "thread/turns/list",
@@ -162,6 +197,25 @@ client_requests = [
         {"threadId": "thread-1", "limit": 100, "sortDirection": "desc"},
     ),
     request("thread/unsubscribe", {"threadId": "thread-1"}),
+    request("thread/archive", {"threadId": "thread-1"}),
+    request("thread/unarchive", {"threadId": "thread-1"}),
+    request("thread/queue/list", {"threadId": "thread-1", "limit": 100}),
+    request(
+        "thread/queue/add",
+        {
+            "threadId": "thread-1",
+            "input": text_input,
+            "clientUserMessageId": "00000000-0000-4000-8000-000000000001",
+        },
+    ),
+    request(
+        "thread/queue/delete",
+        {"threadId": "thread-1", "queuedSubmissionId": "queued-1"},
+    ),
+    request(
+        "thread/queue/start",
+        {"threadId": "thread-1", "queuedSubmissionId": "queued-1"},
+    ),
     request("turn/start", {"threadId": "thread-1", "input": text_input}),
     request("turn/start", {"threadId": "thread-1", "input": text_input}),
     request(
@@ -169,14 +223,13 @@ client_requests = [
         {"threadId": "thread-1", "expectedTurnId": "turn-1", "input": text_input},
     ),
     request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
+    request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
 ]
 for message in client_requests:
     validate("ClientRequest.json", message, f"client request {message['method']}")
-client_source = (
-    pathlib.Path(__file__).resolve().parents[1] / "portal/internal/codex/client.go"
-).read_text()
+client_source = CLIENT_SOURCE.read_text()
 call_pattern = re.compile(
-    r'\b(?:Request|requestConnected|requestOn)\s*\([^)]*?"([a-z]+(?:/[A-Za-z]+)*)"',
+    r'\b(?:Request|requestConnected|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z]+)*)"',
     re.DOTALL,
 )
 implemented_calls = Counter(call_pattern.findall(client_source))
@@ -270,6 +323,38 @@ validate(
     {"method": "serverRequest/resolved", "params": {"requestId": 1, "threadId": "thread-1"}},
     "resolved-request notification",
 )
+validate(
+    "ServerNotification.json",
+    {
+        "method": "thread/settings/updated",
+        "params": {
+            "threadId": "thread-1",
+            "threadSettings": {
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "test-model",
+                        "reasoning_effort": "high",
+                        "developer_instructions": None,
+                    },
+                },
+                "cwd": "/workspace/work/example",
+                "effort": "high",
+                "model": "test-model",
+                "modelProvider": "openai",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+        },
+    },
+    "thread settings notification",
+)
+validate(
+    "ServerNotification.json",
+    {"method": "thread/queue/changed", "params": {"threadId": "thread-1"}},
+    "thread queue notification",
+)
 
 for decision in ("accept", "acceptForSession", "decline", "cancel"):
     validate(
@@ -358,6 +443,7 @@ common_start = {
 }
 validate("v2/ThreadStartResponse.json", common_start, "thread/start result")
 validate("v2/ThreadResumeResponse.json", common_start, "thread/resume result")
+validate("v2/ThreadUnarchiveResponse.json", {"thread": thread}, "thread/unarchive result")
 fork_thread = dict(thread)
 fork_thread["id"] = "thread-fork"
 fork_thread["cwd"] = "/workspace/work/fork"
@@ -408,6 +494,42 @@ validate(
 )
 validate("v2/ThreadUnsubscribeResponse.json", {"status": "unsubscribed"}, "thread/unsubscribe result")
 validate("v2/ThreadSetNameResponse.json", {}, "thread/name/set result")
+validate(
+    "v2/CollaborationModeListResponse.json",
+    {
+        "data": [
+            {"name": "Default", "mode": "default", "model": None, "reasoning_effort": None},
+            {"name": "Plan", "mode": "plan", "model": None, "reasoning_effort": "medium"},
+        ]
+    },
+    "collaborationMode/list result",
+)
+validate("v2/ThreadSettingsUpdateResponse.json", {}, "thread/settings/update result")
+queued_submission = {
+    "id": "queued-1",
+    "clientUserMessageId": "00000000-0000-4000-8000-000000000001",
+    "input": text_input,
+}
+validate(
+    "v2/ThreadQueueListResponse.json",
+    {"data": [queued_submission], "nextCursor": None},
+    "thread/queue/list result",
+)
+validate(
+    "v2/ThreadQueueAddResponse.json",
+    {"queuedSubmission": queued_submission},
+    "thread/queue/add result",
+)
+validate(
+    "v2/ThreadQueueDeleteResponse.json",
+    {"deleted": True},
+    "thread/queue/delete result",
+)
+validate(
+    "v2/ThreadQueueStartResponse.json",
+    {"turn": turn},
+    "thread/queue/start result",
+)
 validate("v2/TurnStartResponse.json", {"turn": turn}, "turn/start result")
 validate("v2/TurnSteerResponse.json", {"turnId": "turn-1"}, "turn/steer result")
 validate("v2/TurnInterruptResponse.json", {}, "turn/interrupt result")
@@ -433,6 +555,12 @@ for file_name, value, paths, label in [
         common_start,
         [["thread"], ["thread", "id"], ["thread", "cwd"]],
         "thread/resume result",
+    ),
+    (
+        "v2/ThreadUnarchiveResponse.json",
+        {"thread": thread},
+        [["thread"], ["thread", "id"], ["thread", "cwd"], ["thread", "source"]],
+        "thread/unarchive result",
     ),
     (
         "v2/ThreadForkResponse.json",
