@@ -276,6 +276,52 @@ func ResolveNewThreadSettings(models []Model, requested ThreadSettings) (ThreadS
 	return ThreadSettings{Model: selected.Model, ReasoningEffort: effort}, nil
 }
 
+func ResolveForkThreadSettings(
+	models []Model, source ThreadSettings, requested ThreadSettings,
+) (ThreadSettings, error) {
+	desired := source
+	if requested.Model != "" {
+		desired.Model = requested.Model
+	}
+	if requested.ReasoningEffort != "" {
+		desired.ReasoningEffort = requested.ReasoningEffort
+	}
+	if desired.Model == "" || desired.ReasoningEffort == "" {
+		return ThreadSettings{}, errors.New("source Codex thread has incomplete settings")
+	}
+	var selected *Model
+	for index := range models {
+		candidate := &models[index]
+		if candidate.Model != desired.Model {
+			continue
+		}
+		if selected != nil {
+			return ThreadSettings{}, fmt.Errorf(
+				"Codex model catalog has more than one %q model", desired.Model,
+			)
+		}
+		selected = candidate
+	}
+	if selected == nil {
+		return ThreadSettings{}, fmt.Errorf("Codex model %q is not available", desired.Model)
+	}
+	if !slices.ContainsFunc(
+		selected.SupportedReasoningEfforts,
+		func(option ReasoningEffortOption) bool {
+			return option.ReasoningEffort == desired.ReasoningEffort
+		},
+	) {
+		return ThreadSettings{}, fmt.Errorf(
+			"reasoning effort %q is not available for %s",
+			desired.ReasoningEffort,
+			selected.DisplayName,
+		)
+	}
+	return ThreadSettings{
+		Model: desired.Model, ReasoningEffort: desired.ReasoningEffort,
+	}, nil
+}
+
 type Client struct {
 	socket string
 
@@ -2527,6 +2573,23 @@ func (c *Client) RecoverForkThread(
 		return "", err
 	}
 	return c.ResumeThreadWithSettings(ctx, candidate.ID, cwd, environment, settings)
+}
+
+func (c *Client) ResolveForkSettings(
+	ctx context.Context, sourceThreadID string, requested ThreadSettings,
+) (ThreadSettings, error) {
+	if sourceThreadID == "" {
+		return ThreadSettings{}, errors.New("fork settings require a source thread")
+	}
+	source, err := c.readThreadSettingsMetadata(ctx, sourceThreadID)
+	if err != nil {
+		return ThreadSettings{}, fmt.Errorf("read source Codex settings: %w", err)
+	}
+	models, err := c.ListModels(ctx)
+	if err != nil {
+		return ThreadSettings{}, fmt.Errorf("load Codex models: %w", err)
+	}
+	return ResolveForkThreadSettings(models, source.settings, requested)
 }
 
 // RecoverArchivedThread restores one exact portal conversation after its

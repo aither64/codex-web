@@ -335,6 +335,50 @@ func TestResolveNewThreadSettingsRejectsInvalidCatalogAndSelections(t *testing.T
 	}
 }
 
+func TestResolveForkThreadSettingsUsesInheritedSourceSettings(t *testing.T) {
+	models := []Model{
+		{
+			Model: DefaultNewThreadModel, DisplayName: "GPT-6 Astra",
+			SupportedReasoningEfforts: []ReasoningEffortOption{
+				{ReasoningEffort: "medium"}, {ReasoningEffort: "xhigh"},
+			},
+		},
+		{
+			Model: "source-model", DisplayName: "Source Model",
+			SupportedReasoningEfforts: []ReasoningEffortOption{
+				{ReasoningEffort: "medium"}, {ReasoningEffort: "high"},
+			},
+		},
+	}
+	source := ThreadSettings{Model: "source-model", ReasoningEffort: "medium"}
+
+	settings, err := ResolveForkThreadSettings(
+		models, source, ThreadSettings{ReasoningEffort: "high"},
+	)
+	if err != nil || settings.Model != "source-model" || settings.ReasoningEffort != "high" {
+		t.Fatalf("effort-only fork settings = %#v, %v", settings, err)
+	}
+	settings, err = ResolveForkThreadSettings(
+		models, source, ThreadSettings{Model: DefaultNewThreadModel},
+	)
+	if err != nil || settings.Model != DefaultNewThreadModel || settings.ReasoningEffort != "medium" {
+		t.Fatalf("model-only fork settings = %#v, %v", settings, err)
+	}
+	_, err = ResolveForkThreadSettings(
+		models, source, ThreadSettings{ReasoningEffort: "xhigh"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "Source Model") {
+		t.Fatalf("unsupported inherited-model effort error = %v", err)
+	}
+	source.ReasoningEffort = "high"
+	_, err = ResolveForkThreadSettings(
+		models, source, ThreadSettings{Model: DefaultNewThreadModel},
+	)
+	if err == nil || !strings.Contains(err.Error(), "GPT-6 Astra") {
+		t.Fatalf("unsupported inherited effort on overridden model error = %v", err)
+	}
+}
+
 func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
 	rollout := settingsRollout(t, "default")
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
