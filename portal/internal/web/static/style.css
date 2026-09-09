@@ -58,6 +58,20 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .new-session h2, .section-heading h2 { margin: .25rem 0; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: .8rem; }
 .section-heading > span { color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: .2rem .6rem; }
+.operation-list { display: grid; gap: .7rem; }
+.operation-item { display: grid; gap: .55rem; padding: .8rem; border: 1px solid var(--line); border-radius: 10px; background: #0d1219; }
+.operation-item.running { border-color: #2b6652; }
+.operation-item.failed { border-color: #713b46; }
+.operation-item.paused { border-color: #66532e; }
+.operation-item-summary { display: flex; align-items: start; justify-content: space-between; gap: .8rem; }
+.operation-item-summary > div { display: grid; gap: .2rem; min-width: 0; }
+.operation-item-summary strong, .operation-item-summary a { overflow-wrap: anywhere; }
+.operation-state { flex: none; border: 1px solid var(--line); border-radius: 999px; padding: .25rem .6rem; color: var(--muted); font-size: .76rem; }
+.operation-state.running, .operation-state.complete { color: var(--accent); border-color: #2b6652; }
+.operation-state.failed { color: var(--danger); border-color: #713b46; }
+.operation-state.pending { color: var(--warning); border-color: #66532e; }
+.operation-error { margin: 0; color: #ffb5b5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.operation-item-actions { display: flex; justify-content: flex-end; gap: .55rem; }
 .session-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: .8rem; }
 .session-card { color: var(--text); display: grid; grid-template-columns: auto 1fr; gap: .25rem .7rem; padding: 1rem; border-radius: 11px; border: 1px solid var(--line); background: var(--panel); }
 .session-card > :not(.status-dot) { grid-column: 2; }
@@ -230,6 +244,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 @media (max-width: 650px) {
   .new-session { grid-template-columns: 1fr; gap: 1rem; }
   .field-grid { grid-template-columns: 1fr; }
+  .operation-item-summary { align-items: stretch; flex-direction: column; }
+  .operation-state { align-self: start; }
   .topbar { align-items: flex-start; }
   .chat-heading, .chat-heading-actions, .chat-actions { align-items: flex-start; flex-wrap: wrap; }
   .chat-actions .composer-controls { flex-wrap: wrap; }

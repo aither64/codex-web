@@ -45,16 +45,26 @@
       method: "POST", body: JSON.stringify({kind}),
     }),
     artifactPreview: (path) => request(`${apiPath(slug, "artifact-preview")}?path=${encodeURIComponent(path)}`),
-    archive: (mode) => request(apiPath(slug, "archive"), {
-      method: "POST", body: JSON.stringify({mode}),
+    archive: (mode, targetId) => request(apiPath(slug, "archive"), {
+      method: "POST", body: JSON.stringify({mode, targetId}),
     }),
-    revive: (allowAbandoned) => request(apiPath(slug, "revive"), {
-      method: "POST", body: JSON.stringify({allowAbandoned}),
+    revive: (allowAbandoned, targetId) => request(apiPath(slug, "revive"), {
+      method: "POST", body: JSON.stringify({allowAbandoned, targetId}),
     }),
-    deleteSession: (confirmation, force) => request(apiPath(slug, "delete"), {
-      method: "POST", body: JSON.stringify({confirmation, force}),
+    deleteSession: (force, targetId) => request(apiPath(slug, "delete"), {
+      method: "POST", body: JSON.stringify({force, targetId}),
     }),
     operation: () => request(apiPath(slug, "operation")),
+    retryOperation: (receiptId, journalId, force) => {
+      const body = {receiptId, journalId};
+      if (force !== undefined) body.force = force;
+      return request(`${apiPath(slug, "operation")}/retry`, {
+        method: "POST", body: JSON.stringify(body),
+      });
+    },
+    dismissOperation: (receiptId) => request(apiPath(slug, "operation"), {
+      method: "DELETE", body: JSON.stringify({receiptId}),
+    }),
     interrupt: () => request(apiPath(slug, "interrupt"), {method: "POST", body: "{}"}),
     implementPlan: (payload) => request(apiPath(slug, "implement-plan"), {
       method: "POST", body: JSON.stringify(payload),
@@ -251,6 +261,14 @@
         tone: "pending",
       };
     }
+    if (operation.state === "complete") {
+      return {
+        detail: operation.updatedAt ? `Finished ${activityAge(operation.updatedAt)}` : "Finished",
+        retry: false,
+        title: `${label} complete`,
+        tone: "complete",
+      };
+    }
     if (pendingKind) {
       return {
         detail: `Retry ${pendingKind} to continue.`,
@@ -260,6 +278,31 @@
       };
     }
     return {detail: "", retry: false, title: "", tone: "idle"};
+  };
+  const lifecycleRecoveryAction = (kind, expected = {}, operation = {}) => {
+    if (operation.kind !== kind || !operation.receiptId) return "none";
+    if (expected.journalId) {
+      if (operation.options?.journalId !== expected.journalId) return "none";
+      if (expected.receiptId && operation.receiptId === expected.receiptId &&
+          operation.state !== "complete") return "unchanged";
+    } else {
+      if (!expected.targetId || operation.options?.targetId !== expected.targetId) return "none";
+      if (kind === "archive" && operation.options?.mode !== expected.mode) return "none";
+      if (kind === "revive" &&
+          Boolean(operation.options?.allowAbandoned) !== Boolean(expected.allowAbandoned)) return "none";
+      if (kind === "delete" &&
+          Boolean(operation.options?.force) !== Boolean(expected.force)) return "none";
+    }
+    if (operation.state === "complete") return "complete";
+    if (operation.state === "running") return "monitor";
+    if (operation.state === "failed" || operation.state === "paused") return "retry";
+    return "none";
+  };
+  const lifecycleOperationMatches = (kind, targetId, pendingKind, operation = {}) => {
+    if (operation.kind !== kind || !operation.receiptId) return false;
+    if (targetId && operation.options?.targetId === targetId) return true;
+    return pendingKind === kind && Boolean(operation.options?.journalExpected) &&
+      Boolean(operation.options?.journalId);
   };
   const safeDiffPath = (value) => String(value || "unknown-file").replace(/[\r\n\t]/g, " ");
   const diffLineKind = (line) => {
@@ -461,6 +504,14 @@
       return false;
     }
   };
+  const cleanupCompletedDeleteStorage = (operations, storages) => {
+    for (const operation of operations || []) {
+      if (operation.state !== "complete" || operation.kind !== "delete" || !operation.slug) continue;
+      const threadId = operation.options?.deletedThreadId || "";
+      if (!threadId) continue;
+      for (const storage of storages || []) clearThreadStorage(storage, operation.slug, threadId);
+    }
+  };
   const loadRequestInputDraft = (storage, slug, threadId, requestId, questions) => {
     if (!storage || !threadId || !requestId || !Array.isArray(questions)) return null;
     try {
@@ -521,9 +572,11 @@
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript,
       sendAcknowledgementCandidates, shouldSubmitMessage,
       storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
-      captureTranscriptDisclosureState, captureTranscriptViewState, encodeQuestionAnswer,
+      captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
+      encodeQuestionAnswer,
       activityAge, fileChangeDiffs, formatElapsed, indexMembershipChanged, indexStatusFreshForPage,
-      indexStatusOrder, lifecyclePresentation, sessionTabFromHash,
+      indexStatusOrder, lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction,
+      sessionTabFromHash,
       transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
       transcriptErrorPresentation, wrapMarkdownTables,
     };
@@ -533,15 +586,166 @@
   const body = document.body;
   document.querySelectorAll(".document").forEach(wrapMarkdownTables);
   const slug = body.dataset.session;
+  const lifecycleTargetId = body.dataset.lifecycleTargetId || "";
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
 
+  let indexNavigationPending = false;
+  let indexRefreshTimer = null;
+  const renderIndexOperations = (operations) => {
+    const panel = document.getElementById("operations");
+    const list = document.getElementById("operation-list");
+    const count = document.getElementById("operation-count");
+    if (!panel || !list || !count) return false;
+    const records = [...(operations || [])].sort((left, right) => (
+      (Date.parse(right.updatedAt || right.startedAt || "") || 0) -
+      (Date.parse(left.updatedAt || left.startedAt || "") || 0)
+    ));
+    list.replaceChildren();
+    count.textContent = String(records.length);
+    panel.hidden = records.length === 0;
+    let localStorage = null;
+    let sessionStorage = null;
+    try { localStorage = globalThis.localStorage; } catch (_error) {}
+    try { sessionStorage = globalThis.sessionStorage; } catch (_error) {}
+    cleanupCompletedDeleteStorage(records, [localStorage, sessionStorage]);
+    for (const operation of records) {
+      const item = document.createElement("article");
+      item.className = `operation-item ${operation.state || "paused"}`;
+
+      const summary = document.createElement("div");
+      summary.className = "operation-item-summary";
+      const identity = document.createElement("div");
+      const name = operation.state === "complete" && operation.kind === "delete" ?
+        document.createElement("strong") : document.createElement("a");
+      name.textContent = operation.slug || "Unknown session";
+      if (name instanceof HTMLAnchorElement) name.href = `/${encodeURIComponent(operation.slug)}/`;
+      const phase = document.createElement("span");
+      phase.className = "muted";
+      phase.textContent = `${lifecycleKindLabel(operation.kind)} · ${lifecyclePhaseLabel(operation.phase)}`;
+      identity.append(name, phase);
+
+      const elapsedStart = Date.parse(operation.startedAt || operation.updatedAt || "");
+      const presentation = lifecyclePresentation(
+        operation, "", Number.isFinite(elapsedStart) ? Date.now() - elapsedStart : 0,
+      );
+      const state = document.createElement("span");
+      state.className = `operation-state ${presentation.tone}`;
+      state.textContent = operation.state === "running" ? presentation.detail : presentation.title;
+      summary.append(identity, state);
+      item.append(summary);
+
+      if (operation.state === "failed" || operation.state === "paused") {
+        const detail = document.createElement("p");
+        detail.className = operation.state === "failed" ? "operation-error" : "muted";
+        detail.textContent = presentation.detail;
+        item.append(detail);
+      }
+
+      const actions = document.createElement("div");
+      actions.className = "operation-item-actions";
+      if (operation.state === "failed" || operation.state === "paused") {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.textContent = `Retry ${operation.kind}`;
+        retry.addEventListener("click", async () => {
+          retry.disabled = true;
+          retry.textContent = "Retrying…";
+          try {
+            await request(`${apiPath(operation.slug, "operation")}/retry`, {
+              method: "POST", body: JSON.stringify({
+                receiptId: operation.receiptId || "",
+                journalId: operation.options?.journalId || "",
+              }),
+            });
+            if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
+            indexRefreshTimer = setTimeout(refreshIndexStatus, 0);
+          } catch (error) {
+            retry.disabled = false;
+            retry.textContent = `Retry ${operation.kind}`;
+            const warning = document.getElementById("index-status-warning");
+            if (warning) {
+              warning.textContent = `Unable to retry ${operation.kind}: ${error.message}`;
+              warning.hidden = false;
+            }
+          }
+        });
+        actions.append(retry);
+        if (operation.kind === "delete" && !operation.options?.force) {
+          const forceRetry = document.createElement("button");
+          forceRetry.type = "button";
+          forceRetry.className = "danger";
+          forceRetry.textContent = "Force delete";
+          forceRetry.addEventListener("click", async () => {
+            if (!globalThis.confirm(
+              "Force deletion may discard dirty worktrees or interrupt an active Codex turn. Continue?",
+            )) return;
+            forceRetry.disabled = true;
+            forceRetry.textContent = "Forcing…";
+            try {
+              await request(`${apiPath(operation.slug, "operation")}/retry`, {
+                method: "POST", body: JSON.stringify({
+                  receiptId: operation.receiptId || "",
+                  journalId: operation.options?.journalId || "",
+                  force: true,
+                }),
+              });
+              if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
+              indexRefreshTimer = setTimeout(refreshIndexStatus, 0);
+            } catch (error) {
+              forceRetry.disabled = false;
+              forceRetry.textContent = "Force delete";
+              const warning = document.getElementById("index-status-warning");
+              if (warning) {
+                warning.textContent = `Unable to force deletion: ${error.message}`;
+                warning.hidden = false;
+              }
+            }
+          });
+          actions.append(forceRetry);
+        }
+      }
+      if (operation.state === "failed" || operation.state === "complete") {
+        const dismiss = document.createElement("button");
+        dismiss.type = "button";
+        dismiss.className = "quiet";
+        dismiss.textContent = "Dismiss";
+        dismiss.addEventListener("click", async () => {
+          dismiss.disabled = true;
+          try {
+            await request(apiPath(operation.slug, "operation"), {
+              method: "DELETE",
+              body: JSON.stringify({receiptId: operation.receiptId || ""}),
+            });
+            item.remove();
+            const remaining = list.childElementCount;
+            count.textContent = String(remaining);
+            panel.hidden = remaining === 0;
+          } catch (error) {
+            dismiss.disabled = false;
+            const warning = document.getElementById("index-status-warning");
+            if (warning) {
+              warning.textContent = `Unable to dismiss operation: ${error.message}`;
+              warning.hidden = false;
+            }
+          }
+        });
+        actions.append(dismiss);
+      }
+      if (actions.childElementCount) item.append(actions);
+      list.append(item);
+    }
+    return records.some((operation) => operation.state === "running");
+  };
   const refreshIndexStatus = async () => {
     if (!body.hasAttribute("data-index")) return;
+    if (indexNavigationPending) return;
     const warning = document.getElementById("index-status-warning");
     let nextRefresh = 15_000;
     try {
       const payload = await request("/api/index-status");
+      if (indexNavigationPending) return;
+      if (renderIndexOperations(payload.operations)) nextRefresh = 1000;
       const statuses = indexStatusOrder(payload.sessions);
       if (!indexStatusFreshForPage(body.dataset.indexGeneratedAt, payload.generatedAt)) {
         nextRefresh = 1000;
@@ -604,10 +808,21 @@
         warning.hidden = false;
       }
     } finally {
-      setTimeout(refreshIndexStatus, nextRefresh);
+      if (!indexNavigationPending) indexRefreshTimer = setTimeout(refreshIndexStatus, nextRefresh);
     }
   };
-  if (body.hasAttribute("data-index")) void refreshIndexStatus();
+  if (body.hasAttribute("data-index")) {
+    const form = document.getElementById("new-session-form");
+    form?.addEventListener("submit", () => {
+      indexNavigationPending = true;
+      if (indexRefreshTimer !== null) clearTimeout(indexRefreshTimer);
+      const button = form.querySelector('button[type="submit"]');
+      if (button) button.disabled = true;
+      const progress = document.getElementById("new-session-progress");
+      timedProgress(progress, "Creating session");
+    });
+    void refreshIndexStatus();
+  }
 
   let models = [];
   let collaborationModes = [];
@@ -758,6 +973,17 @@
   let lifecycleClock = null;
   let lifecyclePollTimer = null;
   let lastLifecycleOperation = {state: pendingLifecycle ? "idle" : "idle"};
+  const lifecycleOperationBelongsToPage = (kind, operation) => lifecycleOperationMatches(
+    kind, lifecycleTargetId, pendingLifecycle, operation,
+  );
+  const operationForRetry = async (kind) => {
+    let operation = lastLifecycleOperation;
+    if (!lifecycleOperationBelongsToPage(kind, operation)) operation = await client.operation();
+    if (!lifecycleOperationBelongsToPage(kind, operation)) {
+      throw new Error("This operation belongs to an older session. Reload the page before continuing.");
+    }
+    return operation;
+  };
 
   const setLifecycleActionsDisabled = (disabled) => {
     for (const id of ["archive-session-open", "revive-session-open", "revive-session-retry", "delete-session-open"]) {
@@ -770,13 +996,14 @@
     lifecycleClock = null;
     lifecyclePollTimer = null;
   };
-  const clearBrowserThreadStorage = () => {
+  const clearBrowserThreadStorage = (deletedThreadId) => {
+    if (!deletedThreadId) return;
     let localStorage = null;
     let sessionStorage = null;
     try { localStorage = globalThis.localStorage; } catch (_error) {}
     try { sessionStorage = globalThis.sessionStorage; } catch (_error) {}
-    clearThreadStorage(localStorage, slug, currentThreadId);
-    clearThreadStorage(sessionStorage, slug, currentThreadId);
+    clearThreadStorage(localStorage, slug, deletedThreadId);
+    clearThreadStorage(sessionStorage, slug, deletedThreadId);
   };
   const showLifecycle = (operation = lastLifecycleOperation, pendingKind = "") => {
     if (!lifecycleStatus || !lifecycleTitle || !lifecycleDetail || !lifecycleRetry) return;
@@ -794,12 +1021,51 @@
     lifecycleRetry.hidden = !presentation.retry;
     lifecycleRetry.textContent = `Retry ${(operation.kind || pendingKind || "operation")}`;
   };
-  const failLifecycle = (kind, error, resetControls = () => {}, phase = "") => {
+  const failLifecycle = (
+    kind, error, resetControls = () => {}, phase = "", failedOperation = lastLifecycleOperation,
+  ) => {
     stopLifecycleTimers();
     lifecycleKind = kind;
     setLifecycleActionsDisabled(false);
     resetControls();
-    showLifecycle({kind, state: "failed", phase, error: error || "The operation did not finish."});
+    showLifecycle({
+      ...failedOperation,
+      kind,
+      state: "failed",
+      phase,
+      error: error || "The operation did not finish.",
+    });
+  };
+  const adoptLifecycleAfterRequestFailure = async (kind, expected, error, resetControls) => {
+    try {
+      const operation = await client.operation();
+      switch (lifecycleRecoveryAction(kind, expected, operation)) {
+        case "complete":
+          if (kind === "delete") clearBrowserThreadStorage(operation.options?.deletedThreadId);
+          location.assign(operation.redirect || "/");
+          return;
+        case "monitor":
+          monitorLifecycle(kind, operation, resetControls);
+          return;
+        case "retry":
+          failLifecycle(
+            kind,
+            operation.error || error,
+            resetControls,
+            operation.phase,
+            operation,
+          );
+          return;
+        case "unchanged":
+          failLifecycle(kind, error, resetControls, operation.phase, operation);
+          return;
+        default:
+          break;
+      }
+    } catch (_statusError) {
+      // Keep the initiating request's error when status recovery is unavailable.
+    }
+    failLifecycle(kind, error, resetControls, "", {});
   };
   const monitorLifecycle = (kind, firstOperation, resetControls = () => {}) => {
     stopLifecycleTimers();
@@ -812,14 +1078,31 @@
     const poll = async () => {
       try {
         const operation = await client.operation();
+        if (!firstOperation?.receiptId || operation.receiptId !== firstOperation.receiptId ||
+            operation.kind !== kind) {
+          failLifecycle(
+            kind,
+            "The lifecycle operation changed. Reload the page before continuing.",
+            resetControls,
+          );
+          return;
+        }
         if (operation.state === "complete") {
           stopLifecycleTimers();
-          if ((operation.kind || kind) === "delete") clearBrowserThreadStorage();
+          if (operation.kind === "delete") {
+            clearBrowserThreadStorage(operation.options?.deletedThreadId);
+          }
           location.assign(operation.redirect || "/");
           return;
         }
         if (operation.state === "failed") {
-          failLifecycle(operation.kind || kind, operation.error, resetControls, operation.phase);
+          failLifecycle(
+            operation.kind || kind,
+            operation.error,
+            resetControls,
+            operation.phase,
+            operation,
+          );
           return;
         }
         if (operation.state !== "running") {
@@ -837,25 +1120,21 @@
   const deleteDialog = document.getElementById("delete-session-dialog");
   const deleteForm = document.getElementById("delete-session-form");
   const deleteOpen = document.getElementById("delete-session-open");
-  let deleteRetryConfirmation = "";
   let deleteRetryForce = false;
-  const retryDelete = async () => {
-    const resetControl = () => {
-      deleteOpen.disabled = false;
-      deleteOpen.textContent = "Retry delete…";
-    };
-    deleteOpen.disabled = true;
-    deleteOpen.textContent = "Deleting…";
-    try {
-      const operation = await client.deleteSession(deleteRetryConfirmation, deleteRetryForce);
-      monitorLifecycle("delete", operation, resetControl);
-    } catch (error) {
-      failLifecycle("delete", error.message, resetControl);
+  const openDeleteDialog = async () => {
+    let operation = lastLifecycleOperation;
+    if (pendingLifecycle === "delete" &&
+        (operation.kind !== "delete" || !operation.receiptId)) {
+      try {
+        operation = await client.operation();
+        if (operation.kind === "delete") showLifecycle(operation, "delete");
+      } catch (_error) {}
     }
-  };
-  deleteOpen?.addEventListener("click", () => {
+    deleteForm.elements.force.checked = lifecycleOperationBelongsToPage("delete", operation) &&
+      Boolean(operation.options?.force);
     deleteDialog.showModal();
-  });
+  };
+  deleteOpen?.addEventListener("click", () => void openDeleteDialog());
   deleteDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => deleteDialog.close());
   deleteForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -863,16 +1142,31 @@
     const resetControls = () => controls.forEach((control) => { control.disabled = false; });
     controls.forEach((control) => { control.disabled = true; });
     deleteDialog.close();
-    deleteRetryConfirmation = deleteForm.elements.confirmation.value;
-    deleteRetryForce = deleteForm.elements.force.checked;
+    const operation = lastLifecycleOperation;
+    const isRetry = lifecycleOperationBelongsToPage("delete", operation) &&
+      (operation.state === "failed" || operation.state === "paused");
+    deleteRetryForce = deleteForm.elements.force.checked ||
+      Boolean(isRetry && operation.options?.force);
     try {
-      const operation = await client.deleteSession(
-        deleteRetryConfirmation,
-        deleteRetryForce,
-      );
-      monitorLifecycle("delete", operation, resetControls);
+      if (isRetry) {
+        await client.retryOperation(
+          operation.receiptId,
+          operation.options?.journalId || "",
+          deleteRetryForce,
+        );
+      } else {
+        await client.deleteSession(deleteRetryForce, lifecycleTargetId);
+      }
+      location.assign("/");
     } catch (error) {
-      failLifecycle("delete", error.message, resetControls);
+      const expected = isRetry ? {
+        journalId: operation.options?.journalId || "",
+        receiptId: operation.receiptId,
+      } : {
+        targetId: lifecycleTargetId,
+        force: deleteRetryForce,
+      };
+      await adoptLifecycleAfterRequestFailure("delete", expected, error.message, resetControls);
     }
   });
 
@@ -927,7 +1221,6 @@
   const archiveDialog = document.getElementById("archive-session-dialog");
   const archiveForm = document.getElementById("archive-session-form");
   const archiveOpen = document.getElementById("archive-session-open");
-  let archiveRetryMode = "";
   const retryArchive = async () => {
     const resetControl = () => {
       archiveOpen.disabled = false;
@@ -935,11 +1228,23 @@
     };
     archiveOpen.disabled = true;
     archiveOpen.textContent = "Archiving…";
+    let operation = null;
     try {
-      const operation = await client.archive(archiveRetryMode);
-      monitorLifecycle("archive", operation, resetControl);
+      operation = await operationForRetry("archive");
+      await client.retryOperation(
+        operation.receiptId || "",
+        operation.options?.journalId || "",
+      );
+      location.assign("/");
     } catch (error) {
-      failLifecycle("archive", error.message, resetControl);
+      if (operation?.options?.journalId) {
+        await adoptLifecycleAfterRequestFailure("archive", {
+          journalId: operation.options.journalId,
+          receiptId: operation.receiptId,
+        }, error.message, resetControl);
+      } else {
+        failLifecycle("archive", error.message, resetControl);
+      }
     }
   };
   archiveOpen?.addEventListener("click", () => {
@@ -950,7 +1255,6 @@
   archiveForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const mode = event.submitter?.value === "abandoned" ? "abandoned" : "complete";
-    archiveRetryMode = mode;
     const button = event.submitter;
     const controls = Array.from(archiveForm.querySelectorAll("button"));
     const idleLabel = mode === "abandoned" ? "Archive as abandoned" : "Archive completed session";
@@ -961,12 +1265,15 @@
     controls.forEach((control) => { control.disabled = true; });
     button.textContent = "Archiving…";
     try {
-      const operation = await client.archive(mode);
+      await client.archive(mode, lifecycleTargetId);
       archiveDialog.close();
-      monitorLifecycle("archive", operation, resetControls);
+      location.assign("/");
     } catch (error) {
       archiveDialog.close();
-      failLifecycle("archive", error.message, resetControls);
+      await adoptLifecycleAfterRequestFailure("archive", {
+        targetId: lifecycleTargetId,
+        mode,
+      }, error.message, resetControls);
     }
   });
 
@@ -985,12 +1292,15 @@
     controls.forEach((control) => { control.disabled = true; });
     button.textContent = "Reviving…";
     try {
-      const operation = await client.revive(body.dataset.lifecycle === "abandoned");
+      await client.revive(body.dataset.lifecycle === "abandoned", lifecycleTargetId);
       reviveDialog.close();
-      monitorLifecycle("revive", operation, resetControls);
+      location.assign("/");
     } catch (error) {
       reviveDialog.close();
-      failLifecycle("revive", error.message, resetControls);
+      await adoptLifecycleAfterRequestFailure("revive", {
+        targetId: lifecycleTargetId,
+        allowAbandoned: body.dataset.lifecycle === "abandoned",
+      }, error.message, resetControls);
     }
   });
   const reviveRetry = document.getElementById("revive-session-retry");
@@ -1004,24 +1314,37 @@
       control.disabled = true;
       control.textContent = "Reviving…";
     }
+    let operation = null;
     try {
-      const operation = await client.revive(false);
-      monitorLifecycle("revive", operation, resetControl);
+      operation = await operationForRetry("revive");
+      await client.retryOperation(
+        operation.receiptId || "",
+        operation.options?.journalId || "",
+      );
+      location.assign("/");
     } catch (error) {
-      failLifecycle("revive", error.message, resetControl);
+      if (operation?.options?.journalId) {
+        await adoptLifecycleAfterRequestFailure("revive", {
+          journalId: operation.options.journalId,
+          receiptId: operation.receiptId,
+        }, error.message, resetControl);
+      } else {
+        failLifecycle("revive", error.message, resetControl);
+      }
     }
   };
   reviveRetry?.addEventListener("click", () => void retryRevive(reviveRetry));
   lifecycleRetry?.addEventListener("click", () => {
-    const needsOptions = !pendingLifecycle && lastLifecycleOperation.phase === "starting";
+    const needsOptions = !pendingLifecycle &&
+      !lifecycleOperationBelongsToPage(lifecycleKind, lastLifecycleOperation);
     if (lifecycleKind === "archive" && needsOptions) archiveDialog.showModal();
     else if (lifecycleKind === "archive") void retryArchive();
-    else if (lifecycleKind === "delete" && needsOptions) deleteDialog.showModal();
-    else if (lifecycleKind === "delete") void retryDelete();
+    else if (lifecycleKind === "delete") void openDeleteDialog();
     else if (lifecycleKind === "revive" && needsOptions) reviveDialog.showModal();
     else if (lifecycleKind === "revive") void retryRevive(lifecycleRetry);
   });
   client.operation().then((operation) => {
+    if (!pendingLifecycle && !lifecycleOperationBelongsToPage(operation.kind, operation)) return;
     if (operation.state === "running") {
       monitorLifecycle(operation.kind || pendingLifecycle, operation);
     } else if (operation.state !== "complete" && (operation.state !== "idle" || pendingLifecycle)) {

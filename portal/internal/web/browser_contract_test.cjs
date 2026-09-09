@@ -3,7 +3,8 @@
 const assert = require("node:assert/strict");
 const {
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient,
-  captureTranscriptDisclosureState, captureTranscriptViewState, clearThreadStorage,
+  captureTranscriptDisclosureState, captureTranscriptViewState, cleanupCompletedDeleteStorage,
+  clearSlugStorage, clearThreadStorage,
   deleteQueueAttempt, deleteRequestInputDraft,
   deleteSendAttempt, loadQueueAttempts,
   loadRequestInputDraft, loadSendAttempts, markTranscriptMessagesObserved,
@@ -15,7 +16,7 @@ const {
   transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed,
   activityAge, indexMembershipChanged, indexStatusFreshForPage, indexStatusOrder,
-  lifecyclePresentation, sessionTabFromHash,
+  lifecycleOperationMatches, lifecyclePresentation, lifecycleRecoveryAction, sessionTabFromHash,
 } = require("./static/app.js");
 
 const baseURL = process.argv[2];
@@ -155,9 +156,81 @@ assert.deepEqual(lifecyclePresentation(
   title: "Archive: Tracking committed",
   tone: "pending",
 });
+assert.deepEqual(lifecyclePresentation(
+  {kind: "delete", state: "complete"}, "", 0,
+), {
+  detail: "Finished", retry: false, title: "Delete complete", tone: "complete",
+});
 assert.deepEqual(lifecyclePresentation({state: "idle"}, "delete", 0), {
   detail: "Retry delete to continue.", retry: true, title: "Delete needs attention", tone: "pending",
 });
+const completeArchiveRequest = {targetId: "target-a", mode: "complete"};
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "archive", state: "running", receiptId: "receipt-1",
+  options: completeArchiveRequest,
+}), "monitor");
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "archive", state: "failed", receiptId: "receipt-1",
+  options: completeArchiveRequest,
+}), "retry");
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "archive", state: "paused", receiptId: "receipt-1",
+  options: completeArchiveRequest,
+}), "retry");
+assert.equal(lifecycleRecoveryAction("delete", {targetId: "target-a", force: true}, {
+  kind: "delete", state: "complete", receiptId: "receipt-1",
+  options: {targetId: "target-a", force: true, deletedThreadId: "thread-a"},
+}), "complete");
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "revive", state: "failed", receiptId: "receipt-1",
+  options: completeArchiveRequest,
+}), "none");
+assert.equal(lifecycleRecoveryAction("archive", {journalId: "journal-a"}, {
+  kind: "archive", state: "running", receiptId: "replacement-receipt",
+  options: {journalId: "journal-a", mode: "complete"},
+}), "monitor");
+assert.equal(lifecycleRecoveryAction("archive", {journalId: "journal-a"}, {
+  kind: "archive", state: "failed", receiptId: "replacement-receipt",
+  options: {journalId: "journal-b", mode: "complete"},
+}), "none");
+assert.equal(lifecycleRecoveryAction("archive", {
+  journalId: "journal-a", receiptId: "receipt-a",
+}, {
+  kind: "archive", state: "failed", receiptId: "receipt-a",
+  options: {journalId: "journal-a", mode: "complete"},
+}), "unchanged");
+assert.equal(lifecycleRecoveryAction("delete", {
+  journalId: "journal-a", receiptId: "receipt-a",
+}, {
+  kind: "delete", state: "complete", receiptId: "receipt-a",
+  options: {journalId: "journal-a", deletedThreadId: "thread-a"},
+}), "complete");
+assert.equal(lifecycleOperationMatches("delete", "target-a", "", {
+  kind: "delete", receiptId: "receipt-1", options: {targetId: "target-a"},
+}), true);
+assert.equal(lifecycleOperationMatches("delete", "target-b", "", {
+  kind: "delete", receiptId: "receipt-1", options: {targetId: "target-a"},
+}), false);
+assert.equal(lifecycleOperationMatches("archive", "target-a", "archive", {
+  kind: "archive", receiptId: "receipt-1",
+  options: {journalExpected: true, journalId: "journal-1"},
+}), true);
+assert.equal(lifecycleOperationMatches("archive", "target-a", "", {
+  kind: "archive", receiptId: "receipt-1",
+  options: {journalExpected: true, journalId: "journal-1"},
+}), false);
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "archive", state: "failed",
+  options: completeArchiveRequest,
+}), "none");
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "archive", state: "running", receiptId: "receipt-1",
+  options: {targetId: "target-b", mode: "complete"},
+}), "none");
+assert.equal(lifecycleRecoveryAction("archive", completeArchiveRequest, {
+  kind: "archive", state: "failed", receiptId: "receipt-1",
+  options: {targetId: "target-a", mode: "abandoned"},
+}), "none");
 const renderedDiffs = fileChangeDiffs(JSON.stringify([{
   path: "portal/<script>alert(1)</script>.js",
   kind: "update",
@@ -339,6 +412,26 @@ assert.match(
 );
 assert.equal(deleteRequestInputDraft(storage, "example", "thread-1", "request-1"), true);
 
+storeQueueAttempt(storage, "deleted", "thread-1", firstAttempt);
+storeSendAttempt(storage, "deleted", "thread-1", sendAttempt);
+storeRequestInputDraft(storage, "deleted", "thread-1", "request-2", inputQuestions, {
+  page: 0, drafts: [{kind: "option", choice: "First", note: "keep"}, {}],
+});
+storeQueueAttempt(storage, "deleted", "replacement-thread", secondAttempt);
+storeQueueAttempt(storage, "retained", "thread-1", secondAttempt);
+cleanupCompletedDeleteStorage([
+  {
+    slug: "deleted", kind: "delete", state: "complete",
+    options: {deletedThreadId: "thread-1"},
+  },
+  {slug: "retained", kind: "delete", state: "failed"},
+], [storage]);
+assert.deepEqual(loadQueueAttempts(storage, "deleted", "thread-1"), []);
+assert.deepEqual(loadSendAttempts(storage, "deleted", "thread-1"), []);
+assert.equal(loadRequestInputDraft(storage, "deleted", "thread-1", "request-2", inputQuestions), null);
+assert.deepEqual(loadQueueAttempts(storage, "deleted", "replacement-thread"), [secondAttempt]);
+assert.deepEqual(loadQueueAttempts(storage, "retained", "thread-1"), [secondAttempt]);
+
 assert.equal(storeQueueAttempt(storage, "example", "thread-2", firstAttempt), true);
 assert.equal(storeSendAttempt(storage, "example", "thread-1", sendAttempt), true);
 assert.equal(storeRequestInputDraft(
@@ -402,8 +495,12 @@ if (!unitOnly) (async () => {
     digest: "ea5068c45b6c755e5dd592e23c713559960f37c09b5da18873ebc3982f42d211",
   }]);
   await automaticClient.fork("forked", "2026-09-05", "model-1", "");
-  await automaticClient.archive("complete");
-  await automaticClient.revive(true);
+  await automaticClient.archive("complete", "target-1");
+  await automaticClient.revive(true, "target-1");
+  await automaticClient.deleteSession(true, "deletion-target-1");
+  await automaticClient.retryOperation("receipt-1", "journal-1");
+  await automaticClient.retryOperation("receipt-2", "journal-2", true);
+  await automaticClient.dismissOperation("receipt-1");
   await automaticClient.artifactPreview("notes/example.md");
   assert.deepEqual(automaticRequests, [
     {
@@ -423,11 +520,27 @@ if (!unitOnly) (async () => {
     },
     {
       path: "/api/sessions/example/archive",
-      body: {mode: "complete"},
+      body: {mode: "complete", targetId: "target-1"},
     },
     {
       path: "/api/sessions/example/revive",
-      body: {allowAbandoned: true},
+      body: {allowAbandoned: true, targetId: "target-1"},
+    },
+    {
+      path: "/api/sessions/example/delete",
+      body: {force: true, targetId: "deletion-target-1"},
+    },
+    {
+      path: "/api/sessions/example/operation/retry",
+      body: {receiptId: "receipt-1", journalId: "journal-1"},
+    },
+    {
+      path: "/api/sessions/example/operation/retry",
+      body: {receiptId: "receipt-2", journalId: "journal-2", force: true},
+    },
+    {
+      path: "/api/sessions/example/operation",
+      body: {receiptId: "receipt-1"},
     },
     {
       path: "/api/sessions/example/artifact-preview?path=notes%2Fexample.md",
