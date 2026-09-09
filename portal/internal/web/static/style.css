@@ -106,6 +106,8 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .run-state { color: var(--muted); margin-right: .5rem; }
 .run-state.success { color: var(--accent); }
 .run-state.failure, .run-state.cancelled { color: var(--danger); }
+.run-state.queued { color: var(--warning); }
+.run-state.in_progress { color: #8fc7ff; }
 .revision-note { margin-bottom: 0; font-size: .85rem; }
 .cluster-services { margin-top: 1rem; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
 .cluster-service-tabs { display: flex; overflow-x: auto; border-bottom: 1px solid var(--line); background: #0d1219; }
