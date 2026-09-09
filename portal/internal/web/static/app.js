@@ -164,6 +164,27 @@
     const hours = Math.floor(minutes / 60);
     return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
   };
+  const timedProgress = (element, label) => {
+    const startedAt = Date.now();
+    const update = () => {
+      if (!element) return;
+      element.hidden = false;
+      element.className = "operation-progress";
+      element.textContent = `${label} · ${formatElapsed(Date.now() - startedAt)} elapsed`;
+    };
+    update();
+    const timer = setInterval(update, 1000);
+    return {
+      fail: (message) => {
+        clearInterval(timer);
+        if (!element) return;
+        element.hidden = false;
+        element.className = "operation-progress error";
+        element.textContent = message;
+      },
+      stop: () => clearInterval(timer),
+    };
+  };
   const indexStatusOrder = (statuses) => [...(statuses || [])].sort((left, right) => {
     const leftTime = Date.parse(left?.updatedAt || "") || 0;
     const rightTime = Date.parse(right?.updatedAt || "") || 0;
@@ -1953,6 +1974,9 @@
     event.preventDefault();
     const controls = Array.from(planSessionForm.querySelectorAll("button, input"));
     controls.forEach((control) => { control.disabled = true; });
+    const progress = timedProgress(
+      document.getElementById("plan-session-progress"), "Creating session",
+    );
     try {
       const result = await client.implementPlan({
         action: "new",
@@ -1961,9 +1985,10 @@
         name: planSessionForm.elements.name.value,
         creationDate: planSessionForm.elements.creationDate.value,
       });
+      progress.stop();
       location.assign(result.url);
     } catch (error) {
-      alert(error.message);
+      progress.fail(error.message);
       controls.forEach((control) => { control.disabled = false; });
     }
   });
@@ -2001,6 +2026,7 @@
       event.preventDefault();
       const controls = Array.from(forkForm.querySelectorAll("button, input, select"));
       controls.forEach((control) => { control.disabled = true; });
+      const progress = timedProgress(document.getElementById("fork-progress"), "Creating fork");
       try {
         const result = await client.fork(
           forkForm.elements.name.value,
@@ -2008,9 +2034,10 @@
           forkForm.elements.model.value,
           forkForm.elements.effort.value,
         );
+        progress.stop();
         location.assign(result.url);
       } catch (error) {
-        alert(error.message);
+        progress.fail(error.message);
         controls.forEach((control) => { control.disabled = false; });
       }
     });

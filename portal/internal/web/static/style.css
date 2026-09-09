@@ -77,6 +77,9 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .operation-status.pending strong { color: var(--warning); }
 .operation-status.failed { border: 1px solid #713b46; }
 .operation-status.failed strong { color: var(--danger); }
+.operation-progress { margin: 0; padding: .65rem .75rem; border: 1px solid #2b6652; border-radius: 9px; background: #10251f; color: var(--accent); }
+.operation-progress.error { border-color: #713b46; background: #29161b; color: #ffb5b5; }
+.operation-progress[hidden], .badge[hidden] { display: none; }
 .badge { display: inline-flex; align-items: center; border-radius: 999px; padding: .25rem .62rem; border: 1px solid var(--line); color: var(--muted); font-size: .76rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
 .badge.active { color: var(--accent); border-color: #2b6652; }
 .badge.archived { color: var(--muted); }
