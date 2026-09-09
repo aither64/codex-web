@@ -32,6 +32,13 @@ const (
 	DefaultNewThreadReasoningEffort = "xhigh"
 )
 
+const sessionLifecycleDeveloperInstructions = "Completing work, preparing a handoff, or setting " +
+	"lifecycle state does not authorize archiving, deleting, stopping, finalizing, removing, " +
+	"invoking private lifecycle helpers, or scheduling delayed or background cleanup for this " +
+	"session. Perform a session lifecycle action only when the user explicitly requests that " +
+	"exact action for this exact session in the current conversation; otherwise leave the " +
+	"session open."
+
 type rpcMessage struct {
 	ID     json.RawMessage `json:"id,omitempty"`
 	Method string          `json:"method,omitempty"`
@@ -878,9 +885,7 @@ func (c *Client) resumeWatched(ctx context.Context, threadID string) error {
 	}
 	c.watchedMu.Unlock()
 	var result map[string]any
-	if err := c.requestConnected(ctx, "thread/resume", map[string]any{
-		"threadId": threadID, "excludeTurns": true,
-	}, &result); err != nil {
+	if err := c.requestConnected(ctx, "thread/resume", threadResumeParams(threadID), &result); err != nil {
 		return err
 	}
 	c.watchedMu.Lock()
@@ -2096,6 +2101,7 @@ func stringValue(value any) string {
 }
 
 func settingsParams(settings ThreadSettings, params map[string]any, config map[string]any) {
+	params["developerInstructions"] = sessionLifecycleDeveloperInstructions
 	if settings.Model != "" {
 		params["model"] = settings.Model
 	}
@@ -2139,6 +2145,15 @@ func (c *Client) ResumeThread(ctx context.Context, threadID, cwd string, environ
 	return c.ResumeThreadWithSettings(ctx, threadID, cwd, environment, ThreadSettings{})
 }
 
+// ReconcileThreadInstructions refreshes the package-owned thread instruction
+// without interrupting or changing an active turn.
+func (c *Client) ReconcileThreadInstructions(ctx context.Context, threadID string) error {
+	if err := c.requireThreadTurnsIdle(ctx, threadID); err != nil {
+		return err
+	}
+	return c.resumeThread(ctx, threadID)
+}
+
 func (c *Client) ResumeThreadWithSettings(
 	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
 ) (string, error) {
@@ -2151,12 +2166,9 @@ func (c *Client) ResumeThreadWithSettings(
 	config := map[string]any{
 		"shell_environment_policy": map[string]any{"set": environment},
 	}
-	params := map[string]any{
-		"threadId":     threadID,
-		"cwd":          cwd,
-		"excludeTurns": true,
-		"config":       config,
-	}
+	params := threadResumeParams(threadID)
+	params["cwd"] = cwd
+	params["config"] = config
 	settingsParams(settings, params, config)
 	if err := c.Request(ctx, "thread/resume", params, &response); err != nil {
 		return "", err
@@ -2621,6 +2633,9 @@ func (c *Client) UpdateThreadSettings(
 		}
 	}
 	if update.CollaborationMode != nil {
+		// The thread-level developer instruction is independent of collaboration
+		// mode instructions. Keep this nil so Codex supplies the built-in Default
+		// or Plan instructions instead of replacing them with the lifecycle policy.
 		modeSettings := map[string]any{
 			"model":                  desired.Model,
 			"reasoning_effort":       nil,
@@ -3292,7 +3307,15 @@ func jsonDetails(value any) string {
 
 func (c *Client) resumeThread(ctx context.Context, threadID string) error {
 	var response map[string]any
-	return c.Request(ctx, "thread/resume", map[string]any{"threadId": threadID, "excludeTurns": true}, &response)
+	return c.Request(ctx, "thread/resume", threadResumeParams(threadID), &response)
+}
+
+func threadResumeParams(threadID string) map[string]any {
+	return map[string]any{
+		"threadId":              threadID,
+		"excludeTurns":          true,
+		"developerInstructions": sessionLifecycleDeveloperInstructions,
+	}
 }
 
 func (c *Client) ListQueue(ctx context.Context, threadID string) ([]QueueEntry, error) {

@@ -275,6 +275,118 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
+	methods := []string{
+		"thread/start",
+		"thread/resume",
+		"thread/resume",
+		"thread/resume",
+		"thread/turns/list",
+		"thread/resume",
+		"thread/turns/list",
+		"thread/fork",
+	}
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, method := range methods {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != method {
+				return fmt.Errorf("request %d = %#v, want %s", index, request, method)
+			}
+			params, _ := request["params"].(map[string]any)
+			if method != "thread/turns/list" &&
+				params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
+				return fmt.Errorf("%s omitted lifecycle instructions: %#v", method, params)
+			}
+			result := map[string]any{}
+			switch index {
+			case 0:
+				result["thread"] = map[string]any{
+					"id": "thread-1", "cwd": "/workspace/work/example",
+				}
+			case 1:
+				result["thread"] = map[string]any{
+					"id": "thread-1", "cwd": "/workspace/work/example",
+				}
+			case 4, 6:
+				result["data"] = []any{}
+			case 7:
+				result["thread"] = map[string]any{
+					"id": "thread-fork", "cwd": "/workspace/work/fork",
+					"forkedFromId": "thread-1",
+				}
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": result,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	environment := map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"}
+	if _, err := client.StartThread(ctx, "/workspace/work/example", environment); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ResumeThread(ctx, "thread-1", "/workspace/work/example", environment); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.resumeThread(ctx, "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	client.watchedMu.Lock()
+	client.watched["thread-1"] = 1
+	client.watchedMu.Unlock()
+	if err := client.resumeWatched(ctx, "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ReconcileThreadInstructions(ctx, "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ForkThread(
+		ctx, "thread-1", "/workspace/work/fork", environment, ThreadSettings{},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileThreadInstructionsDoesNotResumeAnActiveTurn(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		if request["method"] != "thread/turns/list" {
+			return fmt.Errorf("expected idle check, got %#v", request)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"data": []any{map[string]any{"id": "turn-active", "status": "inProgress"}},
+			},
+		})
+	})
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.ReconcileThreadInstructions(ctx, "thread-1"); err == nil ||
+		!strings.Contains(err.Error(), "not idle") {
+		t.Fatalf("active reconciliation result = %v", err)
+	}
+}
+
 func TestResolveNewThreadSettingsDefaultsToXhigh(t *testing.T) {
 	models := []Model{
 		{
@@ -404,7 +516,8 @@ func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
 					}}, "nextCursor": nil,
 				}})
 			case 1:
-				if request["method"] != "thread/resume" || params["threadId"] != "thread-source" {
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-source" ||
+					params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
 					return fmt.Errorf("expected settings subscription, got %#v", request)
 				}
 				err = writeObject(connection, map[string]any{
@@ -450,7 +563,8 @@ func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
 				})
 			case 6:
 				if request["method"] != "thread/fork" || params["threadId"] != "thread-source" ||
-					params["cwd"] != "/workspace/work/fork" || params["model"] != "gpt-test" {
+					params["cwd"] != "/workspace/work/fork" || params["model"] != "gpt-test" ||
+					params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
 					return fmt.Errorf("invalid fork request: %#v", request)
 				}
 				err = writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
@@ -609,7 +723,8 @@ func TestCollaborationModeUpdatePreservesModelAndReasoningEffort(t *testing.T) {
 			}
 			params, _ := request["params"].(map[string]any)
 			if index == 0 {
-				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" {
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" ||
+					params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
 					return fmt.Errorf("expected settings subscription: %#v", request)
 				}
 				if err := writeObject(connection, map[string]any{
@@ -639,6 +754,9 @@ func TestCollaborationModeUpdatePreservesModelAndReasoningEffort(t *testing.T) {
 			if request["method"] != "thread/settings/update" || mode["mode"] != "plan" ||
 				settings["model"] != "gpt-6-astra" || settings["reasoning_effort"] != "xhigh" {
 				return fmt.Errorf("mode update changed current settings: %#v", request)
+			}
+			if instructions, exists := settings["developer_instructions"]; !exists || instructions != nil {
+				return fmt.Errorf("mode update replaced built-in instructions: %#v", request)
 			}
 			if _, exists := params["model"]; exists {
 				return fmt.Errorf("mode update redundantly overwrote model: %#v", request)
@@ -742,7 +860,8 @@ func TestCollaborationModeUpdateUsesAStableSettingsSnapshot(t *testing.T) {
 			}
 			params, _ := request["params"].(map[string]any)
 			if index == 0 {
-				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" {
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" ||
+					params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
 					return fmt.Errorf("expected settings subscription: %#v", request)
 				}
 				if err := writeObject(connection, map[string]any{
@@ -774,6 +893,9 @@ func TestCollaborationModeUpdateUsesAStableSettingsSnapshot(t *testing.T) {
 			if request["method"] != "thread/settings/update" || mode["mode"] != "plan" ||
 				settings["model"] != "gpt-new" || settings["reasoning_effort"] != "xhigh" {
 				return fmt.Errorf("mode update used a torn settings snapshot: %#v", request)
+			}
+			if instructions, exists := settings["developer_instructions"]; !exists || instructions != nil {
+				return fmt.Errorf("mode update replaced built-in instructions: %#v", request)
 			}
 			if err := writeObject(connection, map[string]any{
 				"id": request["id"], "result": map[string]any{},

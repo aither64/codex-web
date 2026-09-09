@@ -69,6 +69,14 @@ environment = {
     "VPSFREE_DEV_SESSION_SLUG": "example",
     "VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
 }
+lifecycle_developer_instructions = (
+    "Completing work, preparing a handoff, or setting lifecycle state does not "
+    "authorize archiving, deleting, stopping, finalizing, removing, invoking "
+    "private lifecycle helpers, or scheduling delayed or background cleanup for "
+    "this session. Perform a session lifecycle action only when the user "
+    "explicitly requests that exact action for this exact session in the current "
+    "conversation; otherwise leave the session open."
+)
 text_input = [{"type": "text", "text": "continue"}]
 
 client_requests = [
@@ -87,6 +95,7 @@ client_requests = [
         "thread/start",
         {
             "cwd": "/workspace/work/example",
+            "developerInstructions": lifecycle_developer_instructions,
             "runtimeWorkspaceRoots": ["/workspace"],
             "config": {"shell_environment_policy": {"set": environment}},
         },
@@ -96,6 +105,7 @@ client_requests = [
         {
             "threadId": "thread-1",
             "cwd": "/workspace/work/example",
+            "developerInstructions": lifecycle_developer_instructions,
             "excludeTurns": True,
             "config": {"shell_environment_policy": {"set": environment}},
         },
@@ -116,6 +126,9 @@ client_requests = [
                 "settings": {
                     "model": "test-model",
                     "reasoning_effort": "high",
+                    # Keep Codex's built-in Default/Plan instructions. The
+                    # lifecycle policy is the independent thread-level
+                    # developerInstructions value refreshed above.
                     "developer_instructions": None,
                 },
             },
@@ -129,6 +142,7 @@ client_requests = [
             "runtimeWorkspaceRoots": ["/workspace"],
             "excludeTurns": True,
             "deferGoalContinuation": True,
+            "developerInstructions": lifecycle_developer_instructions,
             "model": "test-model",
             "config": {
                 "shell_environment_policy": {"set": environment},
@@ -136,8 +150,22 @@ client_requests = [
             },
         },
     ),
-    request("thread/resume", {"threadId": "thread-1", "excludeTurns": True}),
-    request("thread/resume", {"threadId": "thread-1", "excludeTurns": True}),
+    request(
+        "thread/resume",
+        {
+            "threadId": "thread-1",
+            "excludeTurns": True,
+            "developerInstructions": lifecycle_developer_instructions,
+        },
+    ),
+    request(
+        "thread/resume",
+        {
+            "threadId": "thread-1",
+            "excludeTurns": True,
+            "developerInstructions": lifecycle_developer_instructions,
+        },
+    ),
     request(
         "thread/list",
         {
