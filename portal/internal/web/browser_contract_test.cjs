@@ -3,7 +3,8 @@
 const assert = require("node:assert/strict");
 const {
   automaticReasoningLabel, autoResolutionLabel, beforeRequestInputAction, createRequest, createSessionClient,
-  captureTranscriptDisclosureState, clearThreadStorage, deleteQueueAttempt, deleteRequestInputDraft,
+  captureTranscriptDisclosureState, captureTranscriptViewState, clearThreadStorage,
+  deleteQueueAttempt, deleteRequestInputDraft,
   deleteSendAttempt, loadQueueAttempts,
   loadRequestInputDraft, loadSendAttempts, matchingSendAttempt, messageActionLabel, queueAttemptStorageKey,
   queueAttemptStoragePrefix, requestInputDraftStorageKey, requireQueueAttempts,
@@ -16,8 +17,10 @@ const {
 
 const baseURL = process.argv[2];
 if (!baseURL) throw new Error("browser contract test requires the server URL");
-const origin = new URL(baseURL).origin;
-const fetchRequest = (path, options = {}) => fetch(new URL(path, baseURL), {
+const unitOnly = baseURL === "--unit";
+const testBaseURL = unitOnly ? "http://127.0.0.1" : baseURL;
+const origin = new URL(testBaseURL).origin;
+const fetchRequest = (path, options = {}) => fetch(new URL(path, testBaseURL), {
   ...options,
   headers: {Origin: origin, ...(options.headers || {})},
 });
@@ -85,6 +88,69 @@ assert.deepEqual(Array.from(disclosureStates), [
   ['["turn-1","item-1"]', true],
   ['["turn-1","item-2"]', false],
 ]);
+const transcriptView = captureTranscriptViewState({
+  clientHeight: 400,
+  querySelectorAll: () => [],
+  scrollHeight: 1000,
+  scrollTop: 275,
+});
+assert.equal(transcriptView.scrollTop, 275);
+assert.equal(transcriptView.follow, false);
+assert.deepEqual(Array.from(transcriptView.disclosures), []);
+const filterEntries = [
+  {kind: "userMessage", text: "question"},
+  {kind: "reasoning", text: "condensed reasoning"},
+  {kind: "commandExecution", summary: "command"},
+  {kind: "error", summary: "failed"},
+];
+assert.equal(transcriptEntryVisible(filterEntries[0], "messages"), true);
+assert.equal(transcriptEntryVisible(filterEntries[1], "messages"), true);
+assert.equal(transcriptEntryVisible(filterEntries[1], "activity"), false);
+assert.equal(transcriptEntryVisible(filterEntries[2], "messages"), false);
+assert.equal(transcriptEntryVisible(filterEntries[3], "messages"), true);
+assert.deepEqual(
+  transcriptEntriesForFilter(filterEntries, "messages").map((entry) => entry.kind),
+  ["userMessage", "reasoning", "error"],
+);
+assert.deepEqual(
+  transcriptEntriesForFilter(filterEntries, "activity").map((entry) => entry.kind),
+  ["commandExecution", "error"],
+);
+assert.equal(formatElapsed(59_900), "59s");
+assert.equal(formatElapsed(62_000), "1m 02s");
+assert.equal(formatElapsed(3_661_000), "1h 01m");
+assert.deepEqual(lifecyclePresentation(
+  {kind: "archive", state: "running"}, "", 12_000,
+), {
+  detail: "Running · 12s elapsed", retry: false, title: "Archive: Starting", tone: "running",
+});
+assert.deepEqual(lifecyclePresentation(
+  {kind: "revive", state: "failed", phase: "runtime_starting", error: "lock unavailable"}, "", 0,
+), {
+  detail: "lock unavailable", retry: true, title: "Revive failed during runtime starting", tone: "failed",
+});
+assert.deepEqual(lifecyclePresentation(
+  {kind: "archive", state: "paused", phase: "tracking_committed"}, "archive", 4_000,
+), {
+  detail: "Paused · 4s since the last recorded update",
+  retry: true,
+  title: "Archive: Tracking committed",
+  tone: "pending",
+});
+assert.deepEqual(lifecyclePresentation({state: "idle"}, "delete", 0), {
+  detail: "Retry delete to continue.", retry: true, title: "Delete needs attention", tone: "pending",
+});
+const renderedDiffs = fileChangeDiffs(JSON.stringify([{
+  path: "portal/<script>alert(1)</script>.js",
+  kind: "update",
+  diff: "@@ -1 +1 @@\n-old value\n+<script>new value</script>\n",
+}]));
+assert.equal(renderedDiffs[0].path, "portal/<script>alert(1)</script>.js");
+assert.deepEqual(renderedDiffs[0].lines.map((line) => line.kind), [
+  "header", "header", "hunk", "deletion", "addition",
+]);
+assert.equal(renderedDiffs[0].lines.at(-1).text, "+<script>new value</script>");
+assert.deepEqual(fileChangeDiffs("not json"), []);
 let tableWrapperCount = 0;
 const table = {
   parentElement: {classList: {contains: () => false}},
@@ -241,10 +307,22 @@ const automaticClient = createSessionClient("example", async (path, options = {}
   return {ok: true};
 });
 
-(async () => {
+if (!unitOnly) (async () => {
   let snoozedBeforeWizardAction = false;
   await beforeRequestInputAction(async () => { snoozedBeforeWizardAction = true; });
   assert.equal(snoozedBeforeWizardAction, true);
+
+  const sessionPage = await fetchRequest("/example/");
+  assert.equal(sessionPage.status, 200);
+  const sessionHTML = await sessionPage.text();
+  assert.match(sessionHTML, /href="#codex"[^>]+data-session-tab="codex"/);
+  assert.match(sessionHTML, /data-transcript-filter="all"/);
+  assert.match(sessionHTML, /data-transcript-filter="messages"/);
+  assert.match(sessionHTML, /data-transcript-filter="activity"/);
+  assert.match(sessionHTML, /id="codex-model"[^>]+data-existing-settings="true"/);
+  assert.match(sessionHTML, /id="codex-work"/);
+  assert.match(sessionHTML, /id="lifecycle-operation-status"/);
+  assert.doesNotMatch(sessionHTML, /codex-settings-dialog|codex-settings-open/);
 
   const thread = await client.thread();
   assert.equal(thread.threadId, "thread-1");

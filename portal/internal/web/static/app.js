@@ -569,7 +569,7 @@
   const populateEfforts = (modelSelect, effortSelect, selected = "") => {
     if (!effortSelect) return;
     const model = models.find((candidate) => candidate.model === modelSelect.value);
-    const existingSettings = Boolean(modelSelect.closest("#codex-settings"));
+    const existingSettings = modelSelect.dataset.existingSettings === "true";
     effortSelect.replaceChildren();
     if (!existingSettings) {
       const fallback = document.createElement("option");
@@ -598,10 +598,10 @@
         modelSelect.value = currentModel;
       }
       populateEfforts(modelSelect, effortSelect, currentEffort);
-      if (modelSelect.closest("#codex-settings")) modelSelect.disabled = threadActive;
+      if (modelSelect.dataset.existingSettings === "true") {
+        modelSelect.disabled = threadActive || !models.some((model) => model.model === modelSelect.value);
+      }
     });
-    document.getElementById("codex-settings-open")?.toggleAttribute("disabled", threadActive);
-    document.getElementById("codex-settings-save")?.toggleAttribute("disabled", threadActive);
     document.getElementById("fork-open")?.toggleAttribute("disabled", threadActive);
     const modeToggle = document.getElementById("codex-mode");
     const availableModes = new Set(collaborationModes.map((mode) => mode.mode));
@@ -988,14 +988,40 @@
   let refreshDirty = false;
   let transcriptInitialized = false;
   let transcriptSignature = "";
+  let transcriptFilter = "all";
+  let transcriptEntries = [];
+  const transcriptViews = new Map(["all", "messages", "activity"].map((filter) => [filter, {
+    disclosures: new Map(), follow: true, initialized: false, scrollTop: 0,
+  }]));
   let planRenderGeneration = 0;
   let dismissedPlanSHA = "";
   const pendingMessages = new Map();
   const requestInputDrafts = new Map();
+  const codexWork = document.getElementById("codex-work");
+  const codexWorkElapsed = document.getElementById("codex-work-elapsed");
+  let codexWorkStartedAt = 0;
+  let codexWorkTimer = null;
   let sendAttemptStorage = null;
   try { sendAttemptStorage = globalThis.localStorage; } catch (_error) {}
   let requestInputDraftStorage = null;
   try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
+
+  const updateCodexWork = (active) => {
+    if (!codexWork || !codexWorkElapsed) return;
+    if (!active) {
+      codexWork.hidden = true;
+      codexWorkStartedAt = 0;
+      if (codexWorkTimer !== null) clearInterval(codexWorkTimer);
+      codexWorkTimer = null;
+      return;
+    }
+    if (!codexWorkStartedAt) codexWorkStartedAt = Date.now();
+    codexWork.hidden = false;
+    codexWorkElapsed.textContent = `${formatElapsed(Date.now() - codexWorkStartedAt)} elapsed`;
+    if (codexWorkTimer === null) {
+      codexWorkTimer = setInterval(() => updateCodexWork(true), 1000);
+    }
+  };
 
   const loadMessageReceipts = () => {
     if (!currentThreadId || pendingMessages.size) return;
@@ -1060,6 +1086,12 @@
     event.currentTarget.hidden = true;
   });
   transcript.addEventListener("scroll", () => {
+    const view = transcriptViews.get(transcriptFilter);
+    if (view) {
+      view.follow = shouldFollowTranscript(transcript);
+      view.scrollTop = transcript.scrollTop;
+      view.initialized = true;
+    }
     if (shouldFollowTranscript(transcript)) {
       const button = document.getElementById("new-output");
       if (button) button.hidden = true;
@@ -1085,6 +1117,42 @@
     }
   };
 
+  const appendFileChanges = (element, entry, entryKey, disclosureStates) => {
+    const disclosure = document.createElement("details");
+    disclosure.open = disclosureStates.get(entryKey) === true;
+    const summary = document.createElement("summary");
+    summary.textContent = entry.summary || "File changes";
+    disclosure.append(summary);
+    const changes = fileChangeDiffs(entry.details || "");
+    if (!changes.length) {
+      const notice = document.createElement("p");
+      notice.className = "muted";
+      notice.textContent = "File change details are unavailable.";
+      disclosure.append(notice);
+    }
+    for (const change of changes) {
+      const section = document.createElement("section");
+      section.className = "file-diff";
+      const heading = document.createElement("div");
+      heading.className = "file-diff-heading";
+      const path = document.createElement("code");
+      path.textContent = change.path;
+      const kind = document.createElement("span");
+      kind.textContent = change.kind;
+      heading.append(path, kind);
+      const pre = document.createElement("pre");
+      for (const line of change.lines) {
+        const row = document.createElement("span");
+        row.className = `diff-line ${line.kind}`;
+        row.textContent = line.text || " ";
+        pre.append(row);
+      }
+      section.append(heading, pre);
+      disclosure.append(section);
+    }
+    element.append(disclosure);
+  };
+
   const appendMessage = (entry, index, entries, disclosureStates) => {
     const kind = entry.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry.kind) ? "agent" : entry.kind === "error" ? "error" : "event";
     const text = entry.text || entry.summary || "Codex event";
@@ -1094,7 +1162,9 @@
     const element = document.createElement("div");
     element.className = `message ${kind}`;
     element.dataset.transcriptEntryKey = entryKey;
-    if (details) {
+    if (entry.kind === "fileChange") {
+      appendFileChanges(element, entry, entryKey, disclosureStates);
+    } else if (details) {
       const disclosure = document.createElement("details");
       disclosure.open = disclosureStates.get(entryKey) === true;
       const summary = document.createElement("summary");
@@ -1113,6 +1183,50 @@
     transcript.append(element);
   };
 
+  const renderTranscriptEntries = (entries, disclosureStates) => {
+    transcript.replaceChildren();
+    const visibleEntries = transcriptEntriesForFilter(entries, transcriptFilter);
+    entries.forEach((entry, index) => {
+      if (transcriptEntryVisible(entry, transcriptFilter)) {
+        appendMessage(entry, index, entries, disclosureStates);
+      }
+    });
+    if (!visibleEntries.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = transcriptFilter === "all" ? "No conversation entries yet." :
+        `No ${transcriptFilter} in this conversation.`;
+      transcript.append(empty);
+    }
+  };
+
+  const saveTranscriptView = () => {
+    const view = transcriptViews.get(transcriptFilter);
+    if (!view) return;
+    Object.assign(view, captureTranscriptViewState(transcript), {initialized: true});
+  };
+
+  document.querySelectorAll("[data-transcript-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextFilter = button.dataset.transcriptFilter;
+      if (!transcriptViews.has(nextFilter) || nextFilter === transcriptFilter) return;
+      saveTranscriptView();
+      transcriptFilter = nextFilter;
+      document.querySelectorAll("[data-transcript-filter]").forEach((candidate) => {
+        const selected = candidate.dataset.transcriptFilter === transcriptFilter;
+        candidate.classList.toggle("active", selected);
+        candidate.setAttribute("aria-selected", selected ? "true" : "false");
+      });
+      const view = transcriptViews.get(transcriptFilter);
+      renderTranscriptEntries(transcriptEntries, view.disclosures);
+      transcript.scrollTop = !view.initialized || view.follow ? transcript.scrollHeight : view.scrollTop;
+      view.scrollTop = transcript.scrollTop;
+      view.initialized = true;
+      const newOutput = document.getElementById("new-output");
+      if (newOutput) newOutput.hidden = true;
+    });
+  });
+
   const renderThread = (payload) => {
     if (!payload.threadId) throw new Error("Codex returned no thread");
     currentThreadId = payload.threadId;
@@ -1129,12 +1243,17 @@
       }
     }
     if (transcriptChanged) {
-      const disclosureStates = captureTranscriptDisclosureState(transcript);
-      transcript.replaceChildren();
-      entries.forEach((entry, index) => appendMessage(entry, index, entries, disclosureStates));
+      const view = transcriptViews.get(transcriptFilter);
+      view.disclosures = captureTranscriptDisclosureState(transcript);
+      view.follow = follow;
+      view.scrollTop = previousTop;
+      view.initialized = transcriptInitialized;
+      transcriptEntries = entries;
+      renderTranscriptEntries(entries, view.disclosures);
     }
     const threadStatus = payload.status;
     threadActive = threadStatus === "active";
+    updateCodexWork(threadActive);
     currentModel = payload.model || currentModel;
     currentEffort = payload.reasoningEffort || currentEffort;
     currentMode = payload.collaborationMode || currentMode;
@@ -1151,6 +1270,10 @@
         transcript.scrollTop = previousTop;
         if (newOutput && transcriptInitialized) newOutput.hidden = false;
       }
+      const view = transcriptViews.get(transcriptFilter);
+      view.follow = follow;
+      view.scrollTop = transcript.scrollTop;
+      view.initialized = true;
     }
     transcriptInitialized = true;
     transcriptSignature = nextSignature;
@@ -1162,6 +1285,7 @@
     try {
       renderThread(await client.thread());
     } catch (error) {
+      updateCodexWork(false);
       status.textContent = "Offline";
       status.className = "badge warning";
       if (!transcript.children.length || transcript.querySelector(".empty")) transcript.innerHTML = `<p class="notice error"></p>`;
@@ -1600,6 +1724,7 @@
       }
       finally {
         controls.forEach((control) => { control.disabled = false; });
+        applyCurrentSettings();
         updateMessageActions();
         textarea.focus();
       }
@@ -1656,6 +1781,7 @@
       } catch (error) { alert(error.message); }
       finally {
         controls.forEach((control) => { control.disabled = false; });
+        applyCurrentSettings();
         updateMessageActions();
       }
     });
@@ -1735,29 +1861,29 @@
     }
   });
 
-  const settingsForm = document.getElementById("codex-settings");
-  const settingsDialog = document.getElementById("codex-settings-dialog");
-  document.getElementById("codex-settings-open")?.addEventListener("click", () => settingsDialog.showModal());
-  settingsDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => settingsDialog.close());
-  if (settingsForm && interactive) {
-    settingsForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const controls = Array.from(settingsForm.querySelectorAll("button, select"));
-      controls.forEach((control) => { control.disabled = true; });
-      try {
-        const saved = await client.settings(
-          settingsForm.elements.model.value,
-          settingsForm.elements.effort.value,
-        );
-        currentModel = saved.model;
-        currentEffort = saved.reasoningEffort;
-        applyCurrentSettings();
-        settingsDialog.close();
-        scheduleRefresh(0);
-      } catch (error) { alert(error.message); }
-      finally { applyCurrentSettings(); }
-    });
-  }
+  const liveModelSelect = document.getElementById("codex-model");
+  const liveEffortSelect = document.getElementById("codex-effort");
+  const liveSettingsStatus = document.getElementById("codex-settings-status");
+  const saveLiveSettings = async () => {
+    if (!interactive || !liveModelSelect || !liveEffortSelect || threadActive) return;
+    liveModelSelect.disabled = true;
+    liveEffortSelect.disabled = true;
+    if (liveSettingsStatus) liveSettingsStatus.textContent = "Saving Codex settings";
+    try {
+      const saved = await client.settings(liveModelSelect.value, liveEffortSelect.value);
+      currentModel = saved.model;
+      currentEffort = saved.reasoningEffort;
+      if (liveSettingsStatus) liveSettingsStatus.textContent = "Codex settings saved";
+      scheduleRefresh(0);
+    } catch (error) {
+      if (liveSettingsStatus) liveSettingsStatus.textContent = "Codex settings were not saved";
+      alert(error.message);
+    } finally {
+      applyCurrentSettings();
+    }
+  };
+  liveModelSelect?.addEventListener("change", () => { void saveLiveSettings(); });
+  liveEffortSelect?.addEventListener("change", () => { void saveLiveSettings(); });
 
   const forkDialog = document.getElementById("fork-dialog");
   const forkForm = document.getElementById("fork-form");
