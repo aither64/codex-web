@@ -8,8 +8,10 @@ const {
   loadRequestInputDraft, loadSendAttempts, matchingSendAttempt, messageActionLabel, queueAttemptStorageKey,
   queueAttemptStoragePrefix, requestInputDraftStorageKey, requireQueueAttempts,
   sendAttemptStorageKey, shouldFollowTranscript, shouldSubmitMessage, storeQueueAttempt,
-  storeRequestInputDraft, storeSendAttempt, transcriptEntryKey, wrapMarkdownTables,
-  encodeQuestionAnswer,
+  storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
+  transcriptEntryVisible, wrapMarkdownTables, encodeQuestionAnswer, fileChangeDiffs, formatElapsed,
+  activityAge, indexMembershipChanged, indexStatusFreshForPage, indexStatusOrder,
+  lifecyclePresentation, sessionTabFromHash,
 } = require("./static/app.js");
 
 const baseURL = process.argv[2];
@@ -31,6 +33,32 @@ assert.equal(shouldSubmitMessage({key: "Enter", shiftKey: false, isComposing: tr
 assert.equal(shouldSubmitMessage({key: "a", shiftKey: false, isComposing: false}), false);
 assert.equal(shouldFollowTranscript({scrollHeight: 1000, clientHeight: 400, scrollTop: 580}), true);
 assert.equal(shouldFollowTranscript({scrollHeight: 1000, clientHeight: 400, scrollTop: 300}), false);
+assert.deepEqual(indexStatusOrder([
+  {slug: "older", updatedAt: "2026-09-08T10:00:00Z"},
+  {slug: "newer-b", updatedAt: "2026-09-09T10:00:00Z"},
+  {slug: "newer-a", updatedAt: "2026-09-09T10:00:00Z"},
+]).map((entry) => entry.slug), ["newer-a", "newer-b", "older"]);
+assert.equal(indexStatusFreshForPage("2026-09-09T10:00:01Z", "2026-09-09T10:00:00Z"), false);
+assert.equal(indexStatusFreshForPage("2026-09-09T10:00:00Z", "2026-09-09T10:00:01Z"), true);
+assert.equal(indexMembershipChanged([], [], true), false);
+assert.equal(indexMembershipChanged([], [{slug: "new", archived: false}], true), true);
+assert.equal(indexMembershipChanged([{slug: "deleted", archived: false}], [], true), true);
+assert.equal(indexMembershipChanged([{slug: "retained", archived: false}], [], false), false);
+assert.equal(indexMembershipChanged(
+  [{slug: "one", archived: false}, {slug: "two", archived: true}],
+  [{slug: "two", archived: true}, {slug: "one", archived: false}], true,
+), false);
+assert.equal(indexMembershipChanged(
+  [{slug: "moved", archived: false}], [{slug: "moved", archived: true}], true,
+), true);
+assert.equal(indexMembershipChanged(
+  [{slug: "moved", archived: true}], [{slug: "moved", archived: false}], true,
+), true);
+assert.equal(activityAge("2026-09-09T09:59:30Z", Date.parse("2026-09-09T10:00:00Z")), "just now");
+assert.equal(activityAge("2026-09-09T09:55:00Z", Date.parse("2026-09-09T10:00:00Z")), "5m ago");
+assert.equal(sessionTabFromHash("#repositories", ["codex", "repositories"], "codex"), "repositories");
+assert.equal(sessionTabFromHash("#nested-tab", ["codex", "repositories"], "codex"), "codex");
+assert.equal(sessionTabFromHash("#%E0%A4%A", ["codex"], "codex"), "codex");
 assert.equal(transcriptEntryKey({turnId: "turn-1", itemId: "item-1"}, 7), '["turn-1","item-1"]');
 const fallbackEntry = {turnId: "turn-1", kind: "error"};
 assert.equal(

@@ -101,6 +101,144 @@
       wrapper.append(table);
     }
   };
+  const sessionTabFromHash = (hash, panelIDs, fallback) => {
+    let target = "";
+    try {
+      target = decodeURIComponent(String(hash || "").replace(/^#/, ""));
+    } catch (_error) {
+      return fallback;
+    }
+    return panelIDs.includes(target) ? target : fallback;
+  };
+  const transcriptEntryVisible = (entry, filter) => {
+    if (filter === "all" || entry?.kind === "error") return true;
+    const messageKinds = new Set(["userMessage", "agentMessage", "reasoning", "plan"]);
+    if (filter === "messages") return messageKinds.has(entry?.kind);
+    if (filter === "activity") return !messageKinds.has(entry?.kind);
+    return true;
+  };
+  const transcriptEntriesForFilter = (entries, filter) => (
+    (entries || []).filter((entry) => transcriptEntryVisible(entry, filter))
+  );
+  const captureTranscriptViewState = (container) => ({
+    disclosures: captureTranscriptDisclosureState(container),
+    follow: shouldFollowTranscript(container),
+    scrollTop: container.scrollTop,
+  });
+  const formatElapsed = (elapsedMilliseconds) => {
+    const seconds = Math.max(0, Math.floor(Number(elapsedMilliseconds || 0) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainder = String(seconds % 60).padStart(2, "0");
+    if (minutes < 60) return `${minutes}m ${remainder}s`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
+  };
+  const indexStatusOrder = (statuses) => [...(statuses || [])].sort((left, right) => {
+    const leftTime = Date.parse(left?.updatedAt || "") || 0;
+    const rightTime = Date.parse(right?.updatedAt || "") || 0;
+    if (leftTime !== rightTime) return rightTime - leftTime;
+    return String(left?.slug || "").localeCompare(String(right?.slug || ""));
+  });
+  const activityAge = (updatedAt, now = Date.now()) => {
+    const timestamp = Date.parse(updatedAt || "");
+    if (!Number.isFinite(timestamp)) return "unknown";
+    const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+    if (seconds < 60) return "just now";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    if (days < 30) return `${days}d ago`;
+    return new Date(timestamp).toLocaleDateString();
+  };
+  const indexStatusFreshForPage = (pageGeneratedAt, statusGeneratedAt) => {
+    const pageTime = Date.parse(pageGeneratedAt || "");
+    const statusTime = Date.parse(statusGeneratedAt || "");
+    return Number.isFinite(pageTime) && Number.isFinite(statusTime) && statusTime >= pageTime;
+  };
+  const indexMembershipChanged = (cards, statuses, authoritative) => {
+    if (!authoritative) return false;
+    const identity = (item) => `${String(item?.slug || "")}\u0000${item?.archived === true ? "archived" : "active"}`;
+    const current = new Set((cards || []).map(identity));
+    const updated = new Set((statuses || []).map(identity));
+    if (current.size !== updated.size) return true;
+    return Array.from(current).some((slug) => !updated.has(slug));
+  };
+  const lifecycleKindLabel = (kind) => ({
+    archive: "Archive", delete: "Delete", revive: "Revive",
+  }[kind] || "Session operation");
+  const lifecyclePhaseLabel = (phase) => {
+    const label = String(phase || "starting").replaceAll("_", " ");
+    return label.charAt(0).toUpperCase() + label.slice(1);
+  };
+  const lifecyclePresentation = (operation = {}, pendingKind = "", elapsedMilliseconds = 0) => {
+    const kind = operation.kind || pendingKind;
+    const label = lifecycleKindLabel(kind);
+    if (operation.state === "running") {
+      return {
+        detail: `Running · ${formatElapsed(elapsedMilliseconds)} elapsed`,
+        retry: false,
+        title: `${label}: ${lifecyclePhaseLabel(operation.phase)}`,
+        tone: "running",
+      };
+    }
+    if (operation.state === "failed") {
+      return {
+        detail: operation.error || "The operation did not finish.",
+        retry: true,
+        title: `${label} failed${operation.phase ? ` during ${operation.phase.replaceAll("_", " ")}` : ""}`,
+        tone: "failed",
+      };
+    }
+    if (operation.state === "paused") {
+      return {
+        detail: `Paused · ${formatElapsed(elapsedMilliseconds)} since the last recorded update`,
+        retry: true,
+        title: `${label}: ${lifecyclePhaseLabel(operation.phase)}`,
+        tone: "pending",
+      };
+    }
+    if (pendingKind) {
+      return {
+        detail: `Retry ${pendingKind} to continue.`,
+        retry: true,
+        title: `${lifecycleKindLabel(pendingKind)} needs attention`,
+        tone: "pending",
+      };
+    }
+    return {detail: "", retry: false, title: "", tone: "idle"};
+  };
+  const safeDiffPath = (value) => String(value || "unknown-file").replace(/[\r\n\t]/g, " ");
+  const diffLineKind = (line) => {
+    if (/^(diff --git |index |--- |\+\+\+ )/.test(line)) return "header";
+    if (line.startsWith("@@")) return "hunk";
+    if (line.startsWith("+")) return "addition";
+    if (line.startsWith("-")) return "deletion";
+    return "context";
+  };
+  const fileChangeDiffs = (details) => {
+    let changes;
+    try { changes = JSON.parse(details); } catch (_error) { return []; }
+    if (!Array.isArray(changes)) return [];
+    return changes.map((change) => {
+      if (!change || typeof change !== "object" || Array.isArray(change)) return null;
+      const path = safeDiffPath(change.path);
+      const kindValue = typeof change.kind === "object" ? change.kind?.type : change.kind;
+      const kind = typeof kindValue === "string" ? kindValue.toLowerCase() : "update";
+      const diff = typeof change.diff === "string" ? change.diff.replace(/\r\n?/g, "\n") : "";
+      const lines = diff ? diff.replace(/\n$/, "").split("\n") : [];
+      if (!lines.some((line) => line.startsWith("--- ")) ||
+          !lines.some((line) => line.startsWith("+++ "))) {
+        const oldPath = kind === "add" || kind === "create" ? "/dev/null" : `a/${path}`;
+        const newPath = kind === "delete" || kind === "remove" ? "/dev/null" : `b/${path}`;
+        lines.unshift(`--- ${oldPath}`, `+++ ${newPath}`);
+      }
+      if (!diff) lines.push(" No diff was provided.");
+      return {kind, path, lines: lines.map((text) => ({kind: diffLineKind(text), text}))};
+    }).filter(Boolean);
+  };
   const encodeQuestionAnswer = (question, draft = {}) => {
     if (draft.kind === "option" && draft.choice) {
       const values = [draft.choice];
@@ -331,8 +469,10 @@
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript,
       shouldSubmitMessage, storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
-      captureTranscriptDisclosureState, encodeQuestionAnswer, transcriptEntryKey,
-      wrapMarkdownTables,
+      captureTranscriptDisclosureState, captureTranscriptViewState, encodeQuestionAnswer,
+      activityAge, fileChangeDiffs, formatElapsed, indexMembershipChanged, indexStatusFreshForPage,
+      indexStatusOrder, lifecyclePresentation, sessionTabFromHash,
+      transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible, wrapMarkdownTables,
     };
     return;
   }
@@ -342,6 +482,79 @@
   const slug = body.dataset.session;
   const interactive = body.dataset.interactive === "true";
   const request = createRequest(fetch.bind(globalThis));
+
+  const refreshIndexStatus = async () => {
+    if (!body.hasAttribute("data-index")) return;
+    const warning = document.getElementById("index-status-warning");
+    let nextRefresh = 15_000;
+    try {
+      const payload = await request("/api/index-status");
+      const statuses = indexStatusOrder(payload.sessions);
+      if (!indexStatusFreshForPage(body.dataset.indexGeneratedAt, payload.generatedAt)) {
+        nextRefresh = 1000;
+        return;
+      }
+      const cards = Array.from(document.querySelectorAll("[data-session-slug]"));
+      if (indexMembershipChanged(
+        cards.map((card) => ({
+          slug: card.dataset.sessionSlug, archived: card.classList.contains("archived"),
+        })), statuses, payload.authoritative,
+      )) {
+        location.reload();
+        return;
+      }
+      const bySlug = new Map(statuses.map((item) => [item.slug, item]));
+      const visibleAnchor = cards.map((card) => ({card, rect: card.getBoundingClientRect()}))
+        .filter(({rect}) => rect.bottom >= 0 && rect.top <= innerHeight)
+        .sort((left, right) => left.rect.top - right.rect.top)[0];
+      for (const card of cards) {
+        const item = bySlug.get(card.dataset.sessionSlug);
+        if (!item) continue;
+        const updated = card.querySelector("[data-session-updated]");
+        if (updated) {
+          const prefix = card.classList.contains("archived") ? "Finalized" : "Updated";
+          updated.textContent = `${prefix} ${activityAge(item.updatedAt)}`;
+          updated.dataset.updatedAt = item.updatedAt;
+          updated.title = new Date(item.updatedAt).toLocaleString();
+        }
+        const repositories = card.querySelector("[data-session-repositories]");
+        if (repositories) repositories.textContent = `${item.repositoryCount} ${item.repositoryCount === 1 ? "repository" : "repositories"}`;
+        const clusters = card.querySelector("[data-session-clusters]");
+        if (clusters) {
+          clusters.textContent = `${item.runningClusters} running ${item.runningClusters === 1 ? "cluster" : "clusters"}`;
+          clusters.hidden = item.runningClusters === 0;
+        }
+        const lifecycle = card.querySelector("[data-session-lifecycle]");
+        if (lifecycle) {
+          lifecycle.textContent = item.pendingLifecycle ? `${item.pendingLifecycle} pending` : "";
+          lifecycle.hidden = !item.pendingLifecycle;
+        }
+      }
+      for (const grid of document.querySelectorAll(".session-grid")) {
+        const gridCards = Array.from(grid.querySelectorAll(":scope > [data-session-slug]"));
+        const ordered = indexStatusOrder(gridCards.map((card) => bySlug.get(card.dataset.sessionSlug)).filter(Boolean))
+          .map((item) => gridCards.find((card) => card.dataset.sessionSlug === item.slug))
+          .filter(Boolean);
+        ordered.forEach((card) => grid.append(card));
+      }
+      if (warning) {
+        warning.textContent = payload.warning || "";
+        warning.hidden = !warning.textContent;
+      }
+      if (visibleAnchor) {
+        const top = visibleAnchor.card.getBoundingClientRect().top;
+        scrollBy(0, top - visibleAnchor.rect.top);
+      }
+    } catch (error) {
+      if (warning) {
+        warning.textContent = `Live session status is temporarily unavailable: ${error.message}`;
+        warning.hidden = false;
+      }
+    } finally {
+      setTimeout(refreshIndexStatus, nextRefresh);
+    }
+  };
+  if (body.hasAttribute("data-index")) void refreshIndexStatus();
 
   let models = [];
   let collaborationModes = [];
@@ -454,47 +667,159 @@
     });
   });
 
-  const tabButtons = document.querySelectorAll("button[data-tab]");
-  tabButtons.forEach((button) => {
-    button.addEventListener("click", () => {
-      const panel = document.getElementById(button.dataset.tab);
-      if (!panel) return;
-      tabButtons.forEach((candidate) => {
-        const selected = candidate === button;
-        candidate.classList.toggle("active", selected);
-        candidate.setAttribute("aria-selected", selected ? "true" : "false");
-      });
-      document.querySelectorAll(".tab-panel").forEach((candidate) => {
-        candidate.classList.toggle("active", candidate === panel);
-      });
+  const sessionTabBar = document.querySelector(".session-tabs > .tabs");
+  const sessionTabs = Array.from(sessionTabBar?.children || []).filter((element) => (
+    element.matches("a[data-session-tab]")
+  ));
+  const sessionPanels = Array.from(document.querySelectorAll(".session-tabs > .tab-panel"));
+  const defaultSessionTab = sessionTabs.find((tab) => tab.classList.contains("active"))?.dataset.sessionTab ||
+    sessionTabs[0]?.dataset.sessionTab || "";
+  const activateSessionTab = (target) => {
+    if (!sessionTabs.some((tab) => tab.dataset.sessionTab === target)) return;
+    sessionTabs.forEach((tab) => {
+      const selected = tab.dataset.sessionTab === target;
+      tab.classList.toggle("active", selected);
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.tabIndex = selected ? 0 : -1;
     });
-  });
+    sessionPanels.forEach((panel) => panel.classList.toggle("active", panel.id === target));
+  };
+  sessionTabs.forEach((tab) => tab.addEventListener("click", () => {
+    activateSessionTab(tab.dataset.sessionTab);
+  }));
+  const activateSessionHash = () => activateSessionTab(sessionTabFromHash(
+    location.hash, sessionTabs.map((tab) => tab.dataset.sessionTab), defaultSessionTab,
+  ));
+  activateSessionHash();
+  addEventListener("hashchange", activateSessionHash);
 
   if (!slug) return;
   const client = createSessionClient(slug, request);
+  const lifecycleStatus = document.getElementById("lifecycle-operation-status");
+  const lifecycleTitle = document.getElementById("lifecycle-operation-title");
+  const lifecycleDetail = document.getElementById("lifecycle-operation-detail");
+  const lifecycleRetry = document.getElementById("lifecycle-operation-retry");
+  const pendingLifecycle = body.dataset.pendingLifecycle || "";
+  let lifecycleKind = pendingLifecycle;
+  let lifecycleObservedAt = 0;
+  let lifecycleClock = null;
+  let lifecyclePollTimer = null;
+  let lastLifecycleOperation = {state: pendingLifecycle ? "idle" : "idle"};
+
+  const setLifecycleActionsDisabled = (disabled) => {
+    for (const id of ["archive-session-open", "revive-session-open", "revive-session-retry", "delete-session-open"]) {
+      document.getElementById(id)?.toggleAttribute("disabled", disabled);
+    }
+  };
+  const stopLifecycleTimers = () => {
+    if (lifecycleClock !== null) clearInterval(lifecycleClock);
+    if (lifecyclePollTimer !== null) clearTimeout(lifecyclePollTimer);
+    lifecycleClock = null;
+    lifecyclePollTimer = null;
+  };
+  const clearBrowserThreadStorage = () => {
+    let localStorage = null;
+    let sessionStorage = null;
+    try { localStorage = globalThis.localStorage; } catch (_error) {}
+    try { sessionStorage = globalThis.sessionStorage; } catch (_error) {}
+    clearThreadStorage(localStorage, slug, currentThreadId);
+    clearThreadStorage(sessionStorage, slug, currentThreadId);
+  };
+  const showLifecycle = (operation = lastLifecycleOperation, pendingKind = "") => {
+    if (!lifecycleStatus || !lifecycleTitle || !lifecycleDetail || !lifecycleRetry) return;
+    lastLifecycleOperation = operation;
+    if (!lifecycleObservedAt && operation.startedAt) {
+      const startedAt = Date.parse(operation.startedAt);
+      if (Number.isFinite(startedAt)) lifecycleObservedAt = startedAt;
+    }
+    const elapsed = lifecycleObservedAt ? Date.now() - lifecycleObservedAt : 0;
+    const presentation = lifecyclePresentation(operation, pendingKind, elapsed);
+    lifecycleStatus.hidden = presentation.tone === "idle";
+    lifecycleStatus.className = `operation-status notice full ${presentation.tone}`;
+    lifecycleTitle.textContent = presentation.title;
+    lifecycleDetail.textContent = presentation.detail;
+    lifecycleRetry.hidden = !presentation.retry;
+    lifecycleRetry.textContent = `Retry ${(operation.kind || pendingKind || "operation")}`;
+  };
+  const failLifecycle = (kind, error, resetControls = () => {}, phase = "") => {
+    stopLifecycleTimers();
+    lifecycleKind = kind;
+    setLifecycleActionsDisabled(false);
+    resetControls();
+    showLifecycle({kind, state: "failed", phase, error: error || "The operation did not finish."});
+  };
+  const monitorLifecycle = (kind, firstOperation, resetControls = () => {}) => {
+    stopLifecycleTimers();
+    lifecycleKind = kind;
+    const startedAt = Date.parse(firstOperation?.startedAt || "");
+    lifecycleObservedAt = Number.isFinite(startedAt) ? startedAt : Date.now();
+    setLifecycleActionsDisabled(true);
+    showLifecycle(firstOperation || {kind, state: "running"});
+    lifecycleClock = setInterval(() => showLifecycle(), 1000);
+    const poll = async () => {
+      try {
+        const operation = await client.operation();
+        if (operation.state === "complete") {
+          stopLifecycleTimers();
+          if ((operation.kind || kind) === "delete") clearBrowserThreadStorage();
+          location.assign(operation.redirect || "/");
+          return;
+        }
+        if (operation.state === "failed") {
+          failLifecycle(operation.kind || kind, operation.error, resetControls, operation.phase);
+          return;
+        }
+        if (operation.state !== "running") {
+          failLifecycle(kind, "The operation stopped before it finished.", resetControls);
+          return;
+        }
+        showLifecycle(operation);
+        lifecyclePollTimer = setTimeout(poll, 1200);
+      } catch (error) {
+        failLifecycle(kind, error.message, resetControls);
+      }
+    };
+    lifecyclePollTimer = setTimeout(poll, 1200);
+  };
   const deleteDialog = document.getElementById("delete-session-dialog");
   const deleteForm = document.getElementById("delete-session-form");
-  document.getElementById("delete-session-open")?.addEventListener("click", () => deleteDialog.showModal());
+  const deleteOpen = document.getElementById("delete-session-open");
+  let deleteRetryConfirmation = "";
+  let deleteRetryForce = false;
+  const retryDelete = async () => {
+    const resetControl = () => {
+      deleteOpen.disabled = false;
+      deleteOpen.textContent = "Retry delete…";
+    };
+    deleteOpen.disabled = true;
+    deleteOpen.textContent = "Deleting…";
+    try {
+      const operation = await client.deleteSession(deleteRetryConfirmation, deleteRetryForce);
+      monitorLifecycle("delete", operation, resetControl);
+    } catch (error) {
+      failLifecycle("delete", error.message, resetControl);
+    }
+  };
+  deleteOpen?.addEventListener("click", () => {
+    deleteDialog.showModal();
+  });
   deleteDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => deleteDialog.close());
   deleteForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const controls = Array.from(deleteForm.querySelectorAll("button, input"));
+    const resetControls = () => controls.forEach((control) => { control.disabled = false; });
     controls.forEach((control) => { control.disabled = true; });
+    deleteDialog.close();
+    deleteRetryConfirmation = deleteForm.elements.confirmation.value;
+    deleteRetryForce = deleteForm.elements.force.checked;
     try {
-      const result = await client.deleteSession(
-        deleteForm.elements.confirmation.value,
-        deleteForm.elements.force.checked,
+      const operation = await client.deleteSession(
+        deleteRetryConfirmation,
+        deleteRetryForce,
       );
-      let localStorage = null;
-      let sessionStorage = null;
-      try { localStorage = globalThis.localStorage; } catch (_error) {}
-      try { sessionStorage = globalThis.sessionStorage; } catch (_error) {}
-      clearThreadStorage(localStorage, slug, currentThreadId);
-      clearThreadStorage(sessionStorage, slug, currentThreadId);
-      location.assign(result.redirect || "/");
+      monitorLifecycle("delete", operation, resetControls);
     } catch (error) {
-      alert(error.message);
-      controls.forEach((control) => { control.disabled = false; });
+      failLifecycle("delete", error.message, resetControls);
     }
   });
 
@@ -542,36 +867,37 @@
     }
   };
   artifactButtons.forEach((button) => button.addEventListener("click", () => showArtifact(button)));
-  document.querySelector('[data-tab="artifacts"]')?.addEventListener("click", () => {
+  document.querySelector('[data-session-tab="artifacts"]')?.addEventListener("click", () => {
     if (!selectedArtifactPath && artifactButtons[0]) showArtifact(artifactButtons[0]);
   });
 
-  const pollLifecycle = async (button, idleLabel, resetControls) => {
-    try {
-      const operation = await client.operation();
-      if (operation.state === "complete") {
-        location.assign(operation.redirect || "/");
-        return;
-      }
-      if (operation.state === "failed") {
-        resetControls();
-        alert(operation.error || "Session operation failed");
-        return;
-      }
-      setTimeout(() => pollLifecycle(button, idleLabel, resetControls), 1200);
-    } catch (error) {
-      resetControls();
-      alert(error.message);
-    }
-  };
-
   const archiveDialog = document.getElementById("archive-session-dialog");
   const archiveForm = document.getElementById("archive-session-form");
-  document.getElementById("archive-session-open")?.addEventListener("click", () => archiveDialog.showModal());
+  const archiveOpen = document.getElementById("archive-session-open");
+  let archiveRetryMode = "";
+  const retryArchive = async () => {
+    const resetControl = () => {
+      archiveOpen.disabled = false;
+      archiveOpen.textContent = "Retry archive";
+    };
+    archiveOpen.disabled = true;
+    archiveOpen.textContent = "Archiving…";
+    try {
+      const operation = await client.archive(archiveRetryMode);
+      monitorLifecycle("archive", operation, resetControl);
+    } catch (error) {
+      failLifecycle("archive", error.message, resetControl);
+    }
+  };
+  archiveOpen?.addEventListener("click", () => {
+    if (pendingLifecycle === "archive") void retryArchive();
+    else archiveDialog.showModal();
+  });
   archiveDialog?.querySelector("[data-dialog-close]")?.addEventListener("click", () => archiveDialog.close());
   archiveForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const mode = event.submitter?.value === "abandoned" ? "abandoned" : "complete";
+    archiveRetryMode = mode;
     const button = event.submitter;
     const controls = Array.from(archiveForm.querySelectorAll("button"));
     const idleLabel = mode === "abandoned" ? "Archive as abandoned" : "Archive completed session";
@@ -582,12 +908,12 @@
     controls.forEach((control) => { control.disabled = true; });
     button.textContent = "Archiving…";
     try {
-      await client.archive(mode);
+      const operation = await client.archive(mode);
       archiveDialog.close();
-      pollLifecycle(button, idleLabel, resetControls);
+      monitorLifecycle("archive", operation, resetControls);
     } catch (error) {
-      alert(error.message);
-      resetControls();
+      archiveDialog.close();
+      failLifecycle("archive", error.message, resetControls);
     }
   });
 
@@ -606,29 +932,51 @@
     controls.forEach((control) => { control.disabled = true; });
     button.textContent = "Reviving…";
     try {
-      await client.revive(body.dataset.lifecycle === "abandoned");
+      const operation = await client.revive(body.dataset.lifecycle === "abandoned");
       reviveDialog.close();
-      pollLifecycle(button, "Revive session", resetControls);
+      monitorLifecycle("revive", operation, resetControls);
     } catch (error) {
-      alert(error.message);
-      resetControls();
+      reviveDialog.close();
+      failLifecycle("revive", error.message, resetControls);
     }
   });
   const reviveRetry = document.getElementById("revive-session-retry");
-  reviveRetry?.addEventListener("click", async () => {
+  const retryRevive = async (control = reviveRetry || lifecycleRetry) => {
     const resetControl = () => {
-      reviveRetry.disabled = false;
-      reviveRetry.textContent = "Retry revive";
+      if (!control) return;
+      control.disabled = false;
+      control.textContent = "Retry revive";
     };
-    reviveRetry.disabled = true;
-    reviveRetry.textContent = "Reviving…";
-    try {
-      await client.revive(false);
-      pollLifecycle(reviveRetry, "Retry revive", resetControl);
-    } catch (error) {
-      alert(error.message);
-      resetControl();
+    if (control) {
+      control.disabled = true;
+      control.textContent = "Reviving…";
     }
+    try {
+      const operation = await client.revive(false);
+      monitorLifecycle("revive", operation, resetControl);
+    } catch (error) {
+      failLifecycle("revive", error.message, resetControl);
+    }
+  };
+  reviveRetry?.addEventListener("click", () => void retryRevive(reviveRetry));
+  lifecycleRetry?.addEventListener("click", () => {
+    const needsOptions = !pendingLifecycle && lastLifecycleOperation.phase === "starting";
+    if (lifecycleKind === "archive" && needsOptions) archiveDialog.showModal();
+    else if (lifecycleKind === "archive") void retryArchive();
+    else if (lifecycleKind === "delete" && needsOptions) deleteDialog.showModal();
+    else if (lifecycleKind === "delete") void retryDelete();
+    else if (lifecycleKind === "revive" && needsOptions) reviveDialog.showModal();
+    else if (lifecycleKind === "revive") void retryRevive(lifecycleRetry);
+  });
+  client.operation().then((operation) => {
+    if (operation.state === "running") {
+      monitorLifecycle(operation.kind || pendingLifecycle, operation);
+    } else if (operation.state !== "complete" && (operation.state !== "idle" || pendingLifecycle)) {
+      lifecycleKind = operation.kind || pendingLifecycle;
+      showLifecycle(operation, pendingLifecycle);
+    }
+  }).catch((error) => {
+    if (pendingLifecycle) failLifecycle(pendingLifecycle, error.message);
   });
   const transcript = document.getElementById("transcript");
   const pending = document.getElementById("pending");
@@ -1449,6 +1797,31 @@
         button.disabled = false;
         button.textContent = "Release cluster";
       }
+    });
+  });
+
+  document.querySelectorAll("[data-cluster]").forEach((clusterCard) => {
+    const tabs = Array.from(clusterCard.querySelectorAll("[data-cluster-service-tab]"));
+    const panels = Array.from(clusterCard.querySelectorAll("[data-cluster-service-panel]"));
+    tabs.forEach((tab) => tab.addEventListener("click", () => {
+      tabs.forEach((candidate) => {
+        const selected = candidate === tab;
+        candidate.classList.toggle("active", selected);
+        candidate.setAttribute("aria-selected", selected ? "true" : "false");
+        candidate.tabIndex = selected ? 0 : -1;
+      });
+      panels.forEach((panel) => panel.classList.toggle(
+        "active", panel.dataset.clusterServicePanel === tab.dataset.clusterServiceTab,
+      ));
+    }));
+  });
+  document.querySelectorAll("[data-reveal-secret]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const input = button.parentElement.querySelector("[data-secret-field]");
+      if (!input) return;
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      button.textContent = reveal ? "Hide" : "Reveal";
     });
   });
 
