@@ -1717,6 +1717,30 @@ func TestTranscriptEntriesExposeClientMessageIdentityAndPlanCompletion(t *testin
 	}
 }
 
+func TestTranscriptEntriesExposeReadableTurnFailure(t *testing.T) {
+	entries := transcriptEntries(map[string]any{
+		"id": "turn-1", "status": "failed", "items": []any{},
+		"error": map[string]any{
+			"codexErrorInfo": "serverOverloaded",
+			"message":        "Selected model is at capacity. Please try a different model.",
+		},
+	})
+	if len(entries) != 1 || entries[0].Kind != "error" || entries[0].Summary != "Turn failed" ||
+		entries[0].Text != "Selected model is at capacity. Please try a different model." ||
+		entries[0].Details != "" {
+		t.Fatalf("failure transcript entry = %#v", entries)
+	}
+
+	entries = transcriptEntries(map[string]any{
+		"id": "turn-2", "status": "failed", "items": []any{},
+		"error": map[string]any{"code": "unknown", "message": "New failure"},
+	})
+	if len(entries) != 1 || entries[0].Text != "New failure" ||
+		!strings.Contains(entries[0].Details, `"code": "unknown"`) {
+		t.Fatalf("unknown failure transcript entry = %#v", entries)
+	}
+}
+
 func TestTranscriptEntriesOmitEmptyReasoningSummaries(t *testing.T) {
 	entries := transcriptEntries(map[string]any{
 		"id": "turn-1", "status": "completed", "items": []any{

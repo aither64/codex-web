@@ -3220,11 +3220,30 @@ func transcriptEntries(turn map[string]any) []TranscriptEntry {
 		entries = append(entries, entry)
 	}
 	if failure := turn["error"]; failure != nil {
-		entries = append(entries, TranscriptEntry{TurnID: turnID, Kind: "error", Summary: "Turn failed", Details: jsonDetails(failure)})
+		entries = append(entries, transcriptFailureEntry(turnID, failure))
 	} else if status := statusValue(turn["status"]); status == "failed" || status == "error" {
 		entries = append(entries, TranscriptEntry{TurnID: turnID, Kind: "error", Summary: "Turn " + status})
 	}
 	return entries
+}
+
+func transcriptFailureEntry(turnID string, failure any) TranscriptEntry {
+	entry := TranscriptEntry{TurnID: turnID, Kind: "error", Summary: "Turn failed"}
+	if object, ok := failure.(map[string]any); ok {
+		if message := strings.TrimSpace(stringValue(object["message"])); message != "" {
+			entry.Text = message
+			if stringValue(object["codexErrorInfo"]) != "serverOverloaded" {
+				entry.Details = jsonDetails(failure)
+			}
+			return entry
+		}
+	}
+	if message, ok := failure.(string); ok && strings.TrimSpace(message) != "" {
+		entry.Text = message
+		return entry
+	}
+	entry.Details = jsonDetails(failure)
+	return entry
 }
 
 func statusValue(value any) string {

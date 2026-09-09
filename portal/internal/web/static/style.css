@@ -155,6 +155,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .72); }
 .message { min-width: 0; max-width: 100%; border-radius: 11px; padding: .75rem .85rem; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message.user { background: #183328; margin-left: 12%; }
 .message.agent { background: var(--panel-2); margin-right: 6%; }
+.message.error { color: #ffd0d0; border: 1px solid #713b46; background: #28161c; }
+.message-error-heading { display: block; color: var(--danger); }
+.message-error-text { margin: .35rem 0 0; color: #ffd0d0; white-space: pre-wrap; }
+.message-error-details { margin-top: .55rem; color: var(--muted); }
 .message.markdown { white-space: normal; }
 .message.markdown table { width: 100%; border-collapse: collapse; }
 .message.markdown th, .message.markdown td { border: 1px solid var(--line); padding: .45rem .55rem; text-align: left; }

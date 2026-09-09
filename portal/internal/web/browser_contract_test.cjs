@@ -12,7 +12,7 @@ const {
   sendAcknowledgementCandidates, sendAttemptStorageKey, shouldFollowTranscript,
   shouldSubmitMessage, storeQueueAttempt,
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
-  transcriptEntryVisible, wrapMarkdownTables, encodeQuestionAnswer,
+  transcriptEntryVisible, transcriptErrorPresentation, wrapMarkdownTables, encodeQuestionAnswer,
   fileChangeDiffs, formatElapsed,
   activityAge, indexMembershipChanged, indexStatusFreshForPage, indexStatusOrder,
   lifecyclePresentation, sessionTabFromHash,
@@ -119,6 +119,21 @@ assert.deepEqual(
   transcriptEntriesForFilter(filterEntries, "activity").map((entry) => entry.kind),
   ["commandExecution", "error"],
 );
+assert.deepEqual(transcriptErrorPresentation({
+  kind: "error",
+  summary: "Turn failed",
+  text: "Selected model is at capacity. Please try a different model.",
+}), {
+  heading: "Turn failed",
+  message: "Selected model is at capacity. Please try a different model.",
+  details: "",
+});
+assert.deepEqual(transcriptErrorPresentation({
+  kind: "error", summary: "Turn failed", text: "Readable failure", details: "ignored diagnostics",
+}), {heading: "Turn failed", message: "Readable failure", details: "ignored diagnostics"});
+assert.deepEqual(transcriptErrorPresentation({
+  kind: "error", summary: "Unknown failure", details: JSON.stringify({code: "unknown"}),
+}), {heading: "Unknown failure", message: "", details: '{"code":"unknown"}'});
 assert.equal(formatElapsed(59_900), "59s");
 assert.equal(formatElapsed(62_000), "1m 02s");
 assert.equal(formatElapsed(3_661_000), "1h 01m");

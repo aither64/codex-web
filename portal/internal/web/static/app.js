@@ -142,6 +142,14 @@
   const transcriptEntriesForFilter = (entries, filter) => (
     (entries || []).filter((entry) => transcriptEntryVisible(entry, filter))
   );
+  const transcriptErrorPresentation = (entry = {}) => {
+    const heading = String(entry.summary || "Codex error").trim() || "Codex error";
+    return {
+      heading,
+      message: String(entry.text || "").trim(),
+      details: String(entry.details || "").trim(),
+    };
+  };
   const captureTranscriptViewState = (container) => ({
     disclosures: captureTranscriptDisclosureState(container),
     follow: shouldFollowTranscript(container),
@@ -495,7 +503,8 @@
       captureTranscriptDisclosureState, captureTranscriptViewState, encodeQuestionAnswer,
       activityAge, fileChangeDiffs, formatElapsed, indexMembershipChanged, indexStatusFreshForPage,
       indexStatusOrder, lifecyclePresentation, sessionTabFromHash,
-      transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible, wrapMarkdownTables,
+      transcriptEntriesForFilter, transcriptEntryKey, transcriptEntryVisible,
+      transcriptErrorPresentation, wrapMarkdownTables,
     };
     return;
   }
@@ -1220,6 +1229,31 @@
     element.append(disclosure);
   };
 
+  const appendError = (element, entry, entryKey, disclosureStates) => {
+    const presentation = transcriptErrorPresentation(entry);
+    const heading = document.createElement("strong");
+    heading.className = "message-error-heading";
+    heading.textContent = presentation.heading;
+    element.append(heading);
+    if (presentation.message && presentation.message !== presentation.heading) {
+      const message = document.createElement("p");
+      message.className = "message-error-text";
+      message.textContent = presentation.message;
+      element.append(message);
+    }
+    if (presentation.details) {
+      const disclosure = document.createElement("details");
+      disclosure.className = "message-error-details";
+      disclosure.open = disclosureStates.get(entryKey) === true;
+      const summary = document.createElement("summary");
+      summary.textContent = "Error details";
+      const pre = document.createElement("pre");
+      pre.textContent = presentation.details;
+      disclosure.append(summary, pre);
+      element.append(disclosure);
+    }
+  };
+
   const appendMessage = (entry, index, entries, disclosureStates) => {
     const kind = entry.kind === "userMessage" ? "user" : ["agentMessage", "reasoning", "plan"].includes(entry.kind) ? "agent" : entry.kind === "error" ? "error" : "event";
     const text = entry.text || entry.summary || "Codex event";
@@ -1229,7 +1263,9 @@
     const element = document.createElement("div");
     element.className = `message ${kind}`;
     element.dataset.transcriptEntryKey = entryKey;
-    if (entry.kind === "fileChange") {
+    if (entry.kind === "error") {
+      appendError(element, entry, entryKey, disclosureStates);
+    } else if (entry.kind === "fileChange") {
       appendFileChanges(element, entry, entryKey, disclosureStates);
     } else if (details) {
       const disclosure = document.createElement("details");
