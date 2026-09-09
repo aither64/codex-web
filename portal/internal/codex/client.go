@@ -28,7 +28,6 @@ const (
 	requestInputHiddenGrace         = 60 * time.Second
 	requestInputVisibleCountdown    = 60 * time.Second
 	recentTurnLimit                 = 20
-	threadItemPageLimit             = 10
 	DefaultNewThreadModel           = "gpt-6-astra"
 	DefaultNewThreadReasoningEffort = "xhigh"
 )
@@ -120,21 +119,27 @@ type Transcript struct {
 }
 
 type TranscriptEntry struct {
-	TurnID              string `json:"turnId,omitempty"`
-	TurnStatus          string `json:"turnStatus,omitempty"`
-	ItemID              string `json:"itemId,omitempty"`
-	ClientUserMessageID string `json:"clientUserMessageId,omitempty"`
-	Kind                string `json:"kind"`
-	Summary             string `json:"summary,omitempty"`
-	Text                string `json:"text,omitempty"`
-	HTML                string `json:"html,omitempty"`
-	Details             string `json:"details,omitempty"`
+	TurnID                  string `json:"turnId,omitempty"`
+	TurnStatus              string `json:"turnStatus,omitempty"`
+	ItemID                  string `json:"itemId,omitempty"`
+	ClientUserMessageID     string `json:"clientUserMessageId,omitempty"`
+	ClientUserMessageDigest string `json:"clientUserMessageDigest,omitempty"`
+	Kind                    string `json:"kind"`
+	Summary                 string `json:"summary,omitempty"`
+	Text                    string `json:"text,omitempty"`
+	HTML                    string `json:"html,omitempty"`
+	Details                 string `json:"details,omitempty"`
 }
 
 type SendReceipt struct {
 	TurnID              string `json:"turnId"`
 	ClientUserMessageID string `json:"clientUserMessageId"`
 	Steered             bool   `json:"steered"`
+}
+
+type SendAcknowledgement struct {
+	ClientUserMessageID string `json:"clientUserMessageId"`
+	Digest              string `json:"digest"`
 }
 
 type ThreadSettings struct {
@@ -195,6 +200,7 @@ type sendAttempt struct {
 	State   string `json:"state"`
 	Context string `json:"context,omitempty"`
 	Steered bool   `json:"steered"`
+	TurnID  string `json:"turnId,omitempty"`
 }
 
 type UnknownSendOutcomeError struct {
@@ -386,7 +392,7 @@ func New(socket string) *Client {
 		sendAttempts:    make(map[string]map[string]sendAttempt),
 		queueDeletions:  make(map[string]map[string]queueDeletionAttempt),
 		retirements:     make(map[string]string),
-		queueLedgerPath: socket + ".submission-attempts-v2.json",
+		queueLedgerPath: socket + ".submission-attempts-v3.json",
 	}
 }
 
@@ -1289,28 +1295,25 @@ func (c *Client) threadItems(
 	if len(wanted) == 0 {
 		return map[string]map[string]any{}, nil
 	}
-	entries, err := c.listThreadItems(ctx, threadID, func(entry threadItemEntry) bool {
-		delete(wanted, stringValue(entry.Item["id"]))
-		return len(wanted) == 0
+	items := make(map[string]map[string]any, len(wanted))
+	err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
+		id := stringValue(entry.Item["id"])
+		if _, ok := wanted[id]; ok {
+			items[id] = entry.Item
+			delete(wanted, id)
+		}
+		return len(wanted) == 0, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	items := make(map[string]map[string]any, len(entries))
-	for _, entry := range entries {
-		items[stringValue(entry.Item["id"])] = entry.Item
-	}
-	return items, nil
+	return items, err
 }
 
-func (c *Client) listThreadItems(
-	ctx context.Context, threadID string, stop func(threadItemEntry) bool,
-) ([]threadItemEntry, error) {
-	entries := make([]threadItemEntry, 0)
+func (c *Client) walkThreadItems(
+	ctx context.Context, threadID string, visit func(threadItemEntry) (bool, error),
+) error {
 	seenCursors := make(map[string]struct{})
 	seenIDs := make(map[string]struct{})
 	var cursor string
-	for pageNumber := 0; ; pageNumber++ {
+	for {
 		params := map[string]any{
 			"threadId": threadID, "limit": 100, "sortDirection": "desc",
 		}
@@ -1322,39 +1325,36 @@ func (c *Client) listThreadItems(
 			NextCursor *string            `json:"nextCursor"`
 		}
 		if err := c.Request(ctx, "thread/items/list", params, &page); err != nil {
-			return nil, err
+			return err
 		}
 		if page.Data == nil {
-			return nil, errors.New("thread/items/list returned no data")
+			return errors.New("thread/items/list returned no data")
 		}
 		for _, entry := range *page.Data {
 			id := stringValue(entry.Item["id"])
 			if entry.TurnID == "" || entry.Item == nil || id == "" {
-				return nil, errors.New("thread/items/list returned an invalid item entry")
+				return errors.New("thread/items/list returned an invalid item entry")
 			}
 			if _, exists := seenIDs[id]; exists {
-				return nil, fmt.Errorf("thread/items/list repeated item %q", id)
+				return fmt.Errorf("thread/items/list repeated item %q", id)
 			}
 			seenIDs[id] = struct{}{}
-			entries = append(entries, entry)
-			if stop != nil && stop(entry) {
-				return entries, nil
+			stop, err := visit(entry)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
 			}
 		}
 		if page.NextCursor == nil {
-			return entries, nil
-		}
-		if pageNumber+1 >= threadItemPageLimit {
-			return nil, fmt.Errorf(
-				"thread/items/list exceeds the %d-page reconciliation limit",
-				threadItemPageLimit,
-			)
+			return nil
 		}
 		if *page.NextCursor == "" {
-			return nil, errors.New("thread/items/list returned an empty pagination cursor")
+			return errors.New("thread/items/list returned an empty pagination cursor")
 		}
 		if _, exists := seenCursors[*page.NextCursor]; exists {
-			return nil, errors.New("thread/items/list repeated a pagination cursor")
+			return errors.New("thread/items/list repeated a pagination cursor")
 		}
 		seenCursors[*page.NextCursor] = struct{}{}
 		cursor = *page.NextCursor
@@ -1371,6 +1371,22 @@ func inputText(inputs []map[string]any) string {
 		parts = append(parts, stringValue(input["text"]))
 	}
 	return strings.Join(parts, "\n")
+}
+
+func userMessageText(item map[string]any) (string, error) {
+	content, ok := item["content"].([]any)
+	if !ok {
+		return "", errors.New("user message has invalid content")
+	}
+	inputs := make([]map[string]any, 0, len(content))
+	for _, value := range content {
+		input, ok := value.(map[string]any)
+		if !ok {
+			return "", errors.New("user message has invalid input")
+		}
+		inputs = append(inputs, input)
+	}
+	return inputText(inputs), nil
 }
 
 func (c *Client) queueUpdateLock(threadID string) *sync.Mutex {
@@ -1427,7 +1443,7 @@ func (c *Client) loadQueueLedgerLocked() error {
 		c.queueLedgerErr = fmt.Errorf("decode queue attempt ledger: %w", err)
 		return c.queueLedgerErr
 	}
-	if ledger.Schema != 2 || ledger.Attempts == nil {
+	if ledger.Schema != 3 || ledger.Attempts == nil {
 		c.queueLedgerErr = errors.New("queue attempt ledger has an invalid schema")
 		return c.queueLedgerErr
 	}
@@ -1464,7 +1480,7 @@ func (c *Client) loadQueueLedgerLocked() error {
 		}
 		for clientID, attempt := range attempts {
 			if clientID == "" || !validSubmissionDigest(attempt.Digest) ||
-				(attempt.State != "prepared" && attempt.State != "submitting") {
+				!validSendAttemptState(attempt) {
 				c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid send attempt")
 				return c.queueLedgerErr
 			}
@@ -1496,10 +1512,21 @@ func (c *Client) loadQueueLedgerLocked() error {
 	return nil
 }
 
+func validSendAttemptState(attempt sendAttempt) bool {
+	switch attempt.State {
+	case "prepared", "submitting":
+		return attempt.TurnID == ""
+	case "accepted":
+		return attempt.TurnID != ""
+	default:
+		return false
+	}
+}
+
 func (c *Client) writeQueueLedgerLocked() error {
 	directory := filepath.Dir(c.queueLedgerPath)
 	encoded, err := json.Marshal(queueAttemptLedger{
-		Schema: 2, Attempts: c.queueAttempts, Sends: c.sendAttempts,
+		Schema: 3, Attempts: c.queueAttempts, Sends: c.sendAttempts,
 		Deletions: c.queueDeletions, Retirements: c.retirements,
 	})
 	if err != nil {
@@ -1656,6 +1683,9 @@ func (c *Client) markSendSubmitting(threadID, clientID string) error {
 	if attempt.State == "submitting" {
 		return nil
 	}
+	if attempt.State != "prepared" {
+		return errors.New("message attempt was already accepted")
+	}
 	attempt.State = "submitting"
 	c.sendAttempts[threadID][clientID] = attempt
 	if err := c.writeQueueLedgerLocked(); err != nil {
@@ -1666,29 +1696,144 @@ func (c *Client) markSendSubmitting(threadID, clientID string) error {
 	return nil
 }
 
-func (c *Client) clearSendAttempt(threadID, clientID string) error {
+func (c *Client) markSendAccepted(threadID, clientID string, receipt SendReceipt) error {
 	c.queueMu.Lock()
 	defer c.queueMu.Unlock()
 	if err := c.loadQueueLedgerLocked(); err != nil {
 		return err
 	}
-	attempts := c.sendAttempts[threadID]
-	attempt, ok := attempts[clientID]
+	attempt, ok := c.sendAttempts[threadID][clientID]
 	if !ok {
+		return errors.New("submitted message attempt disappeared")
+	}
+	if receipt.TurnID == "" || receipt.ClientUserMessageID != clientID ||
+		receipt.Steered != attempt.Steered {
+		return errors.New("accepted message receipt does not match its attempt")
+	}
+	if attempt.State == "accepted" {
+		if attempt.TurnID != receipt.TurnID {
+			return errors.New("message identity was accepted by another turn")
+		}
 		return nil
 	}
-	delete(attempts, clientID)
-	if len(attempts) == 0 {
-		delete(c.sendAttempts, threadID)
+	if attempt.State != "submitting" {
+		return errors.New("message attempt was accepted before submission")
 	}
+	previous := attempt
+	attempt.State = "accepted"
+	attempt.TurnID = receipt.TurnID
+	c.sendAttempts[threadID][clientID] = attempt
 	if err := c.writeQueueLedgerLocked(); err != nil {
-		if c.sendAttempts[threadID] == nil {
-			c.sendAttempts[threadID] = make(map[string]sendAttempt)
-		}
-		c.sendAttempts[threadID][clientID] = attempt
+		c.sendAttempts[threadID][clientID] = previous
 		return err
 	}
 	return nil
+}
+
+// AcknowledgeSends releases durable attempts only after their browser-owned
+// identities and text are also proven in the Codex transcript. An accepted
+// receipt additionally has to match its recorded turn. This server-side proof
+// keeps a lost acknowledgement response safely retryable after compaction.
+func (c *Client) AcknowledgeSends(
+	ctx context.Context, threadID string, acknowledgements []SendAcknowledgement,
+) ([]string, error) {
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	c.queueMu.Lock()
+	if err := c.loadQueueLedgerLocked(); err != nil {
+		c.queueMu.Unlock()
+		return nil, err
+	}
+	digests := make(map[string]string, len(acknowledgements))
+	expectedTurns := make(map[string]string)
+	for _, acknowledgement := range acknowledgements {
+		digest := acknowledgement.Digest
+		if !validSubmissionDigest(digest) {
+			c.queueMu.Unlock()
+			return nil, errors.New("message acknowledgement has an invalid digest")
+		}
+		digests[acknowledgement.ClientUserMessageID] = digest
+		attempt, found := c.sendAttempts[threadID][acknowledgement.ClientUserMessageID]
+		if found && attempt.Digest != digest {
+			c.queueMu.Unlock()
+			return nil, errors.New("message identity was reused with different text")
+		}
+		if found && attempt.State == "accepted" {
+			expectedTurns[acknowledgement.ClientUserMessageID] = attempt.TurnID
+		}
+	}
+	c.queueMu.Unlock()
+
+	proven := make(map[string]struct{}, len(digests))
+	if len(digests) > 0 {
+		err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
+			if stringValue(entry.Item["type"]) != "userMessage" {
+				return false, nil
+			}
+			clientID := stringValue(entry.Item["clientId"])
+			digest, wanted := digests[clientID]
+			if !wanted {
+				return false, nil
+			}
+			if entry.TurnID == "" {
+				return false, errors.New("acknowledged message has no turn identity")
+			}
+			if expectedTurn := expectedTurns[clientID]; expectedTurn != "" &&
+				entry.TurnID != expectedTurn {
+				return false, errors.New("message identity was accepted by another turn")
+			}
+			text, err := userMessageText(entry.Item)
+			if err != nil {
+				return false, fmt.Errorf("acknowledged message has invalid history: %w", err)
+			}
+			if queueTextDigest(text) != digest {
+				return false, errors.New("message identity was reused with different text")
+			}
+			proven[clientID] = struct{}{}
+			return len(proven) == len(digests), nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	removed := make(map[string]sendAttempt)
+	for clientID := range proven {
+		attempt, found := c.sendAttempts[threadID][clientID]
+		if !found {
+			continue
+		}
+		if attempt.Digest != digests[clientID] {
+			return nil, errors.New("message identity changed during acknowledgement")
+		}
+		removed[clientID] = attempt
+		delete(c.sendAttempts[threadID], clientID)
+	}
+	if len(c.sendAttempts[threadID]) == 0 {
+		delete(c.sendAttempts, threadID)
+	}
+	if len(removed) > 0 {
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			if c.sendAttempts[threadID] == nil {
+				c.sendAttempts[threadID] = make(map[string]sendAttempt)
+			}
+			for clientID, attempt := range removed {
+				c.sendAttempts[threadID][clientID] = attempt
+			}
+			return nil, err
+		}
+	}
+	acknowledged := make([]string, 0, len(proven))
+	for _, acknowledgement := range acknowledgements {
+		if _, found := proven[acknowledgement.ClientUserMessageID]; found {
+			acknowledged = append(acknowledged, acknowledgement.ClientUserMessageID)
+		}
+	}
+	return acknowledged, nil
 }
 
 func (c *Client) clearQueueAttempt(threadID, clientID string) error {
@@ -1825,41 +1970,42 @@ func (c *Client) requireSubmissionAttemptsResolved(ctx context.Context, threadID
 	for clientID, digest := range c.queueAttempts[threadID] {
 		queueAttempts[clientID] = digest
 	}
-	sendCount := len(c.sendAttempts[threadID])
+	unresolvedSendCount := 0
+	for _, attempt := range c.sendAttempts[threadID] {
+		if attempt.State != "accepted" {
+			unresolvedSendCount++
+		}
+	}
 	c.queueMu.Unlock()
-	if sendCount > 0 {
-		return fmt.Errorf("Codex thread %s has %d unresolved message attempt(s)", threadID, sendCount)
+	if unresolvedSendCount > 0 {
+		return fmt.Errorf("Codex thread %s has %d unresolved message attempt(s)", threadID, unresolvedSendCount)
 	}
 	if len(queueAttempts) == 0 {
 		return nil
 	}
 
-	items, err := c.listThreadItems(ctx, threadID, nil)
-	if err != nil {
-		return fmt.Errorf("reconcile queued message attempts: %w", err)
-	}
 	resolved := make(map[string]string)
-	for _, entry := range items {
+	err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
 		if stringValue(entry.Item["type"]) != "userMessage" {
-			continue
+			return false, nil
 		}
 		clientID := stringValue(entry.Item["clientId"])
 		if _, tracked := queueAttempts[clientID]; !tracked {
-			continue
+			return false, nil
 		}
-		content, ok := entry.Item["content"].([]any)
-		if !ok {
-			return errors.New("queued message attempt has invalid history content")
+		text, err := userMessageText(entry.Item)
+		if err != nil {
+			return false, fmt.Errorf("queued message attempt has invalid history: %w", err)
 		}
-		inputs := make([]map[string]any, 0, len(content))
-		for _, value := range content {
-			input, ok := value.(map[string]any)
-			if !ok {
-				return errors.New("queued message attempt has invalid history input")
-			}
-			inputs = append(inputs, input)
+		digest := queueTextDigest(text)
+		if existing, ok := resolved[clientID]; ok && existing != digest {
+			return false, errors.New("queued message identity was reused with different text")
 		}
-		resolved[clientID] = queueTextDigest(inputText(inputs))
+		resolved[clientID] = digest
+		return len(resolved) == len(queueAttempts), nil
+	})
+	if err != nil {
+		return fmt.Errorf("reconcile queued message attempts: %w", err)
 	}
 	unknown := 0
 	for clientID, digest := range queueAttempts {
@@ -3020,6 +3166,9 @@ func transcriptEntries(turn map[string]any) []TranscriptEntry {
 		case "userMessage":
 			entry.Text = textContent(item["content"])
 			entry.ClientUserMessageID = stringValue(item["clientId"])
+			if canonicalText, err := userMessageText(item); err == nil {
+				entry.ClientUserMessageDigest = queueTextDigest(canonicalText)
+			}
 		case "agentMessage":
 			entry.Text = stringValue(item["text"])
 		case "commandExecution":
@@ -3261,37 +3410,31 @@ func (c *Client) queuedOrStartedByClientID(
 func (c *Client) startedByClientID(
 	ctx context.Context, threadID, clientID, text string,
 ) (QueueEntry, bool, error) {
-	items, err := c.listThreadItems(ctx, threadID, nil)
+	var result QueueEntry
+	found := false
+	err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
+		if stringValue(entry.Item["type"]) != "userMessage" ||
+			stringValue(entry.Item["clientId"]) != clientID {
+			return false, nil
+		}
+		startedText, err := userMessageText(entry.Item)
+		if err != nil {
+			return false, fmt.Errorf("started queued message is invalid: %w", err)
+		}
+		if startedText != text {
+			return false, errors.New("queued message identity was reused with different text")
+		}
+		result = QueueEntry{
+			ID: stringValue(entry.Item["id"]), Text: startedText,
+			ClientUserMessageID: clientID,
+		}
+		found = true
+		return true, nil
+	})
 	if err != nil {
 		return QueueEntry{}, false, err
 	}
-	for _, entry := range items {
-		if stringValue(entry.Item["type"]) != "userMessage" ||
-			stringValue(entry.Item["clientId"]) != clientID {
-			continue
-		}
-		content, ok := entry.Item["content"].([]any)
-		if !ok {
-			return QueueEntry{}, false, errors.New("started queued message has invalid content")
-		}
-		inputs := make([]map[string]any, 0, len(content))
-		for _, value := range content {
-			input, ok := value.(map[string]any)
-			if !ok {
-				return QueueEntry{}, false, errors.New("started queued message has invalid input")
-			}
-			inputs = append(inputs, input)
-		}
-		startedText := inputText(inputs)
-		if startedText != text {
-			return QueueEntry{}, false, errors.New("queued message identity was reused with different text")
-		}
-		return QueueEntry{
-			ID: stringValue(entry.Item["id"]), Text: startedText,
-			ClientUserMessageID: clientID,
-		}, true, nil
-	}
-	return QueueEntry{}, false, nil
+	return result, found, nil
 }
 
 func (c *Client) waitForStartedByClientID(
@@ -3319,45 +3462,37 @@ func (c *Client) waitForStartedByClientID(
 func (c *Client) sentByClientID(
 	ctx context.Context, threadID, clientID, text string,
 ) (SendReceipt, bool, error) {
-	items, err := c.listThreadItems(ctx, threadID, nil)
+	var receipt SendReceipt
+	found := false
+	err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
+		if found {
+			if entry.TurnID == receipt.TurnID {
+				receipt.Steered = true
+			}
+			return true, nil
+		}
+		if stringValue(entry.Item["type"]) != "userMessage" ||
+			stringValue(entry.Item["clientId"]) != clientID {
+			return false, nil
+		}
+		sentText, err := userMessageText(entry.Item)
+		if err != nil {
+			return false, fmt.Errorf("sent message is invalid: %w", err)
+		}
+		if sentText != text {
+			return false, errors.New("message identity was reused with different text")
+		}
+		if entry.TurnID == "" {
+			return false, errors.New("sent message has no turn identity")
+		}
+		receipt = SendReceipt{TurnID: entry.TurnID, ClientUserMessageID: clientID}
+		found = true
+		return false, nil
+	})
 	if err != nil {
 		return SendReceipt{}, false, err
 	}
-	for index, entry := range items {
-		if stringValue(entry.Item["type"]) != "userMessage" ||
-			stringValue(entry.Item["clientId"]) != clientID {
-			continue
-		}
-		content, ok := entry.Item["content"].([]any)
-		if !ok {
-			return SendReceipt{}, false, errors.New("sent message has invalid content")
-		}
-		inputs := make([]map[string]any, 0, len(content))
-		for _, value := range content {
-			input, ok := value.(map[string]any)
-			if !ok {
-				return SendReceipt{}, false, errors.New("sent message has invalid input")
-			}
-			inputs = append(inputs, input)
-		}
-		if inputText(inputs) != text {
-			return SendReceipt{}, false, errors.New("message identity was reused with different text")
-		}
-		if entry.TurnID == "" {
-			return SendReceipt{}, false, errors.New("sent message has no turn identity")
-		}
-		steered := false
-		for _, older := range items[index+1:] {
-			if older.TurnID == entry.TurnID {
-				steered = true
-				break
-			}
-		}
-		return SendReceipt{
-			TurnID: entry.TurnID, ClientUserMessageID: clientID, Steered: steered,
-		}, true, nil
-	}
-	return SendReceipt{}, false, nil
+	return receipt, found, nil
 }
 
 func (c *Client) waitForSentByClientID(
@@ -3480,33 +3615,26 @@ func (c *Client) finishAbsentQueueDeletion(
 func (c *Client) queueDeletionWasStarted(
 	ctx context.Context, threadID string, attempt queueDeletionAttempt,
 ) (bool, error) {
-	items, err := c.listThreadItems(ctx, threadID, nil)
+	found := false
+	err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
+		if stringValue(entry.Item["type"]) != "userMessage" ||
+			stringValue(entry.Item["clientId"]) != attempt.ClientUserMessageID {
+			return false, nil
+		}
+		text, err := userMessageText(entry.Item)
+		if err != nil {
+			return false, fmt.Errorf("deleted queued message has invalid history: %w", err)
+		}
+		if queueTextDigest(text) != attempt.Digest {
+			return false, errors.New("deleted queued message identity was reused with different text")
+		}
+		found = true
+		return true, nil
+	})
 	if err != nil {
 		return false, fmt.Errorf("inspect deleted queued message history: %w", err)
 	}
-	for _, entry := range items {
-		if stringValue(entry.Item["type"]) != "userMessage" ||
-			stringValue(entry.Item["clientId"]) != attempt.ClientUserMessageID {
-			continue
-		}
-		content, ok := entry.Item["content"].([]any)
-		if !ok {
-			return false, errors.New("deleted queued message has invalid history content")
-		}
-		inputs := make([]map[string]any, 0, len(content))
-		for _, value := range content {
-			input, ok := value.(map[string]any)
-			if !ok {
-				return false, errors.New("deleted queued message has invalid history input")
-			}
-			inputs = append(inputs, input)
-		}
-		if queueTextDigest(inputText(inputs)) != attempt.Digest {
-			return false, errors.New("deleted queued message identity was reused with different text")
-		}
-		return true, nil
-	}
-	return false, nil
+	return found, nil
 }
 
 func (c *Client) StartQueue(ctx context.Context, threadID, queuedSubmissionID string) error {
@@ -3571,17 +3699,13 @@ func (c *Client) Send(
 	if err != nil {
 		return SendReceipt{}, err
 	}
-	if !attempted {
-		receipt, found, err := c.sentByClientID(
-			ctx, threadID, clientUserMessageID, text,
-		)
-		if err != nil {
-			return SendReceipt{}, err
-		}
-		if found {
-			return receipt, nil
-		}
-	} else if attempt.State == "submitting" {
+	if attempted && attempt.State == "accepted" {
+		return SendReceipt{
+			TurnID: attempt.TurnID, ClientUserMessageID: clientUserMessageID,
+			Steered: attempt.Steered,
+		}, nil
+	}
+	if attempted && attempt.State == "submitting" {
 		receipt, found, err := c.sentByClientID(
 			ctx, threadID, clientUserMessageID, text,
 		)
@@ -3590,9 +3714,9 @@ func (c *Client) Send(
 		}
 		if found {
 			receipt.Steered = attempt.Steered
-			if err := c.clearSendAttempt(threadID, clientUserMessageID); err != nil {
+			if err := c.markSendAccepted(threadID, clientUserMessageID, receipt); err != nil {
 				return SendReceipt{}, &UnknownSendOutcomeError{Err: fmt.Errorf(
-					"message was accepted but its attempt record could not be cleared: %w", err,
+					"message was accepted but its receipt could not be recorded: %w", err,
 				)}
 			}
 			return receipt, nil
@@ -3631,9 +3755,9 @@ func (c *Client) Send(
 		)
 		if found && reconcileErr == nil {
 			receipt.Steered = steered
-			if err := c.clearSendAttempt(threadID, clientUserMessageID); err != nil {
+			if err := c.markSendAccepted(threadID, clientUserMessageID, receipt); err != nil {
 				return SendReceipt{}, &UnknownSendOutcomeError{Err: fmt.Errorf(
-					"message was accepted but its attempt record could not be cleared: %w", err,
+					"message was accepted but its receipt could not be recorded: %w", err,
 				)}
 			}
 			return receipt, nil
@@ -3657,7 +3781,7 @@ func (c *Client) Send(
 		if response.TurnID != turnID {
 			return reconcile(errors.New("turn/steer returned the wrong turn"))
 		}
-		return c.finishAcceptedSend(threadID, text, SendReceipt{
+		return c.finishAcceptedSend(threadID, SendReceipt{
 			TurnID: turnID, ClientUserMessageID: clientUserMessageID, Steered: true,
 		})
 	}
@@ -3676,32 +3800,17 @@ func (c *Client) Send(
 	if response.Turn.ID == "" {
 		return reconcile(errors.New("turn/start returned no turn"))
 	}
-	return c.finishAcceptedSend(threadID, text, SendReceipt{
+	return c.finishAcceptedSend(threadID, SendReceipt{
 		TurnID: response.Turn.ID, ClientUserMessageID: clientUserMessageID,
 	})
 }
 
 func (c *Client) finishAcceptedSend(
-	threadID, text string, receipt SendReceipt,
+	threadID string, receipt SendReceipt,
 ) (SendReceipt, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	visible, found, err := c.waitForSentByClientID(
-		ctx, threadID, receipt.ClientUserMessageID, text,
-	)
-	if err != nil || !found {
-		// The RPC response proves acceptance. Keep the durable submitting record
-		// until a later retry can also prove it from history.
-		return receipt, nil
-	}
-	if visible.TurnID != receipt.TurnID {
-		return SendReceipt{}, &UnknownSendOutcomeError{Err: errors.New(
-			"accepted message appeared under a different turn identity",
-		)}
-	}
-	if err := c.clearSendAttempt(threadID, receipt.ClientUserMessageID); err != nil {
+	if err := c.markSendAccepted(threadID, receipt.ClientUserMessageID, receipt); err != nil {
 		return SendReceipt{}, &UnknownSendOutcomeError{Err: fmt.Errorf(
-			"message was accepted but its attempt record could not be cleared: %w", err,
+			"message was accepted but its receipt could not be recorded: %w", err,
 		)}
 	}
 	return receipt, nil
@@ -3719,12 +3828,29 @@ func (c *Client) PrepareSend(
 func (c *Client) SendAttempted(
 	ctx context.Context, threadID, text, clientUserMessageID, context string,
 ) (bool, error) {
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
 	_, found, err := c.sendAttempt(threadID, clientUserMessageID, text, context)
 	if err != nil || found {
 		return found, err
 	}
-	_, found, err = c.sentByClientID(ctx, threadID, clientUserMessageID, text)
-	return found, err
+	receipt, found, err := c.sentByClientID(ctx, threadID, clientUserMessageID, text)
+	if err != nil || !found {
+		return found, err
+	}
+	if err := c.recordSendAttempt(
+		threadID, clientUserMessageID, text, context, receipt.Steered,
+	); err != nil {
+		return false, err
+	}
+	if err := c.markSendSubmitting(threadID, clientUserMessageID); err != nil {
+		return false, err
+	}
+	if err := c.markSendAccepted(threadID, clientUserMessageID, receipt); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text string, allowUnmaterializedStart bool) error {

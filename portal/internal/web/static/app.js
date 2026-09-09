@@ -14,8 +14,11 @@
     pending: async () => (await request(apiPath(slug, "pending"))) || [],
     modes: async () => (await request("/api/collaboration-modes")) || [],
     queue: async () => (await request(apiPath(slug, "queue"))) || [],
-    message: (message, clientUserMessageId) => request(apiPath(slug, "message"), {
-      method: "POST", body: JSON.stringify({message, clientUserMessageId}),
+    message: (message, clientUserMessageId, retry = false) => request(apiPath(slug, "message"), {
+      method: "POST", body: JSON.stringify({message, clientUserMessageId, retry}),
+    }),
+    acknowledgeMessages: (acknowledgements) => request(apiPath(slug, "message-ack"), {
+      method: "POST", body: JSON.stringify({acknowledgements}),
     }),
     queueMessage: (message, clientUserMessageId) => request(apiPath(slug, "queue"), {
       method: "POST", body: JSON.stringify({message, clientUserMessageId}),
@@ -72,6 +75,25 @@
   const shouldFollowTranscript = (element, threshold = 48) => (
     element.scrollHeight - element.clientHeight - element.scrollTop <= threshold
   );
+  const sendAcknowledgementCandidates = (entries, attempts, excludedIDs = new Set(), limit = 100) => {
+    const observed = new Map((entries || []).filter((entry) => (
+      entry.clientUserMessageId && /^[0-9a-f]{64}$/.test(entry.clientUserMessageDigest || "")
+    )).map((entry) => [entry.clientUserMessageId, entry.clientUserMessageDigest]));
+    return (attempts || []).filter((attempt) => (
+      observed.has(attempt.id) && !excludedIDs.has(attempt.id)
+    )).slice(0, limit).map((attempt) => ({
+      ...attempt, transcriptDigest: observed.get(attempt.id),
+    }));
+  };
+  const markTranscriptMessagesObserved = (pending, entries) => {
+    for (const entry of entries || []) {
+      if (!entry.clientUserMessageId) continue;
+      const receipt = pending.get(entry.clientUserMessageId);
+      if (receipt && receipt.state !== "sending") {
+        pending.set(entry.clientUserMessageId, {...receipt, state: "accepted"});
+      }
+    }
+  };
   const transcriptEntryKey = (entry, index, entries = []) => {
     const turnID = entry?.turnId || "";
     const itemID = entry?.itemId || "";
@@ -465,10 +487,11 @@
       autoResolutionLabel, beforeRequestInputAction, clearThreadStorage,
       deleteQueueAttempt, deleteRequestInputDraft, deleteSendAttempt,
       loadQueueAttempts, loadRequestInputDraft, loadSendAttempts, messageActionLabel,
-      matchingSendAttempt,
+      markTranscriptMessagesObserved, matchingSendAttempt,
       queueAttemptStorageKey, sendAttemptStorageKey, queueAttemptStoragePrefix,
       requestInputDraftStorageKey, requireQueueAttempts, shouldFollowTranscript,
-      shouldSubmitMessage, storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
+      sendAcknowledgementCandidates, shouldSubmitMessage,
+      storeQueueAttempt, storeRequestInputDraft, storeSendAttempt,
       captureTranscriptDisclosureState, captureTranscriptViewState, encodeQuestionAnswer,
       activityAge, fileChangeDiffs, formatElapsed, indexMembershipChanged, indexStatusFreshForPage,
       indexStatusOrder, lifecyclePresentation, sessionTabFromHash,
@@ -996,13 +1019,14 @@
   let planRenderGeneration = 0;
   let dismissedPlanSHA = "";
   const pendingMessages = new Map();
+  let sendReceiptAcknowledgementActive = false;
   const requestInputDrafts = new Map();
   const codexWork = document.getElementById("codex-work");
   const codexWorkElapsed = document.getElementById("codex-work-elapsed");
   let codexWorkStartedAt = 0;
   let codexWorkTimer = null;
   let sendAttemptStorage = null;
-  try { sendAttemptStorage = globalThis.localStorage; } catch (_error) {}
+  try { sendAttemptStorage = globalThis.sessionStorage; } catch (_error) {}
   let requestInputDraftStorage = null;
   try { requestInputDraftStorage = globalThis.sessionStorage; } catch (_error) {}
 
@@ -1049,6 +1073,49 @@
       container.append(item);
     }
     container.hidden = pendingMessages.size === 0;
+  };
+
+  const acknowledgeTranscriptMessages = (entries) => {
+    if (sendReceiptAcknowledgementActive) return;
+    const attempts = loadSendAttempts(sendAttemptStorage, slug, currentThreadId);
+    if (!attempts?.length) return;
+    const inFlight = new Set(Array.from(pendingMessages).filter(([, entry]) => (
+      entry.state === "sending"
+    )).map(([id]) => id));
+    const candidates = sendAcknowledgementCandidates(entries, attempts, inFlight, attempts.length);
+    const batch = candidates.slice(0, 100);
+    if (!batch.length) return;
+    sendReceiptAcknowledgementActive = true;
+    let continueAcknowledging = false;
+    let retryAcknowledgement = false;
+    void client.acknowledgeMessages(batch.map((attempt) => ({
+      clientUserMessageId: attempt.id, digest: attempt.transcriptDigest,
+    }))).then((result) => {
+      const acknowledged = new Set(result.acknowledgedClientUserMessageIds || []);
+      let removedAll = true;
+      for (const attempt of batch) {
+        if (!acknowledged.has(attempt.id)) {
+          removedAll = false;
+          continue;
+        }
+        if (deleteSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt.id)) {
+          pendingMessages.delete(attempt.id);
+          const composer = document.getElementById("message-form")?.elements.message;
+          if (composer && composer.value.trim() === attempt.message) composer.value = "";
+        } else {
+          removedAll = false;
+        }
+      }
+      renderMessageReceipts();
+      continueAcknowledging = removedAll && candidates.length > batch.length;
+      retryAcknowledgement = !removedAll;
+    }).catch(() => {
+      retryAcknowledgement = true;
+    }).finally(() => {
+      sendReceiptAcknowledgementActive = false;
+      if (continueAcknowledging) queueMicrotask(() => acknowledgeTranscriptMessages(entries));
+      if (retryAcknowledgement) setTimeout(() => acknowledgeTranscriptMessages(entries), 2000);
+    });
   };
 
   const sha256Hex = async (text) => {
@@ -1236,12 +1303,9 @@
     const entries = payload.entries || [];
     const nextSignature = JSON.stringify(entries);
     const transcriptChanged = !transcriptInitialized || nextSignature !== transcriptSignature;
-    for (const entry of entries) {
-      if (entry.clientUserMessageId) {
-        pendingMessages.delete(entry.clientUserMessageId);
-        deleteSendAttempt(sendAttemptStorage, slug, currentThreadId, entry.clientUserMessageId);
-      }
-    }
+    markTranscriptMessagesObserved(pendingMessages, entries);
+    renderMessageReceipts();
+    acknowledgeTranscriptMessages(entries);
     if (transcriptChanged) {
       const view = transcriptViews.get(transcriptFilter);
       view.disclosures = captureTranscriptDisclosureState(transcript);
@@ -1660,6 +1724,14 @@
     }, delay);
   }
 
+  const markMessageOutcomeUnknown = (id) => {
+    const entry = pendingMessages.get(id);
+    if (!entry) return;
+    pendingMessages.set(id, {...entry, state: "unknown"});
+    renderMessageReceipts();
+    scheduleRefresh(0);
+  };
+
   const form = document.getElementById("message-form");
   if (form && interactive) {
     const textarea = form.elements.message;
@@ -1696,6 +1768,7 @@
             throw new Error("Browser storage is unavailable; messages cannot be submitted safely.");
           }
           let attempt = matchingSendAttempt(sendAttempts, message);
+          const retry = Boolean(attempt);
           if (!attempt) {
             attempt = {id: crypto.randomUUID(), message, steered: threadActive, context: ""};
             if (!storeSendAttempt(sendAttemptStorage, slug, currentThreadId, attempt)) {
@@ -1705,7 +1778,7 @@
           const id = attempt.id;
           pendingMessages.set(id, {id, message, state: "sending", steered: attempt.steered});
           renderMessageReceipts();
-          const receipt = await client.message(message, id);
+          const receipt = await client.message(message, id, retry);
           pendingMessages.set(id, {
             id, message, state: "accepted", steered: Boolean(receipt.steered),
           });
@@ -1716,10 +1789,9 @@
       } catch (error) {
         for (const [id, entry] of pendingMessages) {
           if (entry.state === "sending" && entry.message === message) {
-            pendingMessages.set(id, {...entry, state: "unknown"});
+            markMessageOutcomeUnknown(id);
           }
         }
-        renderMessageReceipts();
         alert(error.message);
       }
       finally {
@@ -1831,8 +1903,7 @@
       applyCurrentSettings();
       scheduleRefresh(0);
     } catch (error) {
-      pendingMessages.set(id, {id, message, state: "unknown", steered: false});
-      renderMessageReceipts();
+      markMessageOutcomeUnknown(id);
       button.disabled = false;
       alert(error.message);
     }

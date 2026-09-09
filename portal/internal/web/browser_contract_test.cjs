@@ -6,11 +6,14 @@ const {
   captureTranscriptDisclosureState, captureTranscriptViewState, clearThreadStorage,
   deleteQueueAttempt, deleteRequestInputDraft,
   deleteSendAttempt, loadQueueAttempts,
-  loadRequestInputDraft, loadSendAttempts, matchingSendAttempt, messageActionLabel, queueAttemptStorageKey,
+  loadRequestInputDraft, loadSendAttempts, markTranscriptMessagesObserved,
+  matchingSendAttempt, messageActionLabel, queueAttemptStorageKey,
   queueAttemptStoragePrefix, requestInputDraftStorageKey, requireQueueAttempts,
-  sendAttemptStorageKey, shouldFollowTranscript, shouldSubmitMessage, storeQueueAttempt,
+  sendAcknowledgementCandidates, sendAttemptStorageKey, shouldFollowTranscript,
+  shouldSubmitMessage, storeQueueAttempt,
   storeRequestInputDraft, storeSendAttempt, transcriptEntriesForFilter, transcriptEntryKey,
-  transcriptEntryVisible, wrapMarkdownTables, encodeQuestionAnswer, fileChangeDiffs, formatElapsed,
+  transcriptEntryVisible, wrapMarkdownTables, encodeQuestionAnswer,
+  fileChangeDiffs, formatElapsed,
   activityAge, indexMembershipChanged, indexStatusFreshForPage, indexStatusOrder,
   lifecyclePresentation, sessionTabFromHash,
 } = require("./static/app.js");
@@ -232,6 +235,38 @@ assert.equal(
 );
 assert.equal(deleteSendAttempt(storage, "example", "thread-1", sendAttempt.id), true);
 assert.deepEqual(loadSendAttempts(storage, "example", "thread-1"), []);
+assert.deepEqual(sendAcknowledgementCandidates([
+  {clientUserMessageId: "owned", clientUserMessageDigest: "a".repeat(64)},
+  {clientUserMessageId: "another-browser", clientUserMessageDigest: "b".repeat(64)},
+], [
+  {id: "owned", message: "mine"},
+]), [{id: "owned", message: "mine", transcriptDigest: "a".repeat(64)}]);
+assert.deepEqual(sendAcknowledgementCandidates([
+  {clientUserMessageId: "sending", clientUserMessageDigest: "a".repeat(64)},
+  {clientUserMessageId: "settled", clientUserMessageDigest: "b".repeat(64)},
+], [
+  {id: "sending", message: "still in flight"},
+  {id: "settled", message: "ready"},
+], new Set(["sending"])), [{
+  id: "settled", message: "ready", transcriptDigest: "b".repeat(64),
+}]);
+assert.deepEqual(sendAcknowledgementCandidates([
+  {clientUserMessageId: "unicode-space", clientUserMessageDigest: "a".repeat(64)},
+], [
+  {id: "unicode-space", message: "\u0085message\u0085"},
+]), [{
+  id: "unicode-space", message: "\u0085message\u0085", transcriptDigest: "a".repeat(64),
+}]);
+const observedReceipts = new Map([
+  ["sending", {id: "sending", message: "still in flight", state: "sending"}],
+  ["unknown", {id: "unknown", message: "response lost", state: "unknown"}],
+]);
+markTranscriptMessagesObserved(observedReceipts, [
+  {clientUserMessageId: "sending", text: "still in flight"},
+  {clientUserMessageId: "unknown", text: "response lost"},
+]);
+assert.equal(observedReceipts.get("sending").state, "sending");
+assert.equal(observedReceipts.get("unknown").state, "accepted");
 const planAAttempt = {
   message: "Implement the plan.", id: "00000000-0000-4000-8000-000000000006",
   steered: false, context: "plan:aaaaaaaa",
@@ -347,6 +382,10 @@ if (!unitOnly) (async () => {
   assert.equal(queue[0].text, "queued item");
 
   await automaticClient.settings("model-1", "");
+  await automaticClient.acknowledgeMessages([{
+    clientUserMessageId: "00000000-0000-4000-8000-000000000004",
+    digest: "ea5068c45b6c755e5dd592e23c713559960f37c09b5da18873ebc3982f42d211",
+  }]);
   await automaticClient.fork("forked", "2026-09-05", "model-1", "");
   await automaticClient.archive("complete");
   await automaticClient.revive(true);
@@ -355,6 +394,13 @@ if (!unitOnly) (async () => {
     {
       path: "/api/sessions/example/settings",
       body: {model: "model-1", reasoningEffort: ""},
+    },
+    {
+      path: "/api/sessions/example/message-ack",
+      body: {acknowledgements: [{
+        clientUserMessageId: "00000000-0000-4000-8000-000000000004",
+        digest: "ea5068c45b6c755e5dd592e23c713559960f37c09b5da18873ebc3982f42d211",
+      }]},
     },
     {
       path: "/api/sessions/example/fork",
@@ -375,13 +421,17 @@ if (!unitOnly) (async () => {
   ]);
 
   assert.deepEqual(
-    await client.message("browser message", "00000000-0000-4000-8000-000000000004"),
+    await client.message("browser message", "00000000-0000-4000-8000-000000000004", true),
     {
       turnId: "turn-1",
       clientUserMessageId: "00000000-0000-4000-8000-000000000004",
       steered: true,
     },
   );
+  assert.deepEqual(await client.acknowledgeMessages([{
+    clientUserMessageId: "00000000-0000-4000-8000-000000000004",
+    digest: "ea5068c45b6c755e5dd592e23c713559960f37c09b5da18873ebc3982f42d211",
+  }]), {acknowledgedClientUserMessageIds: ["00000000-0000-4000-8000-000000000004"]});
   assert.equal((await client.queueMessage(
     "queue message", "00000000-0000-4000-8000-000000000001",
   )).id, "queued-2");

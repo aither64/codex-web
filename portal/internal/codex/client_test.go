@@ -1015,8 +1015,7 @@ func TestSendReturnsAClientCorrelatedReceipt(t *testing.T) {
 					return err
 				}
 				for index, expected := range []string{
-					"thread/items/list", "thread/resume", "thread/turns/list", test.method,
-					"thread/items/list",
+					"thread/resume", "thread/turns/list", test.method,
 				} {
 					request, err := readObject(connection)
 					if err != nil {
@@ -1028,9 +1027,7 @@ func TestSendReturnsAClientCorrelatedReceipt(t *testing.T) {
 					params := request["params"].(map[string]any)
 					result := map[string]any{}
 					switch index {
-					case 0:
-						result = map[string]any{"data": []any{}, "nextCursor": nil}
-					case 2:
+					case 1:
 						turns := []any{}
 						if test.activeTurn != "" {
 							turns = append(turns, map[string]any{
@@ -1038,7 +1035,7 @@ func TestSendReturnsAClientCorrelatedReceipt(t *testing.T) {
 							})
 						}
 						result = map[string]any{"data": turns}
-					case 3:
+					case 2:
 						if params["threadId"] != "thread-1" ||
 							params["clientUserMessageId"] != "client-message-1" {
 							return fmt.Errorf("uncorrelated message request: %#v", request)
@@ -1051,18 +1048,6 @@ func TestSendReturnsAClientCorrelatedReceipt(t *testing.T) {
 						} else {
 							result = map[string]any{"turn": map[string]any{"id": "turn-new"}}
 						}
-					case 4:
-						turn := "turn-new"
-						if test.steered {
-							turn = test.activeTurn
-						}
-						result = map[string]any{"data": []any{map[string]any{
-							"turnId": turn, "item": map[string]any{
-								"id": "message-1", "type": "userMessage",
-								"clientId": "client-message-1",
-								"content":  []any{map[string]any{"type": "text", "text": "message"}},
-							},
-						}}, "nextCursor": nil}
 					}
 					if err := writeObject(connection, map[string]any{
 						"id": request["id"], "result": result,
@@ -1136,6 +1121,149 @@ func TestSendRetryReconcilesARecordedAttemptWithoutSubmittingAgain(t *testing.T)
 	}
 }
 
+func TestSendRetryReconcilesBeyondTenHistoryPages(t *testing.T) {
+	const pageCount = 12
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for pageNumber := 0; pageNumber < pageCount; pageNumber++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != "thread/items/list" {
+				return fmt.Errorf("history page %d request = %#v", pageNumber, request)
+			}
+			params := request["params"].(map[string]any)
+			if pageNumber > 0 && params["cursor"] != fmt.Sprintf("page-%d", pageNumber) {
+				return fmt.Errorf("history page %d cursor = %v", pageNumber, params["cursor"])
+			}
+			item := map[string]any{
+				"turnId": fmt.Sprintf("turn-%d", pageNumber),
+				"item": map[string]any{
+					"id": fmt.Sprintf("item-%d", pageNumber), "type": "agentMessage",
+				},
+			}
+			if pageNumber == pageCount-1 {
+				item = map[string]any{
+					"turnId": "turn-accepted", "item": map[string]any{
+						"id": "message-accepted", "type": "userMessage",
+						"clientId": "client-long-retry",
+						"content":  []any{map[string]any{"type": "text", "text": "message"}},
+					},
+				}
+			}
+			var nextCursor any
+			if pageNumber+1 < pageCount {
+				nextCursor = fmt.Sprintf("page-%d", pageNumber+1)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{
+					"data": []any{item}, "nextCursor": nextCursor,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordSendAttempt(
+		"thread-1", "client-long-retry", "message", "", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendSubmitting("thread-1", "client-long-retry"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	receipt, err := client.Send(ctx, "thread-1", "message", "client-long-retry", "")
+	if err != nil || receipt.TurnID != "turn-accepted" || receipt.Steered {
+		t.Fatalf("long-history retry = %#v, %v", receipt, err)
+	}
+}
+
+func TestThreadItemWalkerRejectsMalformedPagination(t *testing.T) {
+	item := func(turnID, itemID string) map[string]any {
+		return map[string]any{
+			"turnId": turnID, "item": map[string]any{"id": itemID, "type": "agentMessage"},
+		}
+	}
+	tests := []struct {
+		name  string
+		pages []map[string]any
+		want  string
+	}{
+		{
+			name: "invalid item",
+			pages: []map[string]any{{
+				"data": []any{item("", "item-1")}, "nextCursor": nil,
+			}},
+			want: "invalid item entry",
+		},
+		{
+			name: "repeated item",
+			pages: []map[string]any{
+				{"data": []any{item("turn-1", "item-1")}, "nextCursor": "page-2"},
+				{"data": []any{item("turn-1", "item-1")}, "nextCursor": nil},
+			},
+			want: `repeated item "item-1"`,
+		},
+		{
+			name: "empty cursor",
+			pages: []map[string]any{{
+				"data": []any{item("turn-1", "item-1")}, "nextCursor": "",
+			}},
+			want: "empty pagination cursor",
+		},
+		{
+			name: "repeated cursor",
+			pages: []map[string]any{
+				{"data": []any{item("turn-1", "item-1")}, "nextCursor": "same"},
+				{"data": []any{item("turn-2", "item-2")}, "nextCursor": "same"},
+			},
+			want: "repeated a pagination cursor",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for _, page := range test.pages {
+					request, err := readObject(connection)
+					if err != nil {
+						return err
+					}
+					if request["method"] != "thread/items/list" {
+						return fmt.Errorf("history request = %#v", request)
+					}
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"], "result": page,
+					}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := New(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.walkThreadItems(ctx, "thread-1", func(threadItemEntry) (bool, error) {
+				return false, nil
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("walker error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestSendRetryFailsClosedWhileRecordedAttemptIsAbsent(t *testing.T) {
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
@@ -1173,13 +1301,13 @@ func TestSendRetryFailsClosedWhileRecordedAttemptIsAbsent(t *testing.T) {
 	}
 }
 
-func TestPreparedSendSurvivesRestartAndIsPrunedAfterAcceptance(t *testing.T) {
+func TestPreparedSendSurvivesRestartAndRetainsAcceptanceReceipt(t *testing.T) {
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
 		for index, expected := range []string{
-			"thread/resume", "thread/turns/list", "turn/start", "thread/items/list",
+			"thread/resume", "thread/turns/list", "turn/start",
 		} {
 			request, err := readObject(connection)
 			if err != nil {
@@ -1193,13 +1321,6 @@ func TestPreparedSendSurvivesRestartAndIsPrunedAfterAcceptance(t *testing.T) {
 				result = map[string]any{"data": []any{}}
 			} else if index == 2 {
 				result = map[string]any{"turn": map[string]any{"id": "turn-plan"}}
-			} else if index == 3 {
-				result = map[string]any{"data": []any{map[string]any{
-					"turnId": "turn-plan", "item": map[string]any{
-						"id": "message-plan", "type": "userMessage", "clientId": "client-plan",
-						"content": []any{map[string]any{"type": "text", "text": "Implement the plan."}},
-					},
-				}}, "nextCursor": nil}
 			}
 			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
 				return err
@@ -1234,21 +1355,21 @@ func TestPreparedSendSurvivesRestartAndIsPrunedAfterAcceptance(t *testing.T) {
 	if err != nil || receipt.TurnID != "turn-plan" || receipt.Steered {
 		t.Fatalf("prepared send = %#v, %v", receipt, err)
 	}
-	if _, found, err := client.sendAttempt(
+	attempt, found, err := client.sendAttempt(
 		"thread-1", "client-plan", "Implement the plan.", "plan:digest",
-	); err != nil || found {
-		t.Fatalf("accepted attempt retained = %t, %v", found, err)
+	)
+	if err != nil || !found || attempt.State != "accepted" || attempt.TurnID != "turn-plan" {
+		t.Fatalf("accepted receipt = %#v, %t, %v", attempt, found, err)
 	}
 }
 
-func TestAcceptedSendIsPrunedAndAStaleRetryUsesHistory(t *testing.T) {
+func TestAcceptedSendRetryUsesDurableReceipt(t *testing.T) {
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
 		for index, expected := range []string{
-			"thread/items/list", "thread/resume", "thread/turns/list", "turn/start",
-			"thread/items/list", "thread/items/list",
+			"thread/resume", "thread/turns/list", "turn/start",
 		} {
 			request, err := readObject(connection)
 			if err != nil {
@@ -1259,19 +1380,10 @@ func TestAcceptedSendIsPrunedAndAStaleRetryUsesHistory(t *testing.T) {
 			}
 			result := map[string]any{}
 			switch index {
-			case 0:
-				result = map[string]any{"data": []any{}, "nextCursor": nil}
-			case 2:
+			case 1:
 				result = map[string]any{"data": []any{}}
-			case 3:
+			case 2:
 				result = map[string]any{"turn": map[string]any{"id": "turn-1"}}
-			case 4, 5:
-				result = map[string]any{"data": []any{map[string]any{
-					"turnId": "turn-1", "item": map[string]any{
-						"id": "message-1", "type": "userMessage", "clientId": "client-1",
-						"content": []any{map[string]any{"type": "text", "text": "message"}},
-					},
-				}}, "nextCursor": nil}
 			}
 			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
 				return err
@@ -1287,12 +1399,302 @@ func TestAcceptedSendIsPrunedAndAStaleRetryUsesHistory(t *testing.T) {
 	if err != nil || first.TurnID != "turn-1" {
 		t.Fatalf("first send = %#v, %v", first, err)
 	}
-	if _, found, err := client.sendAttempt("thread-1", "client-1", "message", ""); err != nil || found {
-		t.Fatalf("accepted send attempt retained = %t, %v", found, err)
+	attempt, found, err := client.sendAttempt("thread-1", "client-1", "message", "")
+	if err != nil || !found || attempt.State != "accepted" || attempt.TurnID != "turn-1" {
+		t.Fatalf("accepted send receipt = %#v, %t, %v", attempt, found, err)
 	}
 	retry, err := client.Send(ctx, "thread-1", "message", "client-1", "")
 	if err != nil || retry.TurnID != "turn-1" || retry.Steered {
 		t.Fatalf("stale retry = %#v, %v", retry, err)
+	}
+}
+
+func TestAcknowledgingTranscriptMessagesReleasesOnlyProvenReceipts(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil || request["method"] != "thread/items/list" {
+			return fmt.Errorf("acknowledgement request = %#v, %v", request, err)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{
+				"data": []any{map[string]any{
+					"turnId": "turn-1", "item": map[string]any{
+						"id": "item-user", "type": "userMessage", "clientId": "accepted",
+						"content": []any{map[string]any{"type": "text", "text": "accepted text"}},
+					},
+				}},
+				"nextCursor": nil,
+			},
+		})
+	})
+	client := New(socket)
+	for _, clientID := range []string{"accepted", "submitting"} {
+		if err := client.recordSendAttempt("thread-1", clientID, clientID+" text", "", false); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.markSendSubmitting("thread-1", clientID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := client.markSendAccepted("thread-1", "accepted", SendReceipt{
+		TurnID: "turn-1", ClientUserMessageID: "accepted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(socket + ".submission-attempts-v3.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledged, err := client.AcknowledgeSends(
+		context.Background(), "thread-1", []SendAcknowledgement{{
+			ClientUserMessageID: "accepted", Digest: queueTextDigest("accepted text"),
+		}},
+	)
+	if err != nil || len(acknowledged) != 1 || acknowledged[0] != "accepted" {
+		t.Fatalf("acknowledged identities = %#v, %v", acknowledged, err)
+	}
+	after, err := os.Stat(socket + ".submission-attempts-v3.json")
+	if err != nil || after.Size() >= before.Size() {
+		t.Fatalf("compacted ledger size = %v after %v, error %v", before.Size(), after, err)
+	}
+	if _, found, err := client.sendAttempt("thread-1", "accepted", "accepted text", ""); err != nil || found {
+		t.Fatalf("acknowledged receipt = found %t, error %v", found, err)
+	}
+	attempt, found, err := client.sendAttempt("thread-1", "submitting", "submitting text", "")
+	if err != nil || !found || attempt.State != "submitting" {
+		t.Fatalf("unresolved attempt = %#v, found %t, error %v", attempt, found, err)
+	}
+	client.Close()
+
+	restarted := New(socket)
+	defer restarted.Close()
+	if _, found, err := restarted.sendAttempt(
+		"thread-1", "accepted", "accepted text", "",
+	); err != nil || found {
+		t.Fatalf("restarted acknowledged receipt = found %t, error %v", found, err)
+	}
+	attempt, found, err = restarted.sendAttempt(
+		"thread-1", "submitting", "submitting text", "",
+	)
+	if err != nil || !found || attempt.State != "submitting" {
+		t.Fatalf("restarted unresolved attempt = %#v, found %t, error %v", attempt, found, err)
+	}
+}
+
+func TestAcceptedAcknowledgementRequiresItsRecordedTranscriptTurn(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		data       []any
+		wantError  string
+		wantProven bool
+	}{
+		{name: "missing history", data: []any{}},
+		{
+			name: "different turn",
+			data: []any{map[string]any{
+				"turnId": "turn-other", "item": map[string]any{
+					"id": "item-user", "type": "userMessage", "clientId": "client-accepted",
+					"content": []any{map[string]any{"type": "text", "text": "message"}},
+				},
+			}},
+			wantError: "accepted by another turn",
+		},
+		{
+			name: "different text",
+			data: []any{map[string]any{
+				"turnId": "turn-accepted", "item": map[string]any{
+					"id": "item-user", "type": "userMessage", "clientId": "client-accepted",
+					"content": []any{map[string]any{"type": "text", "text": "other message"}},
+				},
+			}},
+			wantError: "reused with different text",
+		},
+		{
+			name: "exact turn",
+			data: []any{map[string]any{
+				"turnId": "turn-accepted", "item": map[string]any{
+					"id": "item-user", "type": "userMessage", "clientId": "client-accepted",
+					"content": []any{map[string]any{"type": "text", "text": "message"}},
+				},
+			}},
+			wantProven: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				request, err := readObject(connection)
+				if err != nil || request["method"] != "thread/items/list" {
+					return fmt.Errorf("acknowledgement request = %#v, %v", request, err)
+				}
+				return writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"data": testCase.data, "nextCursor": nil,
+					},
+				})
+			})
+			client := New(socket)
+			defer client.Close()
+			if err := client.recordSendAttempt(
+				"thread-1", "client-accepted", "message", "", false,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.markSendSubmitting("thread-1", "client-accepted"); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.markSendAccepted("thread-1", "client-accepted", SendReceipt{
+				TurnID: "turn-accepted", ClientUserMessageID: "client-accepted",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			acknowledged, err := client.AcknowledgeSends(
+				ctx, "thread-1", []SendAcknowledgement{{
+					ClientUserMessageID: "client-accepted", Digest: queueTextDigest("message"),
+				}},
+			)
+			if testCase.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
+					t.Fatalf("acknowledgement error = %v, want %q", err, testCase.wantError)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(acknowledged) == 1; got != testCase.wantProven {
+				t.Fatalf("acknowledged = %#v, want proven %t", acknowledged, testCase.wantProven)
+			}
+			_, retained, attemptErr := client.sendAttempt(
+				"thread-1", "client-accepted", "message", "",
+			)
+			if attemptErr != nil || retained == testCase.wantProven {
+				t.Fatalf("retained receipt = %t, error %v", retained, attemptErr)
+			}
+		})
+	}
+}
+
+func TestAcknowledgementReconcilesAcceptanceLostBeforeReceiptWasRecorded(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for requestNumber := 0; requestNumber < 2; requestNumber++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != "thread/items/list" {
+				return fmt.Errorf("acknowledgement request = %#v", request)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{
+					"data": []any{map[string]any{
+						"turnId": "turn-accepted", "item": map[string]any{
+							"id": "item-user", "type": "userMessage", "clientId": "client-lost",
+							"content": []any{map[string]any{"type": "text", "text": "message"}},
+						},
+					}},
+					"nextCursor": nil,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	first := New(socket)
+	if err := first.recordSendAttempt("thread-1", "client-lost", "message", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.markSendSubmitting("thread-1", "client-lost"); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+
+	client := New(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	acknowledgement := []SendAcknowledgement{{
+		ClientUserMessageID: "client-lost", Digest: queueTextDigest("message"),
+	}}
+	for attempt := 0; attempt < 2; attempt++ {
+		acknowledged, err := client.AcknowledgeSends(ctx, "thread-1", acknowledgement)
+		if err != nil || len(acknowledged) != 1 || acknowledged[0] != "client-lost" {
+			t.Fatalf("acknowledgement %d = %#v, %v", attempt, acknowledged, err)
+		}
+	}
+	if _, found, err := client.sendAttempt("thread-1", "client-lost", "message", ""); err != nil || found {
+		t.Fatalf("reconciled attempt = found %t, error %v", found, err)
+	}
+}
+
+func TestRetryAfterAcknowledgementRebuildsTheReceiptWithoutResubmitting(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for requestNumber := 0; requestNumber < 2; requestNumber++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != "thread/items/list" {
+				return fmt.Errorf("stale retry submitted instead of reconciling: %#v", request)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{
+					"data": []any{map[string]any{
+						"turnId": "turn-accepted", "item": map[string]any{
+							"id": "item-user", "type": "userMessage", "clientId": "client-stale",
+							"content": []any{map[string]any{"type": "text", "text": "message"}},
+						},
+					}},
+					"nextCursor": nil,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordSendAttempt("thread-1", "client-stale", "message", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendSubmitting("thread-1", "client-stale"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendAccepted("thread-1", "client-stale", SendReceipt{
+		TurnID: "turn-accepted", ClientUserMessageID: "client-stale",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	acknowledgement := []SendAcknowledgement{{
+		ClientUserMessageID: "client-stale", Digest: queueTextDigest("message"),
+	}}
+	if acknowledged, err := client.AcknowledgeSends(
+		context.Background(), "thread-1", acknowledgement,
+	); err != nil || len(acknowledged) != 1 {
+		t.Fatalf("acknowledgement = %#v, %v", acknowledged, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	attempted, err := client.SendAttempted(ctx, "thread-1", "message", "client-stale", "")
+	if err != nil || !attempted {
+		t.Fatalf("stale retry detection = %t, %v", attempted, err)
+	}
+	receipt, err := client.Send(ctx, "thread-1", "message", "client-stale", "")
+	if err != nil || receipt.TurnID != "turn-accepted" || receipt.ClientUserMessageID != "client-stale" {
+		t.Fatalf("stale retry receipt = %#v, %v", receipt, err)
 	}
 }
 
@@ -1308,6 +1710,7 @@ func TestTranscriptEntriesExposeClientMessageIdentityAndPlanCompletion(t *testin
 		},
 	})
 	if len(entries) != 2 || entries[0].ClientUserMessageID != "client-1" ||
+		entries[0].ClientUserMessageDigest != queueTextDigest("hello") ||
 		entries[0].ItemID != "item-user" || entries[1].TurnStatus != "completed" ||
 		entries[1].ItemID != "item-plan" {
 		t.Fatalf("transcript entries = %#v", entries)
@@ -1519,6 +1922,14 @@ func TestQueueAttemptsSurviveClientRestart(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err := first.markSendSubmitting("thread-1", "message-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.markSendAccepted("thread-1", "message-1", SendReceipt{
+		TurnID: "turn-1", ClientUserMessageID: "message-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := first.recordRetirementAttempt("/workspace/work/example", "thread-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -1539,11 +1950,17 @@ func TestQueueAttemptsSurviveClientRestart(t *testing.T) {
 	if err != nil || !messageAttempted {
 		t.Fatalf("restored send attempt = %v, %v", messageAttempted, err)
 	}
+	restoredSend, found, err := second.sendAttempt(
+		"thread-1", "message-1", "sent text", "plan:digest",
+	)
+	if err != nil || !found || restoredSend.State != "accepted" || restoredSend.TurnID != "turn-1" {
+		t.Fatalf("restored accepted receipt = %#v, %t, %v", restoredSend, found, err)
+	}
 	retiringThread, err := second.retirementAttempt("/workspace/work/example")
 	if err != nil || retiringThread != "thread-1" {
 		t.Fatalf("restored retirement attempt = %q, %v", retiringThread, err)
 	}
-	info, err := os.Stat(socket + ".submission-attempts-v2.json")
+	info, err := os.Stat(socket + ".submission-attempts-v3.json")
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("queue ledger mode = %v, %v", info, err)
 	}
@@ -2212,6 +2629,50 @@ func TestRequireThreadIdleRejectsUnresolvedDurableSubmissionAttempts(t *testing.
 				t.Fatalf("idle check = %v, want %q", err, testCase.want)
 			}
 		})
+	}
+}
+
+func TestRequireThreadIdleAllowsAcceptedSendReceipts(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for _, method := range []string{"thread/read", "thread/turns/list", "thread/queue/list"} {
+			request, err := readObject(connection)
+			if err != nil || request["method"] != method {
+				return fmt.Errorf("expected %s: %v", method, err)
+			}
+			result := map[string]any{"data": []any{}, "nextCursor": nil}
+			if method == "thread/read" {
+				result = map[string]any{"thread": map[string]any{
+					"id": "thread-1", "cwd": "/workspace/work/example",
+				}}
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": result,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := New(socket)
+	defer client.Close()
+	if err := client.recordSendAttempt("thread-1", "client-1", "message", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendSubmitting("thread-1", "client-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendAccepted("thread-1", "client-1", SendReceipt{
+		TurnID: "turn-1", ClientUserMessageID: "client-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.RequireThreadIdle(ctx, "thread-1", "/workspace/work/example"); err != nil {
+		t.Fatalf("accepted receipt blocked idle thread: %v", err)
 	}
 }
 
