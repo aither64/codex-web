@@ -170,34 +170,6 @@ client_requests = [
         "thread/list",
         {
             "cwd": "/workspace/work/example",
-            "limit": 2,
-            "sortDirection": "asc",
-            "sourceKinds": ["vscode"],
-        },
-    ),
-    request(
-        "thread/list",
-        {
-            "cwd": "/workspace/work/fork",
-            "limit": 2,
-            "sortDirection": "asc",
-            "sourceKinds": ["vscode"],
-        },
-    ),
-    request(
-        "thread/list",
-        {
-            "cwd": "/workspace/work/example",
-            "limit": 2,
-            "sortDirection": "asc",
-            "sourceKinds": ["vscode"],
-            "archived": False,
-        },
-    ),
-    request(
-        "thread/list",
-        {
-            "cwd": "/workspace/work/example",
             "limit": 100,
             "sortDirection": "asc",
             "sourceKinds": ["vscode"],
@@ -206,8 +178,6 @@ client_requests = [
         },
     ),
     request("thread/name/set", {"threadId": "thread-1", "name": "example"}),
-    request("thread/read", {"threadId": "thread-1"}),
-    request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
@@ -260,7 +230,6 @@ client_requests = [
         "turn/steer",
         {"threadId": "thread-1", "expectedTurnId": "turn-1", "input": text_input},
     ),
-    request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
     request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
 ]
 client_source = CLIENT_SOURCE.read_text()

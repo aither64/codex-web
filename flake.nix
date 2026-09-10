@@ -1,5 +1,5 @@
 {
-  description = "Reusable Codex App Server web integration";
+  description = "Reusable Codex App Server client";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
@@ -13,19 +13,14 @@
         pname = "codex-web-checks";
         version = "0.0.0";
         src = ./.;
-        vendorHash = "sha256-05Qdy/y6o9aWMF7/1WcQwD4sTUhLeZXNVY4EJxUxgFk=";
+        vendorHash = "sha256-zJmXIHM4LoJSbfocHzcQwUZQ5NcPfaMFCE0UBolKmtc=";
         subPackages = [ "codex" ];
-        nativeCheckInputs = [
-          pkgs.nodejs
-          python
-        ];
+        nativeCheckInputs = [ python ];
         checkPhase = ''
           runHook preCheck
           ${python}/bin/python3 test/codex_protocol_contract.py \
             --coverage-only codex/client.go
           go test ./codex
-          ${pkgs.nodejs}/bin/node --check portal/internal/web/static/app.js
-          ${pkgs.nodejs}/bin/node portal/internal/web/browser_contract_test.cjs --unit
           runHook postCheck
         '';
         installPhase = ''

@@ -23,21 +23,10 @@ import (
 )
 
 const (
-	readLimit                       = 64 * 1024 * 1024
-	queueLedgerMaxSize              = 1024 * 1024
-	requestInputHiddenGrace         = 60 * time.Second
-	requestInputVisibleCountdown    = 60 * time.Second
-	recentTurnLimit                 = 20
-	DefaultNewThreadModel           = "gpt-6-astra"
-	DefaultNewThreadReasoningEffort = "xhigh"
+	readLimit          = 64 * 1024 * 1024
+	queueLedgerMaxSize = 1024 * 1024
+	recentTurnLimit    = 20
 )
-
-const sessionLifecycleDeveloperInstructions = "Completing work, preparing a handoff, or setting " +
-	"lifecycle state does not authorize archiving, deleting, stopping, finalizing, removing, " +
-	"invoking private lifecycle helpers, or scheduling delayed or background cleanup for this " +
-	"session. Perform a session lifecycle action only when the user explicitly requests that " +
-	"exact action for this exact session in the current conversation; otherwise leave the " +
-	"session open."
 
 type rpcMessage struct {
 	ID     json.RawMessage `json:"id,omitempty"`
@@ -161,10 +150,29 @@ type ThreadSettingsUpdate struct {
 	CollaborationMode *string `json:"collaborationMode,omitempty"`
 }
 
-type ThreadActivity struct {
-	ID        string
-	Cwd       string
-	UpdatedAt time.Time
+// ThreadMetadata is the App Server identity and persistence metadata used by
+// applications that own thread recovery and archival policy.
+type ThreadMetadata struct {
+	ID           string            `json:"id"`
+	Cwd          string            `json:"cwd"`
+	ForkedFromID string            `json:"forkedFromId"`
+	Source       any               `json:"source"`
+	UpdatedAt    int64             `json:"updatedAt"`
+	Path         *string           `json:"path"`
+	Preview      string            `json:"preview"`
+	Ephemeral    *bool             `json:"ephemeral"`
+	HistoryMode  string            `json:"historyMode"`
+	Status       map[string]any    `json:"status"`
+	Turns        *[]map[string]any `json:"turns"`
+}
+
+type ThreadListOptions struct {
+	Cwd           string
+	SourceKinds   []string
+	Archived      *bool
+	Limit         int
+	SortDirection string
+	Cursor        string
 }
 
 type CollaborationMode struct {
@@ -190,11 +198,11 @@ type threadItemEntry struct {
 }
 
 type queueAttemptLedger struct {
-	Schema      int                                        `json:"schema"`
-	Attempts    map[string]map[string]string               `json:"attempts"`
-	Sends       map[string]map[string]sendAttempt          `json:"sends,omitempty"`
-	Deletions   map[string]map[string]queueDeletionAttempt `json:"deletions,omitempty"`
-	Retirements map[string]string                          `json:"retirements,omitempty"`
+	Schema     int                                        `json:"schema"`
+	Attempts   map[string]map[string]string               `json:"attempts"`
+	Sends      map[string]map[string]sendAttempt          `json:"sends,omitempty"`
+	Deletions  map[string]map[string]queueDeletionAttempt `json:"deletions,omitempty"`
+	Operations map[string]string                          `json:"retirements,omitempty"`
 }
 
 type queueDeletionAttempt struct {
@@ -235,7 +243,12 @@ type Model struct {
 	SupportedReasoningEfforts []ReasoningEffortOption `json:"supportedReasoningEfforts"`
 }
 
-func ResolveNewThreadSettings(models []Model, requested ThreadSettings) (ThreadSettings, error) {
+func ResolveNewThreadSettings(
+	models []Model, requested ThreadSettings, defaults ThreadSettings,
+) (ThreadSettings, error) {
+	if defaults.Model == "" || defaults.ReasoningEffort == "" {
+		return ThreadSettings{}, errors.New("default Codex model and reasoning effort are required")
+	}
 	var selected *Model
 	for index := range models {
 		candidate := &models[index]
@@ -244,10 +257,10 @@ func ResolveNewThreadSettings(models []Model, requested ThreadSettings) (ThreadS
 				selected = candidate
 				break
 			}
-		} else if candidate.Model == DefaultNewThreadModel {
+		} else if candidate.Model == defaults.Model {
 			if selected != nil {
 				return ThreadSettings{}, fmt.Errorf(
-					"Codex model catalog has more than one %q model", DefaultNewThreadModel,
+					"Codex model catalog has more than one %q model", defaults.Model,
 				)
 			}
 			selected = candidate
@@ -256,7 +269,7 @@ func ResolveNewThreadSettings(models []Model, requested ThreadSettings) (ThreadS
 	if selected == nil {
 		if requested.Model == "" {
 			return ThreadSettings{}, fmt.Errorf(
-				"required default Codex model %q is not available", DefaultNewThreadModel,
+				"required default Codex model %q is not available", defaults.Model,
 			)
 		}
 		return ThreadSettings{}, fmt.Errorf("Codex model %q is not available", requested.Model)
@@ -269,8 +282,8 @@ func ResolveNewThreadSettings(models []Model, requested ThreadSettings) (ThreadS
 		)
 	}
 	effort := requested.ReasoningEffort
-	if effort == "" && supports(DefaultNewThreadReasoningEffort) {
-		effort = DefaultNewThreadReasoningEffort
+	if effort == "" && supports(defaults.ReasoningEffort) {
+		effort = defaults.ReasoningEffort
 	}
 	if effort == "" && requested.Model != "" && supports(selected.DefaultReasoningEffort) {
 		effort = selected.DefaultReasoningEffort
@@ -278,7 +291,7 @@ func ResolveNewThreadSettings(models []Model, requested ThreadSettings) (ThreadS
 	if effort == "" {
 		return ThreadSettings{}, fmt.Errorf(
 			"Codex model %s does not support the required default reasoning effort %q",
-			selected.DisplayName, DefaultNewThreadReasoningEffort,
+			selected.DisplayName, defaults.ReasoningEffort,
 		)
 	}
 	if !supports(effort) {
@@ -336,7 +349,8 @@ func ResolveForkThreadSettings(
 }
 
 type Client struct {
-	socket string
+	socket  string
+	options ClientOptions
 
 	ensureMu     sync.Mutex
 	connectionMu sync.Mutex
@@ -365,7 +379,7 @@ type Client struct {
 	queueAttempts    map[string]map[string]string
 	sendAttempts     map[string]map[string]sendAttempt
 	queueDeletions   map[string]map[string]queueDeletionAttempt
-	retirements      map[string]string
+	operations       map[string]string
 	queueLedgerPath  string
 	queueLedgerReady bool
 	queueLedgerErr   error
@@ -374,6 +388,28 @@ type Client struct {
 	watched           map[string]int
 	watchedGeneration map[string]uint64
 	watchLocks        map[string]*sync.Mutex
+}
+
+type ClientInfo struct {
+	Name    string `json:"name"`
+	Title   string `json:"title,omitempty"`
+	Version string `json:"version"`
+}
+
+type ClientOptions struct {
+	ClientInfo            ClientInfo
+	DeveloperInstructions string
+	RuntimeWorkspaceRoots []string
+	ThreadSourceKinds     []string
+	NonBlockingUserInput  *NonBlockingUserInputPolicy
+}
+
+// NonBlockingUserInputPolicy opts a client into automatically answering
+// nonblocking user-input requests after an application-defined grace period.
+// A nil policy leaves every request pending until the application responds.
+type NonBlockingUserInputPolicy struct {
+	HiddenGrace      time.Duration
+	VisibleCountdown time.Duration
 }
 
 func DefaultSocket() string {
@@ -385,11 +421,34 @@ func DefaultSocket() string {
 }
 
 func New(socket string) *Client {
+	return NewWithOptions(socket, ClientOptions{})
+}
+
+func NewWithOptions(socket string, options ClientOptions) *Client {
 	if socket == "" {
 		socket = DefaultSocket()
 	}
+	if options.ClientInfo.Name == "" {
+		options.ClientInfo.Name = "codex-web"
+	}
+	if options.ClientInfo.Title == "" {
+		options.ClientInfo.Title = "Codex Web"
+	}
+	if options.ClientInfo.Version == "" {
+		options.ClientInfo.Version = "0.1.0"
+	}
+	options.RuntimeWorkspaceRoots = append([]string(nil), options.RuntimeWorkspaceRoots...)
+	options.ThreadSourceKinds = append([]string(nil), options.ThreadSourceKinds...)
+	if options.NonBlockingUserInput != nil {
+		if options.NonBlockingUserInput.HiddenGrace < 0 ||
+			options.NonBlockingUserInput.VisibleCountdown < 0 {
+			panic("codex: nonblocking user-input durations cannot be negative")
+		}
+		policy := *options.NonBlockingUserInput
+		options.NonBlockingUserInput = &policy
+	}
 	return &Client{
-		socket: socket, pending: make(map[uint64]pendingCall),
+		socket: socket, options: options, pending: make(map[uint64]pendingCall),
 		requests: make(map[string]PendingRequest), notices: make(map[string][]Prompt),
 		subscribers: make(map[chan struct{}]string), watched: make(map[string]int),
 		watchedGeneration: make(map[string]uint64), watchLocks: make(map[string]*sync.Mutex),
@@ -398,7 +457,7 @@ func New(socket string) *Client {
 		queueUpdates:    make(map[string]*sync.Mutex), queueAttempts: make(map[string]map[string]string),
 		sendAttempts:    make(map[string]map[string]sendAttempt),
 		queueDeletions:  make(map[string]map[string]queueDeletionAttempt),
-		retirements:     make(map[string]string),
+		operations:      make(map[string]string),
 		queueLedgerPath: socket + ".submission-attempts-v3.json",
 	}
 }
@@ -436,11 +495,7 @@ func (c *Client) Ensure(ctx context.Context) error {
 	defer cancel()
 	if err := c.requestOn(initializeCtx, connection, generation, "initialize", map[string]any{
 		"capabilities": map[string]any{"experimentalApi": true},
-		"clientInfo": map[string]any{
-			"name":    "vpsfree-workspace-portal",
-			"title":   "vpsFree.cz Workspace Portal",
-			"version": "0.1.0",
-		},
+		"clientInfo":   c.options.ClientInfo,
 	}, nil); err != nil {
 		connection.CloseNow()
 		c.markDisconnected(connection, generation, err)
@@ -568,7 +623,7 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 				ID: key, Method: message.Method, Params: message.Params,
 				generation: generation, connection: connection, receivedAt: time.Now(),
 			}
-			prompt, promptErr := normalizePrompt(request)
+			prompt, promptErr := c.normalizePrompt(request)
 			if promptErr != nil {
 				c.rejectUnsupported(request, promptErr)
 				continue
@@ -576,10 +631,11 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 			c.pendingMu.Lock()
 			c.requests[key] = request
 			c.pendingMu.Unlock()
-			if prompt.Kind == "userInput" && !prompt.IsBlocking {
+			if prompt.Kind == "userInput" && !prompt.IsBlocking &&
+				c.options.NonBlockingUserInput != nil {
+				policy := c.options.NonBlockingUserInput
 				go c.autoResolveUserInput(
-					request.ID, prompt.ThreadID,
-					requestInputHiddenGrace+requestInputVisibleCountdown,
+					request.ID, prompt.ThreadID, policy.HiddenGrace+policy.VisibleCountdown,
 				)
 			}
 			c.broadcast(prompt.ThreadID)
@@ -639,7 +695,7 @@ func (c *Client) claimAutoResolvableUserInput(id, threadID string) (PendingReque
 	if !ok || request.claimed || request.snoozed {
 		return PendingRequest{}, false
 	}
-	prompt, err := normalizePrompt(request)
+	prompt, err := c.normalizePrompt(request)
 	if err != nil || prompt.Kind != "userInput" || prompt.ThreadID != threadID || prompt.IsBlocking {
 		return PendingRequest{}, false
 	}
@@ -655,7 +711,7 @@ func (c *Client) SnoozeUserInput(id, threadID string) error {
 	if !ok || request.claimed {
 		return errors.New("pending request not found")
 	}
-	prompt, err := normalizePrompt(request)
+	prompt, err := c.normalizePrompt(request)
 	if err != nil {
 		return err
 	}
@@ -741,7 +797,7 @@ func (c *Client) rejectUnsupported(request PendingRequest, cause error) {
 			"id": rawID,
 			"error": map[string]any{
 				"code":    -32601,
-				"message": "workspace portal does not support this App Server request",
+				"message": "Codex web client does not support this App Server request",
 			},
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -885,7 +941,7 @@ func (c *Client) resumeWatched(ctx context.Context, threadID string) error {
 	}
 	c.watchedMu.Unlock()
 	var result map[string]any
-	if err := c.requestConnected(ctx, "thread/resume", threadResumeParams(threadID), &result); err != nil {
+	if err := c.requestConnected(ctx, "thread/resume", c.threadResumeParams(threadID), &result); err != nil {
 		return err
 	}
 	c.watchedMu.Lock()
@@ -983,7 +1039,7 @@ func (c *Client) Prompts(threadID string) []Prompt {
 		if request.claimed {
 			continue
 		}
-		prompt, err := normalizePrompt(request)
+		prompt, err := c.normalizePrompt(request)
 		if err == nil && prompt.ThreadID == threadID {
 			result = append(result, prompt)
 		}
@@ -1120,7 +1176,7 @@ func (c *Client) claim(id, threadID string) (PendingRequest, Prompt, error) {
 	if !ok || request.claimed {
 		return PendingRequest{}, Prompt{}, errors.New("pending request not found")
 	}
-	prompt, err := normalizePrompt(request)
+	prompt, err := c.normalizePrompt(request)
 	if err != nil {
 		return PendingRequest{}, Prompt{}, err
 	}
@@ -1213,15 +1269,6 @@ func normalizePrompt(request PendingRequest) (Prompt, error) {
 			value := uint64(milliseconds)
 			prompt.AutoResolutionMS = &value
 		}
-		if !prompt.IsBlocking && !request.receivedAt.IsZero() {
-			visibleAt := request.receivedAt.Add(requestInputHiddenGrace)
-			deadline := request.receivedAt.Add(
-				requestInputHiddenGrace + requestInputVisibleCountdown,
-			)
-			prompt.AutoResolutionVisibleAtMS = visibleAt.UnixMilli()
-			prompt.AutoResolutionAtMS = deadline.UnixMilli()
-			prompt.AutoResolveSnoozed = request.snoozed
-		}
 		questions, err := normalizeQuestions(params["questions"])
 		if err != nil {
 			return Prompt{}, err
@@ -1233,6 +1280,21 @@ func normalizePrompt(request PendingRequest) (Prompt, error) {
 	if prompt.ThreadID == "" {
 		return Prompt{}, errors.New("request has no thread id")
 	}
+	return prompt, nil
+}
+
+func (c *Client) normalizePrompt(request PendingRequest) (Prompt, error) {
+	prompt, err := normalizePrompt(request)
+	policy := c.options.NonBlockingUserInput
+	if err != nil || policy == nil || prompt.Kind != "userInput" || prompt.IsBlocking ||
+		request.receivedAt.IsZero() {
+		return prompt, err
+	}
+	visibleAt := request.receivedAt.Add(policy.HiddenGrace)
+	deadline := visibleAt.Add(policy.VisibleCountdown)
+	prompt.AutoResolutionVisibleAtMS = visibleAt.UnixMilli()
+	prompt.AutoResolutionAtMS = deadline.UnixMilli()
+	prompt.AutoResolveSnoozed = request.snoozed
 	return prompt, nil
 }
 
@@ -1420,7 +1482,7 @@ func (c *Client) loadQueueLedgerLocked() error {
 		c.queueAttempts = make(map[string]map[string]string)
 		c.sendAttempts = make(map[string]map[string]sendAttempt)
 		c.queueDeletions = make(map[string]map[string]queueDeletionAttempt)
-		c.retirements = make(map[string]string)
+		c.operations = make(map[string]string)
 		return nil
 	}
 	if err != nil {
@@ -1460,8 +1522,8 @@ func (c *Client) loadQueueLedgerLocked() error {
 	if ledger.Sends == nil {
 		ledger.Sends = make(map[string]map[string]sendAttempt)
 	}
-	if ledger.Retirements == nil {
-		ledger.Retirements = make(map[string]string)
+	if ledger.Operations == nil {
+		ledger.Operations = make(map[string]string)
 	}
 	if ledger.Deletions == nil {
 		ledger.Deletions = make(map[string]map[string]queueDeletionAttempt)
@@ -1504,16 +1566,16 @@ func (c *Client) loadQueueLedgerLocked() error {
 			}
 		}
 	}
-	for cwd, threadID := range ledger.Retirements {
-		if !filepath.IsAbs(cwd) || threadID == "" {
-			c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid retirement")
+	for key, value := range ledger.Operations {
+		if !filepath.IsAbs(key) || value == "" {
+			c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid operation marker")
 			return c.queueLedgerErr
 		}
 	}
 	c.queueAttempts = ledger.Attempts
 	c.sendAttempts = ledger.Sends
 	c.queueDeletions = ledger.Deletions
-	c.retirements = ledger.Retirements
+	c.operations = ledger.Operations
 	return nil
 }
 
@@ -1532,7 +1594,7 @@ func (c *Client) writeQueueLedgerLocked() error {
 	directory := filepath.Dir(c.queueLedgerPath)
 	encoded, err := json.Marshal(queueAttemptLedger{
 		Schema: 3, Attempts: c.queueAttempts, Sends: c.sendAttempts,
-		Deletions: c.queueDeletions, Retirements: c.retirements,
+		Deletions: c.queueDeletions, Operations: c.operations,
 	})
 	if err != nil {
 		return fmt.Errorf("encode queue attempt ledger: %w", err)
@@ -1949,7 +2011,7 @@ func (c *Client) clearQueueDeletionAndAttempt(
 	return nil
 }
 
-func (c *Client) requireSubmissionAttemptsResolved(ctx context.Context, threadID string) error {
+func (c *Client) RequireSubmissionAttemptsResolved(ctx context.Context, threadID string) error {
 	c.queueMu.Lock()
 	if err := c.loadQueueLedgerLocked(); err != nil {
 		c.queueMu.Unlock()
@@ -2028,36 +2090,58 @@ func (c *Client) requireSubmissionAttemptsResolved(ctx context.Context, threadID
 	return nil
 }
 
-func (c *Client) retirementAttempt(cwd string) (string, error) {
+// ThreadOperationAttempt returns the thread bound to a durable operation for
+// directory. Directory is the canonical absolute working directory used as
+// the operation identity.
+func (c *Client) ThreadOperationAttempt(directory string) (string, error) {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		return "", errors.New("thread operation directory must be canonical and absolute")
+	}
 	c.queueMu.Lock()
 	defer c.queueMu.Unlock()
 	if err := c.loadQueueLedgerLocked(); err != nil {
 		return "", err
 	}
-	return c.retirements[cwd], nil
+	return c.operations[directory], nil
 }
 
-func (c *Client) recordRetirementAttempt(cwd, threadID string) error {
+// RecordThreadOperationAttempt durably binds an operation for directory to one
+// thread. Repeating the same binding is safe; rebinding fails closed.
+func (c *Client) RecordThreadOperationAttempt(directory, threadID string) error {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		return errors.New("thread operation directory must be canonical and absolute")
+	}
+	if strings.TrimSpace(threadID) == "" {
+		return errors.New("thread operation requires a thread id")
+	}
 	c.queueMu.Lock()
 	defer c.queueMu.Unlock()
 	if err := c.loadQueueLedgerLocked(); err != nil {
 		return err
 	}
-	if existing := c.retirements[cwd]; existing != "" {
+	if existing := c.operations[directory]; existing != "" {
 		if existing != threadID {
-			return errors.New("retirement directory is already bound to another Codex thread")
+			return errors.New("thread operation directory is already bound to another thread")
 		}
 		return nil
 	}
-	c.retirements[cwd] = threadID
+	c.operations[directory] = threadID
 	if err := c.writeQueueLedgerLocked(); err != nil {
-		delete(c.retirements, cwd)
+		delete(c.operations, directory)
 		return err
 	}
 	return nil
 }
 
-func (c *Client) clearThreadAttempts(threadID, cwd string) error {
+// ClearConversationAttempts clears all durable submission and operation state
+// for threadID after the caller has proved that the conversation is retired.
+func (c *Client) ClearConversationAttempts(threadID, directory string) error {
+	if strings.TrimSpace(threadID) == "" {
+		return errors.New("conversation attempt cleanup requires a thread id")
+	}
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		return errors.New("conversation attempt cleanup directory must be canonical and absolute")
+	}
 	c.queueMu.Lock()
 	defer c.queueMu.Unlock()
 	if err := c.loadQueueLedgerLocked(); err != nil {
@@ -2066,17 +2150,17 @@ func (c *Client) clearThreadAttempts(threadID, cwd string) error {
 	queueAttempts, queued := c.queueAttempts[threadID]
 	sendAttempts, sent := c.sendAttempts[threadID]
 	queueDeletions, deleting := c.queueDeletions[threadID]
-	retirementThreadID, retiring := c.retirements[cwd]
-	if retiring && retirementThreadID != threadID {
-		return errors.New("retirement directory is bound to another Codex thread")
+	operationValue, operationPending := c.operations[directory]
+	if operationPending && operationValue != threadID {
+		return errors.New("operation key is bound to another conversation")
 	}
-	if !queued && !sent && !deleting && !retiring {
+	if !queued && !sent && !deleting && !operationPending {
 		return nil
 	}
 	delete(c.queueAttempts, threadID)
 	delete(c.sendAttempts, threadID)
 	delete(c.queueDeletions, threadID)
-	delete(c.retirements, cwd)
+	delete(c.operations, directory)
 	if err := c.writeQueueLedgerLocked(); err != nil {
 		if queued {
 			c.queueAttempts[threadID] = queueAttempts
@@ -2087,8 +2171,8 @@ func (c *Client) clearThreadAttempts(threadID, cwd string) error {
 		if deleting {
 			c.queueDeletions[threadID] = queueDeletions
 		}
-		if retiring {
-			c.retirements[cwd] = retirementThreadID
+		if operationPending {
+			c.operations[directory] = operationValue
 		}
 		return err
 	}
@@ -2100,14 +2184,33 @@ func stringValue(value any) string {
 	return result
 }
 
-func settingsParams(settings ThreadSettings, params map[string]any, config map[string]any) {
-	params["developerInstructions"] = sessionLifecycleDeveloperInstructions
+func (c *Client) settingsParams(settings ThreadSettings, params map[string]any, config map[string]any) {
+	if c.options.DeveloperInstructions != "" {
+		params["developerInstructions"] = c.options.DeveloperInstructions
+	}
 	if settings.Model != "" {
 		params["model"] = settings.Model
 	}
 	if settings.ReasoningEffort != "" {
 		config["model_reasoning_effort"] = settings.ReasoningEffort
 	}
+}
+
+func (c *Client) addRuntimeWorkspaceRoots(params map[string]any) error {
+	if len(c.options.RuntimeWorkspaceRoots) == 0 {
+		return nil
+	}
+	roots := make([]string, 0, len(c.options.RuntimeWorkspaceRoots))
+	for _, root := range c.options.RuntimeWorkspaceRoots {
+		if !filepath.IsAbs(root) || filepath.Clean(root) != root {
+			return fmt.Errorf("runtime workspace root is not canonical: %q", root)
+		}
+		if !slices.Contains(roots, root) {
+			roots = append(roots, root)
+		}
+	}
+	params["runtimeWorkspaceRoots"] = roots
+	return nil
 }
 
 func (c *Client) StartThread(ctx context.Context, cwd string, environment map[string]string) (string, error) {
@@ -2127,11 +2230,13 @@ func (c *Client) StartThreadWithSettings(
 		"shell_environment_policy": map[string]any{"set": environment},
 	}
 	params := map[string]any{
-		"cwd":                   cwd,
-		"runtimeWorkspaceRoots": []string{environment["VPSFREE_DEV_SESSION_WORKSPACE"]},
-		"config":                config,
+		"cwd":    cwd,
+		"config": config,
 	}
-	settingsParams(settings, params, config)
+	if err := c.addRuntimeWorkspaceRoots(params); err != nil {
+		return "", err
+	}
+	c.settingsParams(settings, params, config)
 	if err := c.Request(ctx, "thread/start", params, &response); err != nil {
 		return "", err
 	}
@@ -2148,7 +2253,7 @@ func (c *Client) ResumeThread(ctx context.Context, threadID, cwd string, environ
 // ReconcileThreadInstructions refreshes the package-owned thread instruction
 // without interrupting or changing an active turn.
 func (c *Client) ReconcileThreadInstructions(ctx context.Context, threadID string) error {
-	if err := c.requireThreadTurnsIdle(ctx, threadID); err != nil {
+	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
 		return err
 	}
 	return c.resumeThread(ctx, threadID)
@@ -2166,10 +2271,10 @@ func (c *Client) ResumeThreadWithSettings(
 	config := map[string]any{
 		"shell_environment_policy": map[string]any{"set": environment},
 	}
-	params := threadResumeParams(threadID)
+	params := c.threadResumeParams(threadID)
 	params["cwd"] = cwd
 	params["config"] = config
-	settingsParams(settings, params, config)
+	c.settingsParams(settings, params, config)
 	if err := c.Request(ctx, "thread/resume", params, &response); err != nil {
 		return "", err
 	}
@@ -2192,7 +2297,7 @@ func (c *Client) OpenThreadWithSettings(
 	return c.StartThreadWithSettings(ctx, cwd, environment, settings)
 }
 
-func (c *Client) loadedThreadIDs(ctx context.Context) ([]string, error) {
+func (c *Client) LoadedThreadIDs(ctx context.Context) ([]string, error) {
 	ids := make([]string, 0)
 	seenCursors := make(map[string]struct{})
 	var cursor string
@@ -2231,103 +2336,75 @@ func (c *Client) loadedThreadIDs(ctx context.Context) ([]string, error) {
 	}
 }
 
-func (c *Client) RecoverCreatingThread(ctx context.Context, threadID, cwd string, environment map[string]string) (string, error) {
-	return c.RecoverCreatingThreadWithSettings(ctx, threadID, cwd, environment, ThreadSettings{})
-}
-
-func (c *Client) RecoverCreatingThreadWithSettings(
-	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
-) (string, error) {
-	return c.RecoverCreatingThreadWithSettingsResolver(
-		ctx, threadID, cwd, environment,
-		func() (ThreadSettings, error) { return settings, nil },
-	)
-}
-
-// RecoverCreatingThreadWithSettingsResolver inspects persisted candidates
-// before resolving settings. Existing threads already own their creation
-// settings, so catalog changes matter only when a replacement must be created.
-func (c *Client) RecoverCreatingThreadWithSettingsResolver(
-	ctx context.Context,
-	threadID, cwd string,
-	environment map[string]string,
-	resolveSettings func() (ThreadSettings, error),
-) (string, error) {
-	candidates := make(map[string]struct{})
-	loaded, err := c.loadedThreadIDs(ctx)
-	if err != nil {
-		return "", err
+func (c *Client) ReadThreadMetadata(
+	ctx context.Context, threadID string, excludeTurns bool,
+) (ThreadMetadata, error) {
+	var response struct {
+		Thread ThreadMetadata `json:"thread"`
 	}
-	for _, loadedID := range loaded {
-		var metadata struct {
-			Thread struct {
-				ID     string `json:"id"`
-				Cwd    string `json:"cwd"`
-				Source any    `json:"source"`
-			} `json:"thread"`
-		}
-		if err := c.Request(ctx, "thread/read", map[string]any{"threadId": loadedID}, &metadata); err != nil {
-			current, listErr := c.loadedThreadIDs(ctx)
-			if listErr == nil && !slices.Contains(current, loadedID) {
-				continue
-			}
-			return "", err
-		}
-		if metadata.Thread.ID != loadedID {
-			return "", errors.New("thread/read returned the wrong loaded thread")
-		}
-		if loadedID == threadID &&
-			(metadata.Thread.Cwd != cwd || !portalThreadSource(metadata.Thread.Source)) {
-			return "", errors.New("recorded creation thread has the wrong identity")
-		}
-		if metadata.Thread.Cwd == cwd && portalThreadSource(metadata.Thread.Source) {
-			candidates[loadedID] = struct{}{}
-		}
+	params := map[string]any{"threadId": threadID}
+	if excludeTurns {
+		params["excludeTurns"] = true
+	}
+	if err := c.Request(ctx, "thread/read", params, &response); err != nil {
+		return ThreadMetadata{}, err
+	}
+	if response.Thread.ID != threadID {
+		return ThreadMetadata{}, errors.New("thread/read returned the wrong thread")
+	}
+	return response.Thread, nil
+}
+
+func (c *Client) ListThreads(
+	ctx context.Context, options ThreadListOptions,
+) ([]ThreadMetadata, *string, error) {
+	params := map[string]any{}
+	if options.Cwd != "" {
+		params["cwd"] = options.Cwd
+	}
+	if len(options.SourceKinds) > 0 {
+		params["sourceKinds"] = append([]string(nil), options.SourceKinds...)
+	}
+	if options.Archived != nil {
+		params["archived"] = *options.Archived
+	}
+	if options.Limit > 0 {
+		params["limit"] = options.Limit
+	}
+	if options.SortDirection != "" {
+		params["sortDirection"] = options.SortDirection
+	}
+	if options.Cursor != "" {
+		params["cursor"] = options.Cursor
 	}
 	var page struct {
-		Data *[]struct {
-			ID  string `json:"id"`
-			Cwd string `json:"cwd"`
-		} `json:"data"`
+		Data       *[]ThreadMetadata `json:"data"`
+		NextCursor *string           `json:"nextCursor"`
 	}
-	if err := c.Request(ctx, "thread/list", map[string]any{
-		"cwd": cwd, "limit": 2, "sortDirection": "asc", "sourceKinds": []string{"vscode"},
-	}, &page); err != nil {
-		return "", err
+	if err := c.Request(ctx, "thread/list", params, &page); err != nil {
+		return nil, nil, err
 	}
 	if page.Data == nil {
-		return "", errors.New("thread/list returned no data")
+		return nil, nil, errors.New("thread/list returned no data")
 	}
-	for _, candidate := range *page.Data {
-		if candidate.ID == "" || candidate.Cwd != cwd {
-			return "", errors.New("thread/list returned an invalid creation candidate")
-		}
-		candidates[candidate.ID] = struct{}{}
+	return *page.Data, page.NextCursor, nil
+}
+
+func (c *Client) UnarchiveThread(ctx context.Context, threadID string) (ThreadMetadata, error) {
+	var response struct {
+		Thread ThreadMetadata `json:"thread"`
 	}
-	if len(candidates) > 1 {
-		return "", fmt.Errorf("multiple Codex threads use creation directory %s; refusing ambiguous recovery", cwd)
+	if err := c.Request(ctx, "thread/unarchive", map[string]any{"threadId": threadID}, &response); err != nil {
+		return ThreadMetadata{}, err
 	}
-	for candidateID := range candidates {
-		materialized, err := c.threadHistoryMaterialized(ctx, candidateID, cwd)
-		if err != nil {
-			return "", err
-		}
-		if candidateID != threadID && materialized {
-			return "", errors.New("refusing a different materialized Codex thread as a creation replacement")
-		}
-		if !materialized {
-			return candidateID, nil
-		}
-		// The materialized thread already owns the settings chosen when creation
-		// began. Recovery refreshes only runtime configuration; applying today's
-		// defaults here would silently change a session across a deployment.
-		return c.ResumeThread(ctx, candidateID, cwd, environment)
+	if response.Thread.ID != threadID {
+		return ThreadMetadata{}, errors.New("thread/unarchive returned the wrong thread")
 	}
-	settings, err := resolveSettings()
-	if err != nil {
-		return "", err
-	}
-	return c.StartThreadWithSettings(ctx, cwd, environment, settings)
+	return response.Thread, nil
+}
+
+func (c *Client) ArchiveThread(ctx context.Context, threadID string) error {
+	return c.Request(ctx, "thread/archive", map[string]any{"threadId": threadID}, nil)
 }
 
 func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
@@ -2380,8 +2457,7 @@ func (c *Client) ListCollaborationModes(ctx context.Context) ([]CollaborationMod
 	modes := make([]CollaborationMode, 0, len(*response.Data))
 	seen := make(map[string]struct{})
 	for _, entry := range *response.Data {
-		if entry.Mode == nil || entry.Name == "" ||
-			!slices.Contains([]string{"default", "plan"}, *entry.Mode) {
+		if entry.Mode == nil || *entry.Mode == "" || entry.Name == "" {
 			continue
 		}
 		if _, exists := seen[*entry.Mode]; exists {
@@ -2465,6 +2541,14 @@ func (c *Client) readThreadSettingsMetadata(
 		ReasoningEffort: stringValue(metadata.Thread["reasoningEffort"]),
 	}}, nil
 
+}
+
+func (c *Client) ReadThreadSettings(ctx context.Context, threadID string) (ThreadSettings, error) {
+	metadata, err := c.readThreadSettingsMetadata(ctx, threadID)
+	if err != nil {
+		return ThreadSettings{}, err
+	}
+	return metadata.settings, nil
 }
 
 func (c *Client) refreshThreadSettings(ctx context.Context, threadID string) (cachedThreadSettings, error) {
@@ -2673,17 +2757,19 @@ func (c *Client) UpdateThreadSettings(
 func (c *Client) ForkThread(
 	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
 ) (string, error) {
-	if err := c.requireThreadTurnsIdle(ctx, threadID); err != nil {
+	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
 		return "", err
 	}
 	config := map[string]any{"shell_environment_policy": map[string]any{"set": environment}}
 	params := map[string]any{
 		"threadId": threadID, "cwd": cwd, "excludeTurns": true,
 		"deferGoalContinuation": true,
-		"runtimeWorkspaceRoots": []string{environment["VPSFREE_DEV_SESSION_WORKSPACE"]},
 		"config":                config,
 	}
-	settingsParams(settings, params, config)
+	if err := c.addRuntimeWorkspaceRoots(params); err != nil {
+		return "", err
+	}
+	c.settingsParams(settings, params, config)
 	var response struct {
 		Thread struct {
 			ID           string `json:"id"`
@@ -2701,312 +2787,8 @@ func (c *Client) ForkThread(
 	return response.Thread.ID, nil
 }
 
-func (c *Client) RecoverForkThread(
-	ctx context.Context, sourceThreadID, cwd string, environment map[string]string, settings ThreadSettings,
-) (string, error) {
-	var page struct {
-		Data *[]struct {
-			ID           string `json:"id"`
-			Cwd          string `json:"cwd"`
-			ForkedFromID string `json:"forkedFromId"`
-		} `json:"data"`
-		NextCursor *string `json:"nextCursor"`
-	}
-	if err := c.Request(ctx, "thread/list", map[string]any{
-		"cwd": cwd, "limit": 2, "sortDirection": "asc", "sourceKinds": []string{"vscode"},
-	}, &page); err != nil {
-		return "", err
-	}
-	if page.Data == nil {
-		return "", errors.New("thread/list returned no data")
-	}
-	if len(*page.Data) > 1 || page.NextCursor != nil {
-		return "", fmt.Errorf("multiple Codex threads use fork directory %s; refusing ambiguous recovery", cwd)
-	}
-	if len(*page.Data) == 0 {
-		return c.ForkThread(ctx, sourceThreadID, cwd, environment, settings)
-	}
-	candidate := (*page.Data)[0]
-	if candidate.ID == "" || candidate.Cwd != cwd || candidate.ForkedFromID != sourceThreadID {
-		return "", errors.New("existing Codex thread does not match the requested conversation fork")
-	}
-	if err := c.requireThreadTurnsIdle(ctx, candidate.ID); err != nil {
-		return "", err
-	}
-	return c.ResumeThreadWithSettings(ctx, candidate.ID, cwd, environment, settings)
-}
-
-func (c *Client) ResolveForkSettings(
-	ctx context.Context, sourceThreadID string, requested ThreadSettings,
-) (ThreadSettings, error) {
-	if sourceThreadID == "" {
-		return ThreadSettings{}, errors.New("fork settings require a source thread")
-	}
-	source, err := c.readThreadSettingsMetadata(ctx, sourceThreadID)
-	if err != nil {
-		return ThreadSettings{}, fmt.Errorf("read source Codex settings: %w", err)
-	}
-	models, err := c.ListModels(ctx)
-	if err != nil {
-		return ThreadSettings{}, fmt.Errorf("load Codex models: %w", err)
-	}
-	return ResolveForkThreadSettings(models, source.settings, requested)
-}
-
-// RecoverArchivedThread restores one exact portal conversation after its
-// initiative tracking has been revived. It accepts a retry after Codex has
-// already completed the unarchive operation, but never substitutes another
-// conversation that happens to use the same working directory.
-func (c *Client) RecoverArchivedThread(
-	ctx context.Context, threadID, cwd string, environment map[string]string,
-) (string, error) {
-	if threadID == "" || cwd == "" {
-		return "", errors.New("archived thread recovery requires a thread id and working directory")
-	}
-	active, activeFound, err := c.retirementCandidate(ctx, cwd, false)
-	if err != nil {
-		return "", err
-	}
-	_, archivedFound, err := c.retirementThreadByID(ctx, threadID, cwd, true)
-	if err != nil {
-		return "", err
-	}
-	if activeFound && active.ID != threadID {
-		return "", errors.New("another active Codex thread uses the revived session directory")
-	}
-	if activeFound && archivedFound {
-		return "", errors.New("the revived Codex thread exists in both active and archived history")
-	}
-	if activeFound {
-		return c.ResumeThread(ctx, threadID, cwd, environment)
-	}
-	if !archivedFound {
-		return "", errors.New("the revived Codex thread is neither active nor archived")
-	}
-
-	var response struct {
-		Thread retirementThread `json:"thread"`
-	}
-	if err := c.Request(ctx, "thread/unarchive", map[string]any{"threadId": threadID}, &response); err != nil {
-		return "", err
-	}
-	if response.Thread.ID != threadID || response.Thread.Cwd != cwd ||
-		!portalThreadSource(response.Thread.Source) {
-		return "", errors.New("thread/unarchive returned the wrong Codex thread identity")
-	}
-	return c.ResumeThread(ctx, threadID, cwd, environment)
-}
-
 func (c *Client) SetName(ctx context.Context, threadID, name string) error {
 	return c.Request(ctx, "thread/name/set", map[string]any{"threadId": threadID, "name": name}, nil)
-}
-
-func (c *Client) RetireThread(ctx context.Context, threadID, cwd string, force bool) error {
-	var candidate retirementThread
-	var found bool
-	var err error
-	if threadID == "" {
-		threadID, err = c.retirementAttempt(cwd)
-		if err != nil {
-			return err
-		}
-		if threadID == "" {
-			candidate, found, err = c.retirementCandidate(ctx, cwd, false)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return nil
-			}
-			threadID = candidate.ID
-			if err := c.recordRetirementAttempt(cwd, threadID); err != nil {
-				return fmt.Errorf("record Codex thread retirement before archival: %w", err)
-			}
-		}
-	}
-	candidate, found, err = c.retirementCandidate(ctx, cwd, false)
-	if err != nil {
-		return err
-	}
-	if found && candidate.ID != threadID {
-		return errors.New("another Codex thread uses the portal session directory")
-	}
-	if !found {
-		_, archivedFound, err := c.retirementThreadByID(ctx, threadID, cwd, true)
-		if err != nil {
-			return err
-		}
-		if archivedFound {
-			return c.clearThreadAttempts(threadID, cwd)
-		}
-		return errors.New("the expected Codex thread is neither active nor archived")
-	}
-
-	var metadata struct {
-		Thread map[string]any `json:"thread"`
-	}
-	if err := c.Request(ctx, "thread/read", map[string]any{
-		"threadId": threadID, "excludeTurns": true,
-	}, &metadata); err != nil {
-		return err
-	}
-	if stringValue(metadata.Thread["id"]) != threadID ||
-		stringValue(metadata.Thread["cwd"]) != cwd ||
-		!portalThreadSource(metadata.Thread["source"]) {
-		return errors.New("Codex thread does not match the portal session being removed")
-	}
-	freshWithoutRollout := false
-	if force {
-		turnID, err := c.activeTurnID(ctx, threadID)
-		if err != nil {
-			if freshThreadMissingSourceRollout(metadata.Thread, threadID, err) {
-				freshWithoutRollout = true
-			} else {
-				return err
-			}
-		}
-		if turnID != "" {
-			if err := c.Request(ctx, "turn/interrupt", map[string]any{
-				"threadId": threadID, "turnId": turnID,
-			}, nil); err != nil {
-				return err
-			}
-		}
-	}
-	for !freshWithoutRollout {
-		err := c.requireThreadTurnsIdle(ctx, threadID)
-		if err == nil {
-			break
-		}
-		if freshThreadMissingSourceRollout(metadata.Thread, threadID, err) {
-			break
-		}
-		if !force {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for interrupted Codex thread: %w", ctx.Err())
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
-	if err := c.Request(ctx, "thread/archive", map[string]any{"threadId": threadID}, nil); err != nil {
-		return err
-	}
-	return c.clearThreadAttempts(threadID, cwd)
-}
-
-type retirementThread struct {
-	ID     string `json:"id"`
-	Cwd    string `json:"cwd"`
-	Source any    `json:"source"`
-}
-
-// ListThreadActivity reads only the exact portal threads recorded by the
-// workspace. A global thread/list scan can traverse the complete rollout store
-// and block the index while an unrelated turn is active.
-func (c *Client) ListThreadActivity(
-	ctx context.Context, expected []ThreadActivity,
-) ([]ThreadActivity, error) {
-	activities := make([]ThreadActivity, 0, len(expected))
-	for _, identity := range expected {
-		var metadata struct {
-			Thread struct {
-				ID        string `json:"id"`
-				Cwd       string `json:"cwd"`
-				Source    any    `json:"source"`
-				UpdatedAt int64  `json:"updatedAt"`
-			} `json:"thread"`
-		}
-		if err := c.Request(ctx, "thread/read", map[string]any{
-			"threadId": identity.ID, "excludeTurns": true,
-		}, &metadata); err != nil {
-			return nil, err
-		}
-		thread := metadata.Thread
-		if thread.ID != identity.ID || thread.Cwd != identity.Cwd ||
-			thread.UpdatedAt < 0 || !portalThreadSource(thread.Source) {
-			return nil, errors.New("thread/read returned invalid activity metadata")
-		}
-		activities = append(activities, ThreadActivity{
-			ID: thread.ID, Cwd: thread.Cwd, UpdatedAt: time.Unix(thread.UpdatedAt, 0),
-		})
-	}
-	return activities, nil
-}
-
-func (c *Client) retirementCandidate(
-	ctx context.Context, cwd string, archived bool,
-) (retirementThread, bool, error) {
-	var page struct {
-		Data       *[]retirementThread `json:"data"`
-		NextCursor *string             `json:"nextCursor"`
-	}
-	if err := c.Request(ctx, "thread/list", map[string]any{
-		"cwd": cwd, "limit": 2, "sortDirection": "asc", "sourceKinds": []string{"vscode"},
-		"archived": archived,
-	}, &page); err != nil {
-		return retirementThread{}, false, err
-	}
-	if page.Data == nil {
-		return retirementThread{}, false, errors.New("thread/list returned no data")
-	}
-	if len(*page.Data) > 1 || page.NextCursor != nil {
-		return retirementThread{}, false,
-			fmt.Errorf("multiple Codex threads use %s; refusing ambiguous retirement", cwd)
-	}
-	if len(*page.Data) == 0 {
-		return retirementThread{}, false, nil
-	}
-	candidate := (*page.Data)[0]
-	if candidate.ID == "" || candidate.Cwd != cwd || !portalThreadSource(candidate.Source) {
-		return retirementThread{}, false, errors.New("thread/list returned an invalid retirement candidate")
-	}
-	return candidate, true, nil
-}
-
-func (c *Client) retirementThreadByID(
-	ctx context.Context, threadID, cwd string, archived bool,
-) (retirementThread, bool, error) {
-	seenCursors := make(map[string]struct{})
-	var cursor string
-	for {
-		params := map[string]any{
-			"cwd": cwd, "limit": 100, "sortDirection": "asc",
-			"sourceKinds": []string{"vscode"}, "archived": archived,
-		}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		var page struct {
-			Data       *[]retirementThread `json:"data"`
-			NextCursor *string             `json:"nextCursor"`
-		}
-		if err := c.Request(ctx, "thread/list", params, &page); err != nil {
-			return retirementThread{}, false, err
-		}
-		if page.Data == nil {
-			return retirementThread{}, false, errors.New("thread/list returned no data")
-		}
-		for _, candidate := range *page.Data {
-			if candidate.ID != threadID {
-				continue
-			}
-			if candidate.Cwd != cwd || !portalThreadSource(candidate.Source) {
-				return retirementThread{}, false,
-					errors.New("thread/list returned invalid metadata for the expected retirement thread")
-			}
-			return candidate, true, nil
-		}
-		if page.NextCursor == nil || *page.NextCursor == "" {
-			return retirementThread{}, false, nil
-		}
-		cursor = *page.NextCursor
-		if _, duplicate := seenCursors[cursor]; duplicate {
-			return retirementThread{}, false, errors.New("thread/list repeated a retirement cursor")
-		}
-		seenCursors[cursor] = struct{}{}
-	}
 }
 
 func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, error) {
@@ -3050,7 +2832,7 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 	if err := c.Request(ctx, "thread/turns/list", map[string]any{
 		"threadId": threadID, "limit": recentTurnLimit, "sortDirection": "desc", "itemsView": "full",
 	}, &page); err != nil {
-		if freshThreadMissingSourceRollout(metadata.Thread, threadID, err) {
+		if c.freshThreadMissingSourceRollout(metadata.Thread, threadID, err) {
 			return transcript, nil
 		}
 		return Transcript{}, fmt.Errorf("read Codex thread turns: %w", err)
@@ -3065,13 +2847,13 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 	return transcript, nil
 }
 
-func freshThreadMissingSourceRollout(thread map[string]any, threadID string, err error) bool {
+func (c *Client) freshThreadMissingSourceRollout(thread map[string]any, threadID string, err error) bool {
 	var rpcErr *rpcCallError
 	if !errors.As(err, &rpcErr) || rpcErr.code != -32600 ||
 		rpcErr.message != "invalid paginated history lineage for "+threadID+": missing source rollout" {
 		return false
 	}
-	if stringValue(thread["id"]) != threadID || stringValue(thread["source"]) != "vscode" ||
+	if stringValue(thread["id"]) != threadID || !c.threadSource(thread["source"]) ||
 		stringValue(thread["historyMode"]) != "paginated" || stringValue(thread["preview"]) != "" ||
 		stringValue(thread["forkedFromId"]) != "" ||
 		!slices.Contains([]string{"idle", "notLoaded"}, statusValue(thread["status"])) {
@@ -3108,7 +2890,7 @@ func (c *Client) VerifyThread(ctx context.Context, threadID, cwd string) error {
 	}
 	if metadata.Thread == nil || stringValue(metadata.Thread["id"]) != threadID ||
 		stringValue(metadata.Thread["cwd"]) != cwd {
-		return errors.New("Codex thread does not match the development session directory")
+		return errors.New("Codex thread does not match the trusted working directory")
 	}
 	return nil
 }
@@ -3117,7 +2899,7 @@ func (c *Client) RequireThreadIdle(ctx context.Context, threadID, cwd string) er
 	if err := c.VerifyThread(ctx, threadID, cwd); err != nil {
 		return err
 	}
-	if err := c.requireThreadTurnsIdle(ctx, threadID); err != nil {
+	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
 		return err
 	}
 	prompts, err := c.PromptsWithItems(ctx, threadID)
@@ -3134,10 +2916,10 @@ func (c *Client) RequireThreadIdle(ctx context.Context, threadID, cwd string) er
 	if len(queued) > 0 {
 		return fmt.Errorf("Codex thread %s has %d queued message(s)", threadID, len(queued))
 	}
-	return c.requireSubmissionAttemptsResolved(ctx, threadID)
+	return c.RequireSubmissionAttemptsResolved(ctx, threadID)
 }
 
-func (c *Client) requireThreadTurnsIdle(ctx context.Context, threadID string) error {
+func (c *Client) RequireThreadTurnsIdle(ctx context.Context, threadID string) error {
 	var page struct {
 		Data *[]struct {
 			ID     string `json:"id"`
@@ -3307,15 +3089,15 @@ func jsonDetails(value any) string {
 
 func (c *Client) resumeThread(ctx context.Context, threadID string) error {
 	var response map[string]any
-	return c.Request(ctx, "thread/resume", threadResumeParams(threadID), &response)
+	return c.Request(ctx, "thread/resume", c.threadResumeParams(threadID), &response)
 }
 
-func threadResumeParams(threadID string) map[string]any {
-	return map[string]any{
-		"threadId":              threadID,
-		"excludeTurns":          true,
-		"developerInstructions": sessionLifecycleDeveloperInstructions,
+func (c *Client) threadResumeParams(threadID string) map[string]any {
+	params := map[string]any{"threadId": threadID, "excludeTurns": true}
+	if c.options.DeveloperInstructions != "" {
+		params["developerInstructions"] = c.options.DeveloperInstructions
 	}
+	return params
 }
 
 func (c *Client) ListQueue(ctx context.Context, threadID string) ([]QueueEntry, error) {
@@ -3770,7 +3552,7 @@ func (c *Client) Send(
 	if err := c.resumeThread(ctx, threadID); err != nil {
 		return SendReceipt{}, err
 	}
-	turnID, err := c.activeTurnID(ctx, threadID)
+	turnID, err := c.ActiveTurnID(ctx, threadID)
 	if err != nil {
 		return SendReceipt{}, err
 	}
@@ -3896,7 +3678,7 @@ func (c *Client) SendAttempted(
 }
 
 func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text string, allowUnmaterializedStart bool) error {
-	materialized, err := c.threadHistoryMaterialized(ctx, threadID, cwd)
+	materialized, err := c.HistoryMaterialized(ctx, threadID, cwd)
 	if err != nil {
 		return err
 	}
@@ -3924,7 +3706,7 @@ func (c *Client) waitForInitialMessage(ctx context.Context, threadID, cwd, text 
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		materialized, err := c.threadHistoryMaterialized(ctx, threadID, cwd)
+		materialized, err := c.HistoryMaterialized(ctx, threadID, cwd)
 		if err != nil {
 			if !initialRolloutPending(err) {
 				return err
@@ -4012,18 +3794,7 @@ func (c *Client) initialMessageMatches(ctx context.Context, threadID, text strin
 	return true, nil
 }
 
-func (c *Client) RequireThreadMaterialized(ctx context.Context, threadID, cwd string) error {
-	materialized, err := c.threadHistoryMaterialized(ctx, threadID, cwd)
-	if err != nil {
-		return err
-	}
-	if !materialized {
-		return errors.New("recorded Codex thread has no persisted history; archive the session and start a new one")
-	}
-	return nil
-}
-
-func (c *Client) threadHistoryMaterialized(ctx context.Context, threadID, cwd string) (bool, error) {
+func (c *Client) HistoryMaterialized(ctx context.Context, threadID, cwd string) (bool, error) {
 	var metadata struct {
 		Thread struct {
 			ID          string            `json:"id"`
@@ -4055,7 +3826,7 @@ func (c *Client) threadHistoryMaterialized(ctx context.Context, threadID, cwd st
 	}
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		fresh := portalThreadSource(metadata.Thread.Source) &&
+		fresh := c.threadSource(metadata.Thread.Source) &&
 			metadata.Thread.Ephemeral != nil && !*metadata.Thread.Ephemeral &&
 			metadata.Thread.HistoryMode == "paginated" &&
 			metadata.Thread.Preview == "" &&
@@ -4071,9 +3842,9 @@ func (c *Client) threadHistoryMaterialized(ctx context.Context, threadID, cwd st
 				ephemeral = fmt.Sprint(*metadata.Thread.Ephemeral)
 			}
 			return false, fmt.Errorf(
-				"unmaterialized Codex thread is not a fresh idle portal thread "+
+				"unmaterialized Codex thread is not a fresh idle application thread "+
 					"(source=%s ephemeral=%s historyMode=%q previewEmpty=%t status=%q turns=%d)",
-				sessionSourceDescription(metadata.Thread.Source), ephemeral,
+				sourceDescription(metadata.Thread.Source), ephemeral,
 				metadata.Thread.HistoryMode, metadata.Thread.Preview == "",
 				statusValue(metadata.Thread.Status), turnCount,
 			)
@@ -4089,12 +3860,12 @@ func (c *Client) threadHistoryMaterialized(ctx context.Context, threadID, cwd st
 	return true, nil
 }
 
-func portalThreadSource(value any) bool {
+func (c *Client) threadSource(value any) bool {
 	source, ok := value.(string)
-	return ok && source == "vscode"
+	return ok && slices.Contains(c.options.ThreadSourceKinds, source)
 }
 
-func sessionSourceDescription(value any) string {
+func sourceDescription(value any) string {
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return "<invalid>"
@@ -4103,7 +3874,7 @@ func sessionSourceDescription(value any) string {
 }
 
 func (c *Client) Interrupt(ctx context.Context, threadID string) error {
-	turnID, err := c.activeTurnID(ctx, threadID)
+	turnID, err := c.ActiveTurnID(ctx, threadID)
 	if err != nil {
 		return err
 	}
@@ -4113,7 +3884,9 @@ func (c *Client) Interrupt(ctx context.Context, threadID string) error {
 	return c.Request(ctx, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID}, nil)
 }
 
-func (c *Client) activeTurnID(ctx context.Context, threadID string) (string, error) {
+// ActiveTurnID returns the current in-progress turn, or an empty string when
+// the thread is idle.
+func (c *Client) ActiveTurnID(ctx context.Context, threadID string) (string, error) {
 	var page struct {
 		Data *[]struct {
 			ID     string `json:"id"`
