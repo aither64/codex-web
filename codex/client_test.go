@@ -295,7 +295,7 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := client.StartThread(ctx, "/workspace/work/example", map[string]string{
-		"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
+		"DEV_SESSION_WORKSPACE": "/workspace",
 	})
 	if err == nil || !strings.Contains(err.Error(), "working directory") {
 		t.Fatalf("wrong-directory start result = %v", err)
@@ -360,7 +360,7 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	environment := map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"}
+	environment := map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"}
 	if _, err := client.StartThread(ctx, "/workspace/work/example", environment); err != nil {
 		t.Fatal(err)
 	}
@@ -621,7 +621,7 @@ func TestModelsSettingsAndForkUseSupportedAppServerContracts(t *testing.T) {
 	}
 	settings := ThreadSettings{Model: model, ReasoningEffort: effort}
 	id, err := client.ForkThread(ctx, "thread-source", "/workspace/work/fork", map[string]string{
-		"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
+		"DEV_SESSION_WORKSPACE": "/workspace",
 	}, settings)
 	if err != nil || id != "thread-fork" {
 		t.Fatalf("fork = %q, %v", id, err)
@@ -2393,7 +2393,7 @@ func TestOpenThreadDoesNotReplaceMissingPersistedThread(t *testing.T) {
 		ctx,
 		"persisted-thread",
 		"/workspace/work/example",
-		map[string]string{"VPSFREE_DEV_SESSION_WORKSPACE": "/workspace"},
+		map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"},
 	)
 	if err == nil || !strings.Contains(err.Error(), "thread not found") {
 		t.Fatalf("missing persisted thread result = %v", err)
@@ -3061,9 +3061,9 @@ func TestEnsureInitialMessageIsRetrySafe(t *testing.T) {
 }
 
 func TestConfiguredCodexFreshThreadContract(t *testing.T) {
-	binary := os.Getenv("VPSFREE_CODEX_TEST_BINARY")
+	binary := os.Getenv("CODEX_WEB_TEST_BINARY")
 	if binary == "" {
-		t.Skip("VPSFREE_CODEX_TEST_BINARY is not configured")
+		t.Skip("CODEX_WEB_TEST_BINARY is not configured")
 	}
 	directory, err := os.MkdirTemp("/tmp", "workspace-codex-contract-")
 	if err != nil {
@@ -3125,7 +3125,7 @@ func TestConfiguredCodexFreshThreadContract(t *testing.T) {
 		t.Fatalf("resolve configured Codex defaults: %#v, %v\n%s", settings, err, output.String())
 	}
 	threadID, err := client.StartThreadWithSettings(ctx, cwd, map[string]string{
-		"VPSFREE_DEV_SESSION_WORKSPACE": filepath.Join(directory, "workspace"),
+		"DEV_SESSION_WORKSPACE": filepath.Join(directory, "workspace"),
 	}, settings)
 	if err != nil {
 		t.Fatalf("start exact Codex thread: %v\n%s", err, output.String())

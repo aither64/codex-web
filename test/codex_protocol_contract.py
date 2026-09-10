@@ -66,8 +66,8 @@ def request(method, params):
 
 
 environment = {
-    "VPSFREE_DEV_SESSION_SLUG": "example",
-    "VPSFREE_DEV_SESSION_WORKSPACE": "/workspace",
+    "DEV_SESSION_SLUG": "example",
+    "DEV_SESSION_WORKSPACE": "/workspace",
 }
 lifecycle_developer_instructions = (
     "Completing work, preparing a handoff, or setting lifecycle state does not "
@@ -85,8 +85,8 @@ client_requests = [
         {
             "capabilities": {"experimentalApi": True},
             "clientInfo": {
-                "name": "vpsfree-workspace-portal",
-                "title": "vpsFree.cz Workspace Portal",
+                "name": "dev-workspace-portal",
+                "title": "Development Workspace Portal",
                 "version": "0.1.0",
             },
         },

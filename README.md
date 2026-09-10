@@ -5,10 +5,8 @@ protocol client, capability-checked HTTP handlers and framework-free browser
 assets for applications that already decide which Codex threads a user may
 access.
 
-The source history was extracted from
-[`aither64/vpsfree-cz-workspace`](https://github.com/aither64/vpsfree-cz-workspace)
-at commit `3580e60bb035c2d0ba5be6f0d2489bbbf30ded3d`. Workspace lifecycle and
-development-session policy remain in `dev-workspace`.
+The repository was extracted from a larger development-workspace application.
+Workspace lifecycle and development-session policy remain in `dev-workspace`.
 
 ## Go packages
 

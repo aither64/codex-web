@@ -36,6 +36,6 @@ security and compatibility effects in the commit body. Write commit messages
 to a temporary file and pass it to `git commit -F`. Do not bypass declared
 hooks.
 
-Run quick checks before the mandatory vpsFree.cz change review. Run long live
+Run quick checks before the mandatory change review. Run long live
 App Server tests only after review findings are resolved or explicitly
 accepted in the initiative state.
