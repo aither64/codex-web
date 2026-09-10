@@ -2100,6 +2100,183 @@ func TestQueueAttemptsSurviveClientRestart(t *testing.T) {
 	}
 }
 
+func TestSubmissionLedgerReloadsBetweenCooperatingClients(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "app-server.sock")
+	first := newTestClient(socket)
+	defer first.Close()
+	second := newTestClient(socket)
+	defer second.Close()
+	if err := first.recordQueueAttempt("thread-1", "queued-1", "queued text"); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.PrepareSend("thread-1", "sent text", "sent-1", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if attempted, err := first.queueAttempt("thread-1", "queued-1", "queued text"); err != nil || !attempted {
+		t.Fatalf("reloaded queue attempt = %t, %v", attempted, err)
+	}
+	if _, found, err := first.sendAttempt(
+		"thread-1", "sent-1", "sent text", "",
+	); err != nil || !found {
+		t.Fatalf("reloaded send attempt = %t, %v", found, err)
+	}
+}
+
+func TestSubmissionLedgerUsesApplicationOwnedPath(t *testing.T) {
+	socket := serveUnixWebsocket(t, handshake)
+	socketDirectory := filepath.Dir(socket)
+	if err := os.Chmod(socketDirectory, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(socketDirectory, 0o700); err != nil {
+			t.Errorf("restore socket directory mode: %v", err)
+		}
+	})
+	ledgerPath := filepath.Join(t.TempDir(), "submission-attempts.json")
+	client := NewWithOptions(socket, ClientOptions{SubmissionLedgerPath: ledgerPath})
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ensure(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.PrepareSend("thread-1", "sent text", "sent-1", "", false); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(ledgerPath)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("application-owned ledger mode = %v, %v", info, err)
+	}
+	if _, err := os.Stat(socket + ".submission-attempts-v3.json"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("compatibility ledger path was used: %v", err)
+	}
+}
+
+func TestSubmissionLedgerTransactionReleasesLockAfterCallbackError(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "app-server.sock")
+	first := newTestClient(socket)
+	defer first.Close()
+	second := newTestClient(socket)
+	defer second.Close()
+	sentinel := errors.New("transaction failed")
+	if err := queueLedgerAction(first, func() error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("transaction error = %v", err)
+	}
+	finished := make(chan error, 1)
+	go func() {
+		finished <- second.recordQueueAttempt("thread-1", "queued-1", "queued text")
+	}()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback error retained the submission ledger lock")
+	}
+}
+
+func TestSubmissionLedgerSupportsCrossProcessRetirementRecovery(t *testing.T) {
+	if os.Getenv("CODEX_WEB_LEDGER_HELPER") == "1" {
+		socket := os.Getenv("CODEX_WEB_LEDGER_SOCKET")
+		directory := os.Getenv("CODEX_WEB_LEDGER_DIRECTORY")
+		client := newTestClient(socket)
+		defer client.Close()
+		attempted, err := client.SendAttempted(
+			context.Background(), "thread-1", "sent text", "message-1", "plan:digest",
+		)
+		if err != nil || !attempted {
+			t.Fatalf("response-loss retry = %t, %v", attempted, err)
+		}
+		retiringThread, err := client.ThreadOperationAttempt(directory)
+		if err != nil || retiringThread != "thread-1" {
+			t.Fatalf("restored retirement attempt = %q, %v", retiringThread, err)
+		}
+		if err := client.ClearConversationAttempts("thread-1", directory); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	directory := t.TempDir()
+	socket := filepath.Join(directory, "app-server.sock")
+	workingDirectory := "/workspace/work/example"
+	serving := newTestClient(socket)
+	defer serving.Close()
+	if err := serving.PrepareSend(
+		"thread-1", "sent text", "message-1", "plan:digest", false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := serving.markSendSubmitting("thread-1", "message-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := serving.markSendAccepted("thread-1", "message-1", SendReceipt{
+		TurnID: "turn-1", ClientUserMessageID: "message-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := serving.RecordThreadOperationAttempt(workingDirectory, "thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestSubmissionLedgerSupportsCrossProcessRetirementRecovery$")
+	command.Env = append(os.Environ(),
+		"CODEX_WEB_LEDGER_HELPER=1",
+		"CODEX_WEB_LEDGER_SOCKET="+socket,
+		"CODEX_WEB_LEDGER_DIRECTORY="+workingDirectory,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("ledger helper failed: %v\n%s", err, output)
+	}
+	if _, found, err := serving.sendAttempt(
+		"thread-1", "message-1", "sent text", "plan:digest",
+	); err != nil || found {
+		t.Fatalf("retired send attempt = %t, %v", found, err)
+	}
+	if retiringThread, err := serving.ThreadOperationAttempt(workingDirectory); err != nil || retiringThread != "" {
+		t.Fatalf("retired operation attempt = %q, %v", retiringThread, err)
+	}
+}
+
+func TestClosedClientCannotRetakeOrMutateSubmissionLedger(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "app-server.sock")
+	first := newTestClient(socket)
+	first.queueMu.Lock()
+	err := first.loadQueueLedgerLocked()
+	first.queueMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	second := newTestClient(socket)
+	defer second.Close()
+	second.queueMu.Lock()
+	err = second.loadQueueLedgerLocked()
+	second.releaseQueueLedgerLocked()
+	second.queueMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.queueMu.Lock()
+	err = first.loadQueueLedgerLocked()
+	first.queueMu.Unlock()
+	if err == nil ||
+		!strings.Contains(err.Error(), "client is closed") {
+		t.Fatalf("closed client ledger mutation error = %v", err)
+	}
+}
+
+func TestThreadOperationAttemptRequiresCanonicalIdentity(t *testing.T) {
+	client := newTestClient(filepath.Join(t.TempDir(), "app-server.sock"))
+	defer client.Close()
+	if err := client.RecordThreadOperationAttempt("relative", "thread-1"); err == nil {
+		t.Fatal("relative operation directory was accepted")
+	}
+	if err := client.RecordThreadOperationAttempt("/workspace/work/one", ""); err == nil {
+		t.Fatal("empty operation thread was accepted")
+	}
+}
+
 func TestQueueDeletionResponseLossReconcilesAfterClientRestart(t *testing.T) {
 	directory := t.TempDir()
 	socket := filepath.Join(directory, "app-server.sock")

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -357,6 +358,7 @@ type Client struct {
 	connection   *websocket.Conn
 	generation   uint64
 	ready        uint64
+	closed       bool
 	writeMu      sync.Mutex
 	nextID       atomic.Uint64
 
@@ -381,8 +383,7 @@ type Client struct {
 	queueDeletions   map[string]map[string]queueDeletionAttempt
 	operations       map[string]string
 	queueLedgerPath  string
-	queueLedgerReady bool
-	queueLedgerErr   error
+	queueLedgerLock  *os.File
 
 	watchedMu         sync.Mutex
 	watched           map[string]int
@@ -402,6 +403,9 @@ type ClientOptions struct {
 	RuntimeWorkspaceRoots []string
 	ThreadSourceKinds     []string
 	NonBlockingUserInput  *NonBlockingUserInputPolicy
+	// SubmissionLedgerPath selects application-owned durable retry storage.
+	// Empty preserves the compatibility path next to the App Server socket.
+	SubmissionLedgerPath string
 }
 
 // NonBlockingUserInputPolicy opts a client into automatically answering
@@ -439,6 +443,10 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 	}
 	options.RuntimeWorkspaceRoots = append([]string(nil), options.RuntimeWorkspaceRoots...)
 	options.ThreadSourceKinds = append([]string(nil), options.ThreadSourceKinds...)
+	queueLedgerPath := options.SubmissionLedgerPath
+	if queueLedgerPath == "" {
+		queueLedgerPath = socket + ".submission-attempts-v3.json"
+	}
 	if options.NonBlockingUserInput != nil {
 		if options.NonBlockingUserInput.HiddenGrace < 0 ||
 			options.NonBlockingUserInput.VisibleCountdown < 0 {
@@ -458,7 +466,7 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		sendAttempts:    make(map[string]map[string]sendAttempt),
 		queueDeletions:  make(map[string]map[string]queueDeletionAttempt),
 		operations:      make(map[string]string),
-		queueLedgerPath: socket + ".submission-attempts-v3.json",
+		queueLedgerPath: queueLedgerPath,
 	}
 }
 
@@ -466,6 +474,10 @@ func (c *Client) Ensure(ctx context.Context) error {
 	c.ensureMu.Lock()
 	defer c.ensureMu.Unlock()
 	c.connectionMu.Lock()
+	if c.closed {
+		c.connectionMu.Unlock()
+		return errors.New("Codex client is closed")
+	}
 	if c.connection != nil && c.ready == c.generation {
 		c.connectionMu.Unlock()
 		return nil
@@ -518,6 +530,7 @@ func (c *Client) Ensure(ctx context.Context) error {
 
 func (c *Client) Close() {
 	c.connectionMu.Lock()
+	c.closed = true
 	connection := c.connection
 	generation := c.generation
 	c.connectionMu.Unlock()
@@ -525,6 +538,12 @@ func (c *Client) Close() {
 		connection.CloseNow()
 		c.markDisconnected(connection, generation, errors.New("client closed"))
 	}
+	c.queueMu.Lock()
+	if c.queueLedgerLock != nil {
+		_ = c.queueLedgerLock.Close()
+		c.queueLedgerLock = nil
+	}
+	c.queueMu.Unlock()
 }
 
 func (c *Client) Request(ctx context.Context, method string, params any, result any) error {
@@ -1473,10 +1492,33 @@ func queueTextDigest(text string) string {
 }
 
 func (c *Client) loadQueueLedgerLocked() error {
-	if c.queueLedgerReady {
-		return c.queueLedgerErr
+	c.connectionMu.Lock()
+	closed := c.closed
+	c.connectionMu.Unlock()
+	if closed {
+		return errors.New("Codex client is closed")
 	}
-	c.queueLedgerReady = true
+	if c.queueLedgerLock != nil {
+		return errors.New("submission ledger transaction is already active")
+	}
+	lockPath := c.queueLedgerPath + ".lock"
+	lockFD, err := unix.Open(
+		lockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600,
+	)
+	if err != nil {
+		return fmt.Errorf("open submission ledger lock: %w", err)
+	}
+	lockFile := os.NewFile(uintptr(lockFD), lockPath)
+	lockInfo, err := lockFile.Stat()
+	if err != nil || !lockInfo.Mode().IsRegular() || lockInfo.Mode().Perm() != 0o600 {
+		_ = lockFile.Close()
+		return errors.New("submission ledger lock must be a mode-0600 regular file")
+	}
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		_ = lockFile.Close()
+		return fmt.Errorf("lock submission ledger: %w", err)
+	}
+	c.queueLedgerLock = lockFile
 	info, err := os.Lstat(c.queueLedgerPath)
 	if errors.Is(err, os.ErrNotExist) {
 		c.queueAttempts = make(map[string]map[string]string)
@@ -1486,38 +1528,35 @@ func (c *Client) loadQueueLedgerLocked() error {
 		return nil
 	}
 	if err != nil {
-		c.queueLedgerErr = fmt.Errorf("inspect queue attempt ledger: %w", err)
-		return c.queueLedgerErr
+		return c.failQueueLedgerLocked(fmt.Errorf("inspect queue attempt ledger: %w", err))
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		c.queueLedgerErr = errors.New("queue attempt ledger must be a mode-0600 regular file")
-		return c.queueLedgerErr
+		return c.failQueueLedgerLocked(
+			errors.New("queue attempt ledger must be a mode-0600 regular file"),
+		)
 	}
 	if info.Size() > queueLedgerMaxSize {
-		c.queueLedgerErr = errors.New("queue attempt ledger exceeds 1 MiB")
-		return c.queueLedgerErr
+		return c.failQueueLedgerLocked(errors.New("queue attempt ledger exceeds 1 MiB"))
 	}
 	file, err := os.Open(c.queueLedgerPath)
 	if err != nil {
-		c.queueLedgerErr = fmt.Errorf("open queue attempt ledger: %w", err)
-		return c.queueLedgerErr
+		return c.failQueueLedgerLocked(fmt.Errorf("open queue attempt ledger: %w", err))
 	}
 	defer file.Close()
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 	var ledger queueAttemptLedger
 	if err := decoder.Decode(&ledger); err != nil {
-		c.queueLedgerErr = fmt.Errorf("decode queue attempt ledger: %w", err)
-		return c.queueLedgerErr
+		return c.failQueueLedgerLocked(fmt.Errorf("decode queue attempt ledger: %w", err))
 	}
 	if ledger.Schema != 3 || ledger.Attempts == nil {
-		c.queueLedgerErr = errors.New("queue attempt ledger has an invalid schema")
-		return c.queueLedgerErr
+		return c.failQueueLedgerLocked(errors.New("queue attempt ledger has an invalid schema"))
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		c.queueLedgerErr = errors.New("queue attempt ledger contains trailing JSON data")
-		return c.queueLedgerErr
+		return c.failQueueLedgerLocked(
+			errors.New("queue attempt ledger contains trailing JSON data"),
+		)
 	}
 	if ledger.Sends == nil {
 		ledger.Sends = make(map[string]map[string]sendAttempt)
@@ -1530,46 +1569,53 @@ func (c *Client) loadQueueLedgerLocked() error {
 	}
 	for threadID, attempts := range ledger.Attempts {
 		if threadID == "" || attempts == nil {
-			c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid thread")
-			return c.queueLedgerErr
+			return c.failQueueLedgerLocked(
+				errors.New("queue attempt ledger contains an invalid thread"),
+			)
 		}
 		for clientID, digest := range attempts {
 			if clientID == "" || !validSubmissionDigest(digest) {
-				c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid attempt")
-				return c.queueLedgerErr
+				return c.failQueueLedgerLocked(
+					errors.New("queue attempt ledger contains an invalid attempt"),
+				)
 			}
 		}
 	}
 	for threadID, attempts := range ledger.Sends {
 		if threadID == "" || attempts == nil {
-			c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid send thread")
-			return c.queueLedgerErr
+			return c.failQueueLedgerLocked(
+				errors.New("queue attempt ledger contains an invalid send thread"),
+			)
 		}
 		for clientID, attempt := range attempts {
 			if clientID == "" || !validSubmissionDigest(attempt.Digest) ||
 				!validSendAttemptState(attempt) {
-				c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid send attempt")
-				return c.queueLedgerErr
+				return c.failQueueLedgerLocked(
+					errors.New("queue attempt ledger contains an invalid send attempt"),
+				)
 			}
 		}
 	}
 	for threadID, attempts := range ledger.Deletions {
 		if threadID == "" || attempts == nil {
-			c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid deletion thread")
-			return c.queueLedgerErr
+			return c.failQueueLedgerLocked(
+				errors.New("queue attempt ledger contains an invalid deletion thread"),
+			)
 		}
 		for queuedID, attempt := range attempts {
 			if queuedID == "" || attempt.ClientUserMessageID == "" ||
 				!validSubmissionDigest(attempt.Digest) {
-				c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid deletion attempt")
-				return c.queueLedgerErr
+				return c.failQueueLedgerLocked(
+					errors.New("queue attempt ledger contains an invalid deletion attempt"),
+				)
 			}
 		}
 	}
 	for key, value := range ledger.Operations {
 		if !filepath.IsAbs(key) || value == "" {
-			c.queueLedgerErr = errors.New("queue attempt ledger contains an invalid operation marker")
-			return c.queueLedgerErr
+			return c.failQueueLedgerLocked(
+				errors.New("queue attempt ledger contains an invalid operation marker"),
+			)
 		}
 	}
 	c.queueAttempts = ledger.Attempts
@@ -1577,6 +1623,39 @@ func (c *Client) loadQueueLedgerLocked() error {
 	c.queueDeletions = ledger.Deletions
 	c.operations = ledger.Operations
 	return nil
+}
+
+func (c *Client) releaseQueueLedgerLocked() {
+	if c.queueLedgerLock == nil {
+		return
+	}
+	_ = c.queueLedgerLock.Close()
+	c.queueLedgerLock = nil
+}
+
+func (c *Client) failQueueLedgerLocked(err error) error {
+	c.releaseQueueLedgerLocked()
+	return err
+}
+
+func queueLedgerTransaction[T any](
+	c *Client, transaction func() (T, error),
+) (T, error) {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	if err := c.loadQueueLedgerLocked(); err != nil {
+		var zero T
+		return zero, err
+	}
+	defer c.releaseQueueLedgerLocked()
+	return transaction()
+}
+
+func queueLedgerAction(c *Client, action func() error) error {
+	_, err := queueLedgerTransaction(c, func() (struct{}, error) {
+		return struct{}{}, action()
+	})
+	return err
 }
 
 func validSendAttemptState(attempt sendAttempt) bool {
@@ -1591,6 +1670,9 @@ func validSendAttemptState(attempt sendAttempt) bool {
 }
 
 func (c *Client) writeQueueLedgerLocked() error {
+	if c.queueLedgerLock == nil {
+		return errors.New("submission ledger transaction is not active")
+	}
 	directory := filepath.Dir(c.queueLedgerPath)
 	encoded, err := json.Marshal(queueAttemptLedger{
 		Schema: 3, Attempts: c.queueAttempts, Sends: c.sendAttempts,
@@ -1651,150 +1733,137 @@ func validSubmissionDigest(digest string) bool {
 }
 
 func (c *Client) queueAttempt(threadID, clientID, text string) (bool, error) {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return false, err
-	}
-	digest, ok := c.queueAttempts[threadID][clientID]
-	if ok && digest != queueTextDigest(text) {
-		return false, errors.New("queued message identity was reused with different text")
-	}
-	return ok, nil
+	return queueLedgerTransaction(c, func() (bool, error) {
+		digest, ok := c.queueAttempts[threadID][clientID]
+		if ok && digest != queueTextDigest(text) {
+			return false, errors.New("queued message identity was reused with different text")
+		}
+		return ok, nil
+	})
 }
 
 func (c *Client) recordQueueAttempt(threadID, clientID, text string) error {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	attempts := c.queueAttempts
-	digest := queueTextDigest(text)
-	if existing, ok := attempts[threadID][clientID]; ok {
-		if existing != digest {
-			return errors.New("queued message identity was reused with different text")
+	return queueLedgerAction(c, func() error {
+		attempts := c.queueAttempts
+		digest := queueTextDigest(text)
+		if existing, ok := attempts[threadID][clientID]; ok {
+			if existing != digest {
+				return errors.New("queued message identity was reused with different text")
+			}
+			return nil
+		}
+		if attempts[threadID] == nil {
+			attempts[threadID] = make(map[string]string)
+		}
+		attempts[threadID][clientID] = digest
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			delete(attempts[threadID], clientID)
+			if len(attempts[threadID]) == 0 {
+				delete(attempts, threadID)
+			}
+			return err
 		}
 		return nil
-	}
-	if attempts[threadID] == nil {
-		attempts[threadID] = make(map[string]string)
-	}
-	attempts[threadID][clientID] = digest
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		delete(attempts[threadID], clientID)
-		if len(attempts[threadID]) == 0 {
-			delete(attempts, threadID)
-		}
-		return err
-	}
-	return nil
+	})
 }
 
 func (c *Client) sendAttempt(
 	threadID, clientID, text, context string,
 ) (sendAttempt, bool, error) {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return sendAttempt{}, false, err
+	type result struct {
+		attempt sendAttempt
+		found   bool
 	}
-	attempt, ok := c.sendAttempts[threadID][clientID]
-	if ok && (attempt.Digest != queueTextDigest(text) || attempt.Context != context) {
-		return sendAttempt{}, false, errors.New("message identity was reused for another action")
-	}
-	return attempt, ok, nil
+	value, err := queueLedgerTransaction(c, func() (result, error) {
+		attempt, ok := c.sendAttempts[threadID][clientID]
+		if ok && (attempt.Digest != queueTextDigest(text) || attempt.Context != context) {
+			return result{}, errors.New("message identity was reused for another action")
+		}
+		return result{attempt: attempt, found: ok}, nil
+	})
+	return value.attempt, value.found, err
 }
 
 func (c *Client) recordSendAttempt(
 	threadID, clientID, text, context string, steered bool,
 ) error {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	digest := queueTextDigest(text)
-	if existing, ok := c.sendAttempts[threadID][clientID]; ok {
-		if existing.Digest != digest || existing.Context != context || existing.Steered != steered {
-			return errors.New("message identity was reused for another action")
+	return queueLedgerAction(c, func() error {
+		digest := queueTextDigest(text)
+		if existing, ok := c.sendAttempts[threadID][clientID]; ok {
+			if existing.Digest != digest || existing.Context != context || existing.Steered != steered {
+				return errors.New("message identity was reused for another action")
+			}
+			return nil
+		}
+		if c.sendAttempts[threadID] == nil {
+			c.sendAttempts[threadID] = make(map[string]sendAttempt)
+		}
+		c.sendAttempts[threadID][clientID] = sendAttempt{
+			Digest: digest, State: "prepared", Context: context, Steered: steered,
+		}
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			delete(c.sendAttempts[threadID], clientID)
+			if len(c.sendAttempts[threadID]) == 0 {
+				delete(c.sendAttempts, threadID)
+			}
+			return err
 		}
 		return nil
-	}
-	if c.sendAttempts[threadID] == nil {
-		c.sendAttempts[threadID] = make(map[string]sendAttempt)
-	}
-	c.sendAttempts[threadID][clientID] = sendAttempt{
-		Digest: digest, State: "prepared", Context: context, Steered: steered,
-	}
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		delete(c.sendAttempts[threadID], clientID)
-		if len(c.sendAttempts[threadID]) == 0 {
-			delete(c.sendAttempts, threadID)
-		}
-		return err
-	}
-	return nil
+	})
 }
 
 func (c *Client) markSendSubmitting(threadID, clientID string) error {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	attempt, ok := c.sendAttempts[threadID][clientID]
-	if !ok {
-		return errors.New("prepared message attempt disappeared")
-	}
-	if attempt.State == "submitting" {
-		return nil
-	}
-	if attempt.State != "prepared" {
-		return errors.New("message attempt was already accepted")
-	}
-	attempt.State = "submitting"
-	c.sendAttempts[threadID][clientID] = attempt
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		attempt.State = "prepared"
+	return queueLedgerAction(c, func() error {
+		attempt, ok := c.sendAttempts[threadID][clientID]
+		if !ok {
+			return errors.New("prepared message attempt disappeared")
+		}
+		if attempt.State == "submitting" {
+			return nil
+		}
+		if attempt.State != "prepared" {
+			return errors.New("message attempt was already accepted")
+		}
+		attempt.State = "submitting"
 		c.sendAttempts[threadID][clientID] = attempt
-		return err
-	}
-	return nil
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			attempt.State = "prepared"
+			c.sendAttempts[threadID][clientID] = attempt
+			return err
+		}
+		return nil
+	})
 }
 
 func (c *Client) markSendAccepted(threadID, clientID string, receipt SendReceipt) error {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	attempt, ok := c.sendAttempts[threadID][clientID]
-	if !ok {
-		return errors.New("submitted message attempt disappeared")
-	}
-	if receipt.TurnID == "" || receipt.ClientUserMessageID != clientID ||
-		receipt.Steered != attempt.Steered {
-		return errors.New("accepted message receipt does not match its attempt")
-	}
-	if attempt.State == "accepted" {
-		if attempt.TurnID != receipt.TurnID {
-			return errors.New("message identity was accepted by another turn")
+	return queueLedgerAction(c, func() error {
+		attempt, ok := c.sendAttempts[threadID][clientID]
+		if !ok {
+			return errors.New("submitted message attempt disappeared")
+		}
+		if receipt.TurnID == "" || receipt.ClientUserMessageID != clientID ||
+			receipt.Steered != attempt.Steered {
+			return errors.New("accepted message receipt does not match its attempt")
+		}
+		if attempt.State == "accepted" {
+			if attempt.TurnID != receipt.TurnID {
+				return errors.New("message identity was accepted by another turn")
+			}
+			return nil
+		}
+		if attempt.State != "submitting" {
+			return errors.New("message attempt was accepted before submission")
+		}
+		previous := attempt
+		attempt.State = "accepted"
+		attempt.TurnID = receipt.TurnID
+		c.sendAttempts[threadID][clientID] = attempt
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			c.sendAttempts[threadID][clientID] = previous
+			return err
 		}
 		return nil
-	}
-	if attempt.State != "submitting" {
-		return errors.New("message attempt was accepted before submission")
-	}
-	previous := attempt
-	attempt.State = "accepted"
-	attempt.TurnID = receipt.TurnID
-	c.sendAttempts[threadID][clientID] = attempt
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		c.sendAttempts[threadID][clientID] = previous
-		return err
-	}
-	return nil
+	})
 }
 
 // AcknowledgeSends releases durable attempts only after their browser-owned
@@ -1808,32 +1877,29 @@ func (c *Client) AcknowledgeSends(
 	lock.Lock()
 	defer lock.Unlock()
 
-	c.queueMu.Lock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		c.queueMu.Unlock()
-		return nil, err
-	}
 	digests := make(map[string]string, len(acknowledgements))
 	expectedTurns := make(map[string]string)
-	for _, acknowledgement := range acknowledgements {
-		digest := acknowledgement.Digest
-		if !validSubmissionDigest(digest) {
-			c.queueMu.Unlock()
-			return nil, errors.New("message acknowledgement has an invalid digest")
+	if err := queueLedgerAction(c, func() error {
+		for _, acknowledgement := range acknowledgements {
+			digest := acknowledgement.Digest
+			if !validSubmissionDigest(digest) {
+				return errors.New("message acknowledgement has an invalid digest")
+			}
+			digests[acknowledgement.ClientUserMessageID] = digest
+			attempt, found := c.sendAttempts[threadID][acknowledgement.ClientUserMessageID]
+			if found && attempt.Digest != digest {
+				return errors.New("message identity was reused with different text")
+			}
+			if found && attempt.State == "accepted" {
+				expectedTurns[acknowledgement.ClientUserMessageID] = attempt.TurnID
+			}
 		}
-		digests[acknowledgement.ClientUserMessageID] = digest
-		attempt, found := c.sendAttempts[threadID][acknowledgement.ClientUserMessageID]
-		if found && attempt.Digest != digest {
-			c.queueMu.Unlock()
-			return nil, errors.New("message identity was reused with different text")
-		}
-		if found && attempt.State == "accepted" {
-			expectedTurns[acknowledgement.ClientUserMessageID] = attempt.TurnID
-		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	c.queueMu.Unlock()
 
-	proven := make(map[string]struct{}, len(digests))
+	proven := make(map[string]string, len(digests))
 	if len(digests) > 0 {
 		err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
 			if stringValue(entry.Item["type"]) != "userMessage" {
@@ -1858,7 +1924,7 @@ func (c *Client) AcknowledgeSends(
 			if queueTextDigest(text) != digest {
 				return false, errors.New("message identity was reused with different text")
 			}
-			proven[clientID] = struct{}{}
+			proven[clientID] = entry.TurnID
 			return len(proven) == len(digests), nil
 		})
 		if err != nil {
@@ -1866,193 +1932,199 @@ func (c *Client) AcknowledgeSends(
 		}
 	}
 
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	removed := make(map[string]sendAttempt)
-	for clientID := range proven {
-		attempt, found := c.sendAttempts[threadID][clientID]
-		if !found {
-			continue
-		}
-		if attempt.Digest != digests[clientID] {
-			return nil, errors.New("message identity changed during acknowledgement")
-		}
-		removed[clientID] = attempt
-		delete(c.sendAttempts[threadID], clientID)
-	}
-	if len(c.sendAttempts[threadID]) == 0 {
-		delete(c.sendAttempts, threadID)
-	}
-	if len(removed) > 0 {
-		if err := c.writeQueueLedgerLocked(); err != nil {
-			if c.sendAttempts[threadID] == nil {
-				c.sendAttempts[threadID] = make(map[string]sendAttempt)
+	return queueLedgerTransaction(c, func() ([]string, error) {
+		removed := make(map[string]sendAttempt)
+		for clientID := range proven {
+			attempt, found := c.sendAttempts[threadID][clientID]
+			if !found {
+				continue
 			}
-			for clientID, attempt := range removed {
-				c.sendAttempts[threadID][clientID] = attempt
+			if attempt.Digest != digests[clientID] {
+				return nil, errors.New("message identity changed during acknowledgement")
 			}
-			return nil, err
+			if attempt.State == "accepted" && attempt.TurnID != proven[clientID] {
+				return nil, errors.New("message identity was accepted by another turn")
+			}
+			removed[clientID] = attempt
+			delete(c.sendAttempts[threadID], clientID)
 		}
-	}
-	acknowledged := make([]string, 0, len(proven))
-	for _, acknowledgement := range acknowledgements {
-		if _, found := proven[acknowledgement.ClientUserMessageID]; found {
-			acknowledged = append(acknowledged, acknowledgement.ClientUserMessageID)
+		if len(c.sendAttempts[threadID]) == 0 {
+			delete(c.sendAttempts, threadID)
 		}
-	}
-	return acknowledged, nil
+		if len(removed) > 0 {
+			if err := c.writeQueueLedgerLocked(); err != nil {
+				if c.sendAttempts[threadID] == nil {
+					c.sendAttempts[threadID] = make(map[string]sendAttempt)
+				}
+				for clientID, attempt := range removed {
+					c.sendAttempts[threadID][clientID] = attempt
+				}
+				return nil, err
+			}
+		}
+		acknowledged := make([]string, 0, len(proven))
+		for _, acknowledgement := range acknowledgements {
+			if _, found := proven[acknowledgement.ClientUserMessageID]; found {
+				acknowledged = append(acknowledged, acknowledgement.ClientUserMessageID)
+			}
+		}
+		return acknowledged, nil
+	})
 }
 
 func (c *Client) clearQueueAttempt(threadID, clientID string) error {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	attempts := c.queueAttempts[threadID]
-	digest, ok := attempts[clientID]
-	if !ok {
-		return nil
-	}
-	delete(attempts, clientID)
-	if len(attempts) == 0 {
-		delete(c.queueAttempts, threadID)
-	}
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		if c.queueAttempts[threadID] == nil {
-			c.queueAttempts[threadID] = make(map[string]string)
+	return queueLedgerAction(c, func() error {
+		attempts := c.queueAttempts[threadID]
+		digest, ok := attempts[clientID]
+		if !ok {
+			return nil
 		}
-		c.queueAttempts[threadID][clientID] = digest
-		return err
-	}
-	return nil
+		delete(attempts, clientID)
+		if len(attempts) == 0 {
+			delete(c.queueAttempts, threadID)
+		}
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			if c.queueAttempts[threadID] == nil {
+				c.queueAttempts[threadID] = make(map[string]string)
+			}
+			c.queueAttempts[threadID][clientID] = digest
+			return err
+		}
+		return nil
+	})
 }
 
 func (c *Client) queueDeletionAttempt(
 	threadID, queuedSubmissionID string,
 ) (queueDeletionAttempt, bool, error) {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return queueDeletionAttempt{}, false, err
+	type result struct {
+		attempt queueDeletionAttempt
+		found   bool
 	}
-	attempt, ok := c.queueDeletions[threadID][queuedSubmissionID]
-	return attempt, ok, nil
+	value, err := queueLedgerTransaction(c, func() (result, error) {
+		attempt, ok := c.queueDeletions[threadID][queuedSubmissionID]
+		return result{attempt: attempt, found: ok}, nil
+	})
+	return value.attempt, value.found, err
 }
 
 func (c *Client) recordQueueDeletionAttempt(
 	threadID string, target QueueEntry,
 ) (queueDeletionAttempt, error) {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return queueDeletionAttempt{}, err
-	}
-	attempt := queueDeletionAttempt{
-		ClientUserMessageID: target.ClientUserMessageID,
-		Digest:              queueTextDigest(target.Text),
-	}
-	if existing, ok := c.queueDeletions[threadID][target.ID]; ok {
-		if existing != attempt {
-			return queueDeletionAttempt{}, errors.New("queued deletion identity changed")
+	return queueLedgerTransaction(c, func() (queueDeletionAttempt, error) {
+		attempt := queueDeletionAttempt{
+			ClientUserMessageID: target.ClientUserMessageID,
+			Digest:              queueTextDigest(target.Text),
 		}
-		return existing, nil
-	}
-	if c.queueDeletions[threadID] == nil {
-		c.queueDeletions[threadID] = make(map[string]queueDeletionAttempt)
-	}
-	c.queueDeletions[threadID][target.ID] = attempt
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		delete(c.queueDeletions[threadID], target.ID)
-		if len(c.queueDeletions[threadID]) == 0 {
-			delete(c.queueDeletions, threadID)
+		if existing, ok := c.queueDeletions[threadID][target.ID]; ok {
+			if existing != attempt {
+				return queueDeletionAttempt{}, errors.New("queued deletion identity changed")
+			}
+			return existing, nil
 		}
-		return queueDeletionAttempt{}, err
-	}
-	return attempt, nil
+		if c.queueDeletions[threadID] == nil {
+			c.queueDeletions[threadID] = make(map[string]queueDeletionAttempt)
+		}
+		c.queueDeletions[threadID][target.ID] = attempt
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			delete(c.queueDeletions[threadID], target.ID)
+			if len(c.queueDeletions[threadID]) == 0 {
+				delete(c.queueDeletions, threadID)
+			}
+			return queueDeletionAttempt{}, err
+		}
+		return attempt, nil
+	})
 }
 
 func (c *Client) clearQueueDeletionAndAttempt(
 	threadID, queuedSubmissionID, clientID string,
 ) error {
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	deletion, deleting := c.queueDeletions[threadID][queuedSubmissionID]
-	digest, queued := c.queueAttempts[threadID][clientID]
-	if deleting && deletion.ClientUserMessageID != clientID {
-		return errors.New("queued deletion is bound to another message")
-	}
-	delete(c.queueDeletions[threadID], queuedSubmissionID)
-	if len(c.queueDeletions[threadID]) == 0 {
-		delete(c.queueDeletions, threadID)
-	}
-	delete(c.queueAttempts[threadID], clientID)
-	if len(c.queueAttempts[threadID]) == 0 {
-		delete(c.queueAttempts, threadID)
-	}
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		if deleting {
-			if c.queueDeletions[threadID] == nil {
-				c.queueDeletions[threadID] = make(map[string]queueDeletionAttempt)
-			}
-			c.queueDeletions[threadID][queuedSubmissionID] = deletion
+	return queueLedgerAction(c, func() error {
+		deletion, deleting := c.queueDeletions[threadID][queuedSubmissionID]
+		digest, queued := c.queueAttempts[threadID][clientID]
+		if deleting && deletion.ClientUserMessageID != clientID {
+			return errors.New("queued deletion is bound to another message")
 		}
-		if queued {
-			if c.queueAttempts[threadID] == nil {
-				c.queueAttempts[threadID] = make(map[string]string)
-			}
-			c.queueAttempts[threadID][clientID] = digest
+		delete(c.queueDeletions[threadID], queuedSubmissionID)
+		if len(c.queueDeletions[threadID]) == 0 {
+			delete(c.queueDeletions, threadID)
 		}
-		return err
-	}
-	return nil
+		delete(c.queueAttempts[threadID], clientID)
+		if len(c.queueAttempts[threadID]) == 0 {
+			delete(c.queueAttempts, threadID)
+		}
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			if deleting {
+				if c.queueDeletions[threadID] == nil {
+					c.queueDeletions[threadID] = make(map[string]queueDeletionAttempt)
+				}
+				c.queueDeletions[threadID][queuedSubmissionID] = deletion
+			}
+			if queued {
+				if c.queueAttempts[threadID] == nil {
+					c.queueAttempts[threadID] = make(map[string]string)
+				}
+				c.queueAttempts[threadID][clientID] = digest
+			}
+			return err
+		}
+		return nil
+	})
 }
 
 func (c *Client) RequireSubmissionAttemptsResolved(ctx context.Context, threadID string) error {
-	c.queueMu.Lock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		c.queueMu.Unlock()
+	deletionIDs, err := queueLedgerTransaction(c, func() ([]string, error) {
+		ids := make([]string, 0, len(c.queueDeletions[threadID]))
+		for queuedSubmissionID := range c.queueDeletions[threadID] {
+			ids = append(ids, queuedSubmissionID)
+		}
+		return ids, nil
+	})
+	if err != nil {
 		return err
 	}
-	deletionIDs := make([]string, 0, len(c.queueDeletions[threadID]))
-	for queuedSubmissionID := range c.queueDeletions[threadID] {
-		deletionIDs = append(deletionIDs, queuedSubmissionID)
-	}
-	c.queueMu.Unlock()
 	for _, queuedSubmissionID := range deletionIDs {
 		if err := c.DeleteQueueEntry(ctx, threadID, queuedSubmissionID); err != nil {
 			return fmt.Errorf("reconcile queued message deletion: %w", err)
 		}
 	}
 
-	c.queueMu.Lock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		c.queueMu.Unlock()
+	type resolutionSnapshot struct {
+		queueAttempts       map[string]string
+		unresolvedSendCount int
+	}
+	snapshot, err := queueLedgerTransaction(c, func() (resolutionSnapshot, error) {
+		attempts := make(map[string]string, len(c.queueAttempts[threadID]))
+		for clientID, digest := range c.queueAttempts[threadID] {
+			attempts[clientID] = digest
+		}
+		unresolved := 0
+		for _, attempt := range c.sendAttempts[threadID] {
+			if attempt.State != "accepted" {
+				unresolved++
+			}
+		}
+		return resolutionSnapshot{
+			queueAttempts: attempts, unresolvedSendCount: unresolved,
+		}, nil
+	})
+	if err != nil {
 		return err
 	}
-	queueAttempts := make(map[string]string, len(c.queueAttempts[threadID]))
-	for clientID, digest := range c.queueAttempts[threadID] {
-		queueAttempts[clientID] = digest
+	if snapshot.unresolvedSendCount > 0 {
+		return fmt.Errorf(
+			"Codex thread %s has %d unresolved message attempt(s)",
+			threadID, snapshot.unresolvedSendCount,
+		)
 	}
-	unresolvedSendCount := 0
-	for _, attempt := range c.sendAttempts[threadID] {
-		if attempt.State != "accepted" {
-			unresolvedSendCount++
-		}
-	}
-	c.queueMu.Unlock()
-	if unresolvedSendCount > 0 {
-		return fmt.Errorf("Codex thread %s has %d unresolved message attempt(s)", threadID, unresolvedSendCount)
-	}
+	queueAttempts := snapshot.queueAttempts
 	if len(queueAttempts) == 0 {
 		return nil
 	}
 
 	resolved := make(map[string]string)
-	err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
+	err = c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
 		if stringValue(entry.Item["type"]) != "userMessage" {
 			return false, nil
 		}
@@ -2097,12 +2169,9 @@ func (c *Client) ThreadOperationAttempt(directory string) (string, error) {
 	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
 		return "", errors.New("thread operation directory must be canonical and absolute")
 	}
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return "", err
-	}
-	return c.operations[directory], nil
+	return queueLedgerTransaction(c, func() (string, error) {
+		return c.operations[directory], nil
+	})
 }
 
 // RecordThreadOperationAttempt durably binds an operation for directory to one
@@ -2114,23 +2183,20 @@ func (c *Client) RecordThreadOperationAttempt(directory, threadID string) error 
 	if strings.TrimSpace(threadID) == "" {
 		return errors.New("thread operation requires a thread id")
 	}
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	if existing := c.operations[directory]; existing != "" {
-		if existing != threadID {
-			return errors.New("thread operation directory is already bound to another thread")
+	return queueLedgerAction(c, func() error {
+		if existing := c.operations[directory]; existing != "" {
+			if existing != threadID {
+				return errors.New("thread operation directory is already bound to another thread")
+			}
+			return nil
+		}
+		c.operations[directory] = threadID
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			delete(c.operations, directory)
+			return err
 		}
 		return nil
-	}
-	c.operations[directory] = threadID
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		delete(c.operations, directory)
-		return err
-	}
-	return nil
+	})
 }
 
 // ClearConversationAttempts clears all durable submission and operation state
@@ -2142,41 +2208,38 @@ func (c *Client) ClearConversationAttempts(threadID, directory string) error {
 	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
 		return errors.New("conversation attempt cleanup directory must be canonical and absolute")
 	}
-	c.queueMu.Lock()
-	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		return err
-	}
-	queueAttempts, queued := c.queueAttempts[threadID]
-	sendAttempts, sent := c.sendAttempts[threadID]
-	queueDeletions, deleting := c.queueDeletions[threadID]
-	operationValue, operationPending := c.operations[directory]
-	if operationPending && operationValue != threadID {
-		return errors.New("operation key is bound to another conversation")
-	}
-	if !queued && !sent && !deleting && !operationPending {
+	return queueLedgerAction(c, func() error {
+		queueAttempts, queued := c.queueAttempts[threadID]
+		sendAttempts, sent := c.sendAttempts[threadID]
+		queueDeletions, deleting := c.queueDeletions[threadID]
+		operationValue, operationPending := c.operations[directory]
+		if operationPending && operationValue != threadID {
+			return errors.New("operation key is bound to another conversation")
+		}
+		if !queued && !sent && !deleting && !operationPending {
+			return nil
+		}
+		delete(c.queueAttempts, threadID)
+		delete(c.sendAttempts, threadID)
+		delete(c.queueDeletions, threadID)
+		delete(c.operations, directory)
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			if queued {
+				c.queueAttempts[threadID] = queueAttempts
+			}
+			if sent {
+				c.sendAttempts[threadID] = sendAttempts
+			}
+			if deleting {
+				c.queueDeletions[threadID] = queueDeletions
+			}
+			if operationPending {
+				c.operations[directory] = operationValue
+			}
+			return err
+		}
 		return nil
-	}
-	delete(c.queueAttempts, threadID)
-	delete(c.sendAttempts, threadID)
-	delete(c.queueDeletions, threadID)
-	delete(c.operations, directory)
-	if err := c.writeQueueLedgerLocked(); err != nil {
-		if queued {
-			c.queueAttempts[threadID] = queueAttempts
-		}
-		if sent {
-			c.sendAttempts[threadID] = sendAttempts
-		}
-		if deleting {
-			c.queueDeletions[threadID] = queueDeletions
-		}
-		if operationPending {
-			c.operations[directory] = operationValue
-		}
-		return err
-	}
-	return nil
+	})
 }
 
 func stringValue(value any) string {
