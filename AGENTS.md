@@ -2,13 +2,13 @@
 
 ## Repository structure
 
-- `portal/internal/codex/` contains the extracted Go App Server client.
-- `portal/internal/web/` contains the extracted browser assets and contract
-  tests.
-- `test/` contains the Codex protocol request-corpus validator.
-
-The extraction branch will replace this temporary layout with public Go
-packages, scoped browser assets and a standalone example.
+- `codex/` contains the public Go App Server client and generic durable
+  operation primitives.
+- `conversation/` contains the capability-checked HTTP handler and browser ES
+  module.
+- `cmd/codex-web-example/` is the standalone reference application.
+- `test/` contains browser contracts and the Codex protocol request-corpus
+  validator.
 
 ## Development commands
 
