@@ -23,7 +23,7 @@ else:
     CLIENT_SOURCE = (
         pathlib.Path(sys.argv[2])
         if len(sys.argv) == 3
-        else pathlib.Path(__file__).resolve().parents[1] / "portal/internal/codex/client.go"
+        else pathlib.Path(__file__).resolve().parents[1] / "codex/client.go"
     )
 
 

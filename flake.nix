@@ -13,20 +13,19 @@
         pname = "codex-web-checks";
         version = "0.0.0";
         src = ./.;
-        modRoot = "portal";
         vendorHash = "sha256-05Qdy/y6o9aWMF7/1WcQwD4sTUhLeZXNVY4EJxUxgFk=";
-        subPackages = [ ];
+        subPackages = [ "codex" ];
         nativeCheckInputs = [
           pkgs.nodejs
           python
         ];
         checkPhase = ''
           runHook preCheck
-          ${python}/bin/python3 ../test/codex_protocol_contract.py \
-            --coverage-only internal/codex/client.go
-          go test ./internal/codex
-          ${pkgs.nodejs}/bin/node --check internal/web/static/app.js
-          ${pkgs.nodejs}/bin/node internal/web/browser_contract_test.cjs --unit
+          ${python}/bin/python3 test/codex_protocol_contract.py \
+            --coverage-only codex/client.go
+          go test ./codex
+          ${pkgs.nodejs}/bin/node --check portal/internal/web/static/app.js
+          ${pkgs.nodejs}/bin/node portal/internal/web/browser_contract_test.cjs --unit
           runHook postCheck
         '';
         installPhase = ''

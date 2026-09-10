@@ -1,4 +1,4 @@
-module github.com/aither64/vpsfree-cz-workspace/portal
+module github.com/aither64/codex-web
 
 go 1.24.0
 
