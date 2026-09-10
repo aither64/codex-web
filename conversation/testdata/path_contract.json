@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "basePathAlphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/._~!$&'()*+,;=:@-",
+  "opaqueIdCases": [
+    {"name": "ascii", "value": "opaque", "valid": true, "encoded": "opaque"},
+    {"name": "reserved-operation", "value": "start", "valid": true, "encoded": "start"},
+    {"name": "identity-whitespace", "value": " queued item ", "valid": true, "encoded": "%20queued%20item%20"},
+    {"name": "unicode", "value": "ž", "valid": true, "encoded": "%C5%BE"},
+    {"name": "literal-escapes", "value": "%2F%%41-%2e%2e-ž", "valid": true, "encoded": "%252F%25%2541-%252e%252e-%C5%BE"},
+    {"name": "encode-uri-safe", "value": "!~*'()-_.AZaz09", "valid": true, "encoded": "!~*'()-_.AZaz09"},
+    {"name": "maximum-ascii", "repeatValue": "a", "repeatCount": 256, "valid": true},
+    {"name": "maximum-multibyte", "repeatValue": "ž", "repeatCount": 128, "valid": true},
+    {"name": "empty", "value": "", "valid": false},
+    {"name": "dot", "value": ".", "valid": false},
+    {"name": "dot-dot", "value": "..", "valid": false},
+    {"name": "slash", "value": "queued/item", "valid": false},
+    {"name": "nul", "value": "queued\u0000item", "valid": false},
+    {"name": "overlong-ascii", "repeatValue": "a", "repeatCount": 257, "valid": false},
+    {"name": "overlong-multibyte", "repeatValue": "ž", "repeatCount": 129, "valid": false},
+    {"name": "invalid-unicode", "goBytesHex": "ff", "jsCodeUnits": [55296], "valid": false}
+  ]
+}
