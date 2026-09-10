@@ -35,7 +35,23 @@
       };
     in
     {
-      checks.${system}.default = checks;
+      checks.${system} = {
+        default = checks;
+        generic-source = pkgs.runCommand "codex-web-generic-source" { } ''
+          first=vps
+          second=aither
+          forbidden="$first"'free|'"$second"'dev'
+          if grep -RilE "$forbidden" ${./.} --exclude-dir=.git > matches; then
+            cat matches >&2
+            exit 1
+          fi
+          if ${pkgs.findutils}/bin/find ${./.} -printf '%P\n' | grep -iE "$forbidden" > matches; then
+            cat matches >&2
+            exit 1
+          fi
+          touch "$out"
+        '';
+      };
       packages.${system}.default = checks;
     };
 }
