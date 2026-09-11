@@ -27,7 +27,7 @@ class MemoryStorage {
 (async () => {
   const {
     createConversationClient, createDurableAttemptStore, createDurableSender, mountConversation,
-    formatTranscriptTimestamp,
+    formatTranscriptTimestamp, transcriptEntryCopyText, createTranscriptCopyButton,
   } = await import(
     "../conversation/assets/conversation.js"
   );
@@ -55,6 +55,34 @@ class MemoryStorage {
       dateTime: "", dateKey: "", dateLabel: "", approximate: false,
     });
   }
+  const sourceMarkdown = "# Heading\n\nA **bold** [link](https://example.com).\n\n```sh\nprintf 'hello'\n```\n";
+  for (const kind of ["userMessage", "agentMessage", "reasoning", "plan"]) {
+    assert.equal(transcriptEntryCopyText({
+      kind, text: sourceMarkdown, html: "<h1>Heading</h1>", summary: "Interface heading",
+      timestamp: "2026-09-11T12:00:00Z",
+    }), sourceMarkdown);
+  }
+  const commandOutput = "first line\n" + "full output\n".repeat(1000);
+  assert.equal(transcriptEntryCopyText({
+    kind: "commandExecution", summary: "$ printf 'full output'", details: commandOutput,
+  }), "printf 'full output'\n" + commandOutput);
+  assert.equal(transcriptEntryCopyText({kind: "commandExecution", summary: "$ true"}), "true");
+  const sourcePatch = "@@ -1 +1 @@\n-old\n+new\n";
+  assert.equal(transcriptEntryCopyText({
+    kind: "fileChange", summary: "File changes · completed", details: JSON.stringify([
+      {path: "first.txt", kind: {type: "update", move_path: "renamed.txt"}, diff: sourcePatch},
+      {path: "second.txt", kind: {type: "add"}, diff: "+contents\n"},
+    ]),
+  }), "first.txt\nrenamed.txt\n" + sourcePatch + "\n\nsecond.txt\n+contents\n");
+  assert.equal(transcriptEntryCopyText({kind: "fileChange", details: "incomplete JSON"}), "incomplete JSON");
+  assert.equal(transcriptEntryCopyText({
+    kind: "mcpToolCall", summary: "Tool · server/read", details: "{\"result\": \"done\"}",
+  }), "Tool · server/read\n\n{\"result\": \"done\"}");
+  assert.equal(transcriptEntryCopyText({
+    kind: "error", summary: "Turn failed", text: "Disconnected", details: "{\"code\": 1}",
+  }), "Turn failed\n\nDisconnected\n\n{\"code\": 1}");
+  assert.equal(transcriptEntryCopyText({kind: "unknown", details: "full event"}), "full event");
+  assert.equal(transcriptEntryCopyText({kind: "agentMessage", html: "<p>Rendered only</p>"}), "");
   const requests = [];
   const fetchRequest = async (path, options = {}) => {
     requests.push({path, options});
@@ -505,6 +533,50 @@ class MemoryStorage {
   }
   globalThis.Element = FakeElement;
   globalThis.document = {createElement: (name) => new FakeElement(name)};
+  const copied = [];
+  const clipboard = {async writeText(text) { copied.push(text); }};
+  Object.defineProperty(globalThis, "navigator", {value: {clipboard}, configurable: true});
+  const streamingEntry = {kind: "agentMessage", text: "First streamed text"};
+  const copyButton = createTranscriptCopyButton(streamingEntry);
+  assert.equal(copyButton.name, "button");
+  assert.equal(copyButton.attributes.type, "button");
+  assert.equal(copyButton.attributes["aria-label"], "Copy message");
+  assert.equal(copyButton.textContent, "Copy");
+  const scheduledFeedback = [];
+  const savedSetTimeout = globalThis.setTimeout;
+  const savedClearTimeout = globalThis.clearTimeout;
+  globalThis.setTimeout = (callback, delay) => {
+    assert.equal(delay, 2000);
+    scheduledFeedback.push(callback);
+    return scheduledFeedback.length;
+  };
+  globalThis.clearTimeout = () => {};
+  try {
+    await copyButton.listeners.get("click")();
+    assert.deepEqual(copied, ["First streamed text"]);
+    assert.equal(copyButton.textContent, "Copied");
+    assert.equal(copyButton.attributes["data-copy-state"], "copied");
+    scheduledFeedback.pop()();
+    assert.equal(copyButton.textContent, "Copy");
+    assert.equal(copyButton.attributes["aria-label"], "Copy message");
+    streamingEntry.text += " with the latest chunk";
+    await copyButton.listeners.get("click")();
+    assert.equal(copied[1], "First streamed text with the latest chunk");
+    clipboard.writeText = async () => { throw new Error("permission denied"); };
+    await copyButton.listeners.get("click")();
+    assert.equal(copyButton.textContent, "Copy failed");
+    assert.equal(copyButton.attributes["data-copy-state"], "error");
+    assert.equal(copyButton.attributes.title, "Copy failed. Try again.");
+    assert.equal(copyButton.disabled, false);
+    delete globalThis.navigator.clipboard;
+    await copyButton.listeners.get("click")();
+    assert.equal(copyButton.textContent, "Copy failed");
+    scheduledFeedback.pop()();
+    assert.equal(copyButton.attributes["data-copy-state"], "idle");
+  } finally {
+    globalThis.setTimeout = savedSetTimeout;
+    globalThis.clearTimeout = savedClearTimeout;
+  }
   const mountedCalls = [];
   const mountedClient = {
     async thread() {
@@ -556,6 +628,14 @@ class MemoryStorage {
   assert.match(mountedTimes[1].textContent, /^~/);
   assert.equal(mountedTimes[2].name, "span");
   assert.equal(mountedTimes[2].textContent, "Time unavailable");
+  const mountedFooters = root.descendants().filter((element) => element.attributes.class === "codex-entry-footer");
+  assert.equal(mountedFooters.length, 4);
+  mountedFooters.forEach((footer, index) => {
+    assert.equal(footer.children[0].attributes.class, "codex-entry-copy");
+    assert.equal(footer.children[1], mountedTimes[index]);
+    const item = root.descendants().find((element) => element.children.includes(footer));
+    assert.equal(item.children.at(-1), footer);
+  });
   assert.equal(root.descendants().filter((element) => element.attributes.class === "codex-conversation-date").length, 2);
   unmount();
 

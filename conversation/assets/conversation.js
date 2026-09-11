@@ -57,6 +57,65 @@ function createElement(name, attributes = {}, text = "") {
   return element;
 }
 
+// Copy source fields rather than rendered DOM so collapsed details and Markdown
+// survive, while headings, controls and timestamps stay out of the clipboard.
+export function transcriptEntryCopyText(entry) {
+  const text = typeof entry?.text === "string" ? entry.text : "";
+  const summary = typeof entry?.summary === "string" ? entry.summary : "";
+  const details = typeof entry?.details === "string" ? entry.details : "";
+  if (["userMessage", "agentMessage", "reasoning", "plan"].includes(entry?.kind)) return text;
+  if (entry?.kind === "commandExecution") {
+    return [summary.replace(/^\$ /, ""), details].filter(Boolean).join("\n");
+  }
+  if (entry?.kind === "fileChange") {
+    let changes;
+    try { changes = JSON.parse(details); } catch (_error) { return details; }
+    if (!Array.isArray(changes)) return details;
+    return changes.map((change) => {
+      if (!change || typeof change !== "object" || Array.isArray(change)) {
+        return JSON.stringify(change);
+      }
+      return [change.path, change.kind?.move_path, change.diff]
+        .filter((value) => typeof value === "string" && value.length > 0).join("\n") || JSON.stringify(change);
+    }).join("\n\n");
+  }
+  return [summary, text, details].filter(Boolean).join("\n\n");
+}
+
+export function createTranscriptCopyButton(entry) {
+  const label = ["userMessage", "agentMessage"].includes(entry?.kind) ? "Copy message" : "Copy activity";
+  const button = createElement("button", {
+    type: "button", class: "codex-entry-copy", title: label,
+    "aria-label": label, "aria-live": "polite", "data-copy-state": "idle",
+  }, "Copy");
+  let feedbackTimer;
+  button.addEventListener("click", async () => {
+    clearTimeout(feedbackTimer);
+    button.disabled = true;
+    try {
+      await globalThis.navigator.clipboard.writeText(transcriptEntryCopyText(entry));
+      button.textContent = "Copied";
+      button.setAttribute("aria-label", "Copied");
+      button.setAttribute("title", "Copied");
+      button.setAttribute("data-copy-state", "copied");
+    } catch (_error) {
+      button.textContent = "Copy failed";
+      button.setAttribute("aria-label", "Copy failed. Try again.");
+      button.setAttribute("title", "Copy failed. Try again.");
+      button.setAttribute("data-copy-state", "error");
+    } finally {
+      button.disabled = false;
+      feedbackTimer = setTimeout(() => {
+        button.textContent = "Copy";
+        button.setAttribute("aria-label", label);
+        button.setAttribute("title", label);
+        button.setAttribute("data-copy-state", "idle");
+      }, 2000);
+    }
+  });
+  return button;
+}
+
 export function createConversationClient(options) {
   const target = conversationTarget(options);
   const fetchRequest = options.fetch || globalThis.fetch.bind(globalThis);
@@ -563,14 +622,17 @@ export function mountConversation(root, options) {
       const item = createElement("li", {class: `codex-entry codex-entry-${entry.kind || "unknown"}`});
       const heading = entry.kind === "userMessage" ? "You" : entry.kind === "agentMessage" ? "Codex" : entry.kind;
       const header = createElement("div", {class: "codex-entry-header"});
-      const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
-      if (timestamp.dateTime) timeAttributes.datetime = timestamp.dateTime;
-      header.append(
-        createElement("strong", {}, heading || "Activity"),
-        createElement(timestamp.dateTime ? "time" : "span", timeAttributes, timestamp.text),
-      );
+      header.append(createElement("strong", {}, heading || "Activity"));
       item.append(header);
       item.append(createElement("pre", {}, entry.text || entry.summary || entry.details || ""));
+      const footer = createElement("div", {class: "codex-entry-footer"});
+      const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
+      if (timestamp.dateTime) timeAttributes.datetime = timestamp.dateTime;
+      footer.append(
+        createTranscriptCopyButton(entry),
+        createElement(timestamp.dateTime ? "time" : "span", timeAttributes, timestamp.text),
+      );
+      item.append(footer);
       elements.push(item);
     }
     transcript.replaceChildren(...elements);

@@ -80,6 +80,16 @@ order. Missing times return `Time unavailable` and empty date fields.
 An optional second argument accepts `locales` and `timeZone`; the default is
 the browser's locale and time zone, with a 24-hour clock.
 
+`transcriptEntryCopyText(entry)` returns message Markdown, command and output,
+file paths and patches, or other activity summaries and details. It reads the
+entry's source fields, including loaded content hidden by a custom renderer.
+`createTranscriptCopyButton(entry)` returns a native button using that helper
+and the Clipboard API. The button shows `Copied` or `Copy failed` briefly and
+has the `codex-entry-copy` class and `data-copy-state` (`idle`, `copied` or
+`error`) for styling. Create it with the current entry whenever the transcript
+updates. The mounted interface places this button and the timestamp in a
+bottom-right footer on every entry.
+
 The client returned by `createConversationClient()` carries its effective
 endpoint identity into `createDurableSender()` and `mountConversation()`. A
 caller supplying that client does not have to repeat its path options; explicit
