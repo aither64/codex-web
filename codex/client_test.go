@@ -56,6 +56,121 @@ func TestEmptyPromptsAreAJSONList(t *testing.T) {
 	}
 }
 
+func TestReadAccountRateLimits(t *testing.T) {
+	tests := []struct {
+		name   string
+		result string
+		check  func(*testing.T, AccountRateLimits)
+	}{
+		{
+			name: "named buckets preserve reported window positions",
+			result: `{
+				"accountId": "not-exposed", "rateLimitResetCredits": {"availableCount": 5},
+				"rateLimits": {"limitId": "legacy", "primary": {"usedPercent": 99}},
+				"rateLimitsByLimitId": {
+					"codex": {"limitId": "codex", "primary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1789730400}, "secondary": null},
+					"model-specific": {"primary": {"usedPercent": 0, "windowDurationMins": 300, "resetsAt": null}, "secondary": {"usedPercent": 2, "windowDurationMins": 10080}}
+				}
+			}`,
+			check: func(t *testing.T, limits AccountRateLimits) {
+				if limits.RateLimits.LimitID != "legacy" || limits.RateLimits.Primary.UsedPercent != 99 {
+					t.Fatalf("legacy snapshot = %#v", limits.RateLimits)
+				}
+				main := limits.RateLimitsByLimitID["codex"]
+				if main.LimitID != "codex" || main.Primary == nil || main.Secondary != nil {
+					t.Fatalf("main snapshot = %#v", main)
+				}
+				if main.Primary.UsedPercent != 42 || main.Primary.WindowDurationMins == nil ||
+					*main.Primary.WindowDurationMins != 10080 || main.Primary.ResetsAt == nil ||
+					*main.Primary.ResetsAt != 1789730400 {
+					t.Fatalf("main window = %#v", main.Primary)
+				}
+				other := limits.RateLimitsByLimitID["model-specific"]
+				if other.Primary == nil || other.Primary.UsedPercent != 0 ||
+					other.Primary.WindowDurationMins == nil || *other.Primary.WindowDurationMins != 300 ||
+					other.Primary.ResetsAt != nil || other.Secondary == nil {
+					t.Fatalf("other snapshot = %#v", other)
+				}
+				encoded, err := json.Marshal(limits)
+				if err != nil || strings.Contains(string(encoded), "accountId") ||
+					strings.Contains(string(encoded), "rateLimitResetCredits") {
+					t.Fatalf("public result = %s, %v", encoded, err)
+				}
+			},
+		},
+		{
+			name:   "legacy unlabelled window with unknown duration and reset",
+			result: `{"rateLimits":{"limitId":null,"primary":{"usedPercent":0,"windowDurationMins":null,"resetsAt":null}},"rateLimitsByLimitId":null}`,
+			check: func(t *testing.T, limits AccountRateLimits) {
+				window := limits.RateLimits.Primary
+				if limits.RateLimits.LimitID != "" || limits.RateLimitsByLimitID != nil ||
+					window == nil || window.UsedPercent != 0 || window.WindowDurationMins != nil || window.ResetsAt != nil {
+					t.Fatalf("limits = %#v, window = %#v", limits, window)
+				}
+			},
+		},
+		{
+			name:   "no reported windows",
+			result: `{"rateLimits":{}}`,
+			check: func(t *testing.T, limits AccountRateLimits) {
+				if limits.RateLimits.Primary != nil || limits.RateLimits.Secondary != nil || limits.RateLimitsByLimitID != nil {
+					t.Fatalf("limits = %#v", limits)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				request, err := readObject(connection)
+				if err != nil {
+					return err
+				}
+				if request["method"] != "account/rateLimits/read" || request["params"] != nil {
+					return fmt.Errorf("invalid account read request: %#v", request)
+				}
+				return writeObject(connection, map[string]any{
+					"id": request["id"], "result": json.RawMessage(test.result),
+				})
+			})
+			client := newTestClient(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			limits, err := client.ReadAccountRateLimits(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.check(t, limits)
+		})
+	}
+}
+
+func TestReadAccountRateLimitsReturnsRPCError(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "error": map[string]any{"code": -32000, "message": "usage unavailable"},
+		})
+	})
+	client := newTestClient(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.ReadAccountRateLimits(ctx); err == nil || !strings.Contains(err.Error(), "usage unavailable") {
+		t.Fatalf("read error = %v", err)
+	}
+}
+
 func TestHandshakeAndLargeThreadHistory(t *testing.T) {
 	initialized := make(chan struct{}, 1)
 	largeText := strings.Repeat("history", 8_000)

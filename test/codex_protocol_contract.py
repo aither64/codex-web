@@ -115,6 +115,7 @@ client_requests = [
         {"limit": 100, "includeHidden": False},
     ),
     request("collaborationMode/list", {}),
+    request("account/rateLimits/read", None),
     request(
         "thread/settings/update",
         {
@@ -250,6 +251,32 @@ for message in client_requests:
     validate("ClientRequest.json", message, f"client request {message['method']}")
 
 validate("ClientNotification.json", {"method": "initialized"}, "initialized notification")
+
+rate_limits = {
+    "rateLimits": {
+        "limitId": "codex",
+        "primary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1789730400},
+        "secondary": None,
+    },
+    "rateLimitsByLimitId": {
+        "codex": {
+            "primary": {"usedPercent": 42, "windowDurationMins": 10080, "resetsAt": 1789730400},
+            "secondary": {"usedPercent": 0, "windowDurationMins": 300, "resetsAt": None},
+        },
+        "model-specific": {"primary": {"usedPercent": 1}},
+    },
+}
+validate("v2/GetAccountRateLimitsResponse.json", rate_limits, "account rate limits result")
+validate(
+    "v2/GetAccountRateLimitsResponse.json",
+    {"rateLimits": {"primary": None, "secondary": None}, "rateLimitsByLimitId": None},
+    "account rate limits result without reported windows",
+)
+require_fields(
+    "v2/GetAccountRateLimitsResponse.json", rate_limits,
+    [("rateLimits",), ("rateLimits", "primary", "usedPercent")],
+    "account rate limits result",
+)
 
 server_requests = [
     request(

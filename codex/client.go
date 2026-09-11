@@ -182,6 +182,28 @@ type CollaborationMode struct {
 	Mode string `json:"mode"`
 }
 
+// AccountRateLimits contains the legacy allowance and any named allowance buckets.
+// Account identity, plan and credit details are intentionally not included.
+type AccountRateLimits struct {
+	RateLimits          RateLimitSnapshot            `json:"rateLimits"`
+	RateLimitsByLimitID map[string]RateLimitSnapshot `json:"rateLimitsByLimitId"`
+}
+
+type RateLimitSnapshot struct {
+	LimitID   string           `json:"limitId"`
+	Primary   *RateLimitWindow `json:"primary"`
+	Secondary *RateLimitWindow `json:"secondary"`
+}
+
+// RateLimitWindow describes usage over a reported duration. Primary and
+// secondary positions do not imply a particular duration. ResetsAt is Unix time
+// in seconds; nil duration or reset time means the server did not report it.
+type RateLimitWindow struct {
+	UsedPercent        int    `json:"usedPercent"`
+	WindowDurationMins *int64 `json:"windowDurationMins"`
+	ResetsAt           *int64 `json:"resetsAt"`
+}
+
 type QueueEntry struct {
 	ID                  string `json:"id"`
 	Text                string `json:"text"`
@@ -2509,6 +2531,15 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 		seenCursors[*page.NextCursor] = struct{}{}
 		cursor = *page.NextCursor
 	}
+}
+
+// ReadAccountRateLimits reads the connected account's current allowances.
+// Applications decide which buckets to display and authorize account-level
+// reads separately from the conversation handler.
+func (c *Client) ReadAccountRateLimits(ctx context.Context) (AccountRateLimits, error) {
+	var limits AccountRateLimits
+	err := c.Request(ctx, "account/rateLimits/read", nil, &limits)
+	return limits, err
 }
 
 func (c *Client) ListCollaborationModes(ctx context.Context) ([]CollaborationMode, error) {

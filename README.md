@@ -24,6 +24,15 @@ Nonblocking user-input requests stay pending by default. Set
 `ClientOptions.NonBlockingUserInput` only when the embedding application owns
 an explicit automatic-response policy.
 
+`Client.ReadAccountRateLimits(ctx)` reads current usage with
+`account/rateLimits/read`. Its typed result contains the legacy `RateLimits`
+snapshot and named `RateLimitsByLimitID` buckets, with nullable windows,
+durations and reset times. Match `WindowDurationMins` to identify a window;
+primary and secondary positions can represent different durations. `ResetsAt`
+is Unix time in seconds. The result omits account identity, plan and credit
+details. Applications authorize and expose this account-level read separately
+from the conversation handler.
+
 `github.com/aither64/codex-web/conversation` exposes those operations through
 an `http.Handler`. The application supplies a resolver that maps its opaque
 conversation ID to a trusted client, thread ID, canonical working directory and
