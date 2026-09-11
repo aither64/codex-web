@@ -8,6 +8,48 @@ const defaultLabels = {
 
 const conversationTargetIdentities = new WeakMap();
 
+function timestampFormatters({locales, timeZone} = {}) {
+  return {
+    clock: new Intl.DateTimeFormat(locales, {
+      timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }),
+    title: new Intl.DateTimeFormat(locales, {
+      timeZone, dateStyle: "full", timeStyle: "long", hourCycle: "h23",
+    }),
+    date: new Intl.DateTimeFormat(locales, {timeZone, dateStyle: "long"}),
+    key: new Intl.DateTimeFormat("en", {
+      timeZone, calendar: "gregory", numberingSystem: "latn",
+      year: "numeric", month: "2-digit", day: "2-digit",
+    }),
+  };
+}
+
+let localTimestampFormatters;
+
+// Shared by the mounted interface and applications that render their own
+// transcript. Date keys follow the displayed local calendar day, not UTC.
+export function formatTranscriptTimestamp(entry, options) {
+  const timestamp = typeof entry?.timestamp === "string" ? new Date(entry.timestamp) : null;
+  if (!timestamp || !Number.isFinite(timestamp.getTime())) {
+    return {
+      text: "Time unavailable", title: "This message has no recorded time.",
+      dateTime: "", dateKey: "", dateLabel: "", approximate: false,
+    };
+  }
+  const format = options ? timestampFormatters(options) :
+    (localTimestampFormatters ||= timestampFormatters());
+  const approximate = entry.timestampApproximate === true;
+  const day = Object.fromEntries(format.key.formatToParts(timestamp).map(({type, value}) => [type, value]));
+  return {
+    text: `${approximate ? "~" : ""}${format.clock.format(timestamp)}`,
+    title: `${format.title.format(timestamp)}${approximate ? " (approximate, based on turn timing)" : ""}`,
+    dateTime: timestamp.toISOString(),
+    dateKey: `${day.year}-${day.month}-${day.day}`,
+    dateLabel: format.date.format(timestamp),
+    approximate,
+  };
+}
+
 function createElement(name, attributes = {}, text = "") {
   const element = document.createElement(name);
   Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, value));
@@ -508,13 +550,30 @@ export function mountConversation(root, options) {
     currentThread = thread;
     applyThreadSettings();
     const entries = thread.entries || [];
-    transcript.replaceChildren(...entries.map((entry) => {
+    const elements = [];
+    let previousDate = "";
+    for (const entry of entries) {
+      const timestamp = formatTranscriptTimestamp(entry);
+      if (timestamp.dateKey && timestamp.dateKey !== previousDate) {
+        const separator = createElement("li", {class: "codex-conversation-date"});
+        separator.append(createElement("time", {datetime: timestamp.dateKey}, timestamp.dateLabel));
+        elements.push(separator);
+        previousDate = timestamp.dateKey;
+      }
       const item = createElement("li", {class: `codex-entry codex-entry-${entry.kind || "unknown"}`});
       const heading = entry.kind === "userMessage" ? "You" : entry.kind === "agentMessage" ? "Codex" : entry.kind;
-      item.append(createElement("strong", {}, heading || "Activity"));
+      const header = createElement("div", {class: "codex-entry-header"});
+      const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
+      if (timestamp.dateTime) timeAttributes.datetime = timestamp.dateTime;
+      header.append(
+        createElement("strong", {}, heading || "Activity"),
+        createElement(timestamp.dateTime ? "time" : "span", timeAttributes, timestamp.text),
+      );
+      item.append(header);
       item.append(createElement("pre", {}, entry.text || entry.summary || entry.details || ""));
-      return item;
-    }));
+      elements.push(item);
+    }
+    transcript.replaceChildren(...elements);
     if (capabilities.send) await sender.acknowledge(entries);
     const active = thread.status === "active";
     status.textContent = active ? "Working" : labels.idle;

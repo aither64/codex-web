@@ -365,6 +365,36 @@ validate(
     "thread queue notification",
 )
 
+for method, definition, timestamp_field, timestamp in [
+    ("item/started", "ItemStartedNotification", "startedAtMs", 1789120800123),
+    ("item/completed", "ItemCompletedNotification", "completedAtMs", 1789120830000),
+]:
+    message = {
+        "method": method,
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {"id": "item-agent", "type": "agentMessage", "text": "response"},
+            timestamp_field: timestamp,
+        },
+    }
+    label = f"{method} timestamp notification"
+    validate("ServerNotification.json", message, label)
+    require_fields(
+        "ServerNotification.json",
+        message,
+        [
+            ["params"],
+            ["params", "threadId"],
+            ["params", "turnId"],
+            ["params", "item"],
+            ["params", "item", "id"],
+            ["params", timestamp_field],
+        ],
+        label,
+    )
+    require_declared_property("ServerNotification.json", definition, timestamp_field, label)
+
 for decision in ("accept", "acceptForSession", "decline", "cancel"):
     validate(
         "CommandExecutionRequestApprovalResponse.json",

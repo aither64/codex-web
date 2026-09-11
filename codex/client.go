@@ -1,7 +1,6 @@
 package codex
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -126,6 +125,8 @@ type TranscriptEntry struct {
 	Text                    string `json:"text,omitempty"`
 	HTML                    string `json:"html,omitempty"`
 	Details                 string `json:"details,omitempty"`
+	Timestamp               string `json:"timestamp,omitempty"`
+	TimestampApproximate    bool   `json:"timestampApproximate,omitempty"`
 }
 
 type SendReceipt struct {
@@ -389,6 +390,7 @@ type Client struct {
 	watched           map[string]int
 	watchedGeneration map[string]uint64
 	watchLocks        map[string]*sync.Mutex
+	liveItemTimes     map[string]*liveTurnTimestamps // protected by watchedMu
 }
 
 type ClientInfo struct {
@@ -460,6 +462,7 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		requests: make(map[string]PendingRequest), notices: make(map[string][]Prompt),
 		subscribers: make(map[chan struct{}]string), watched: make(map[string]int),
 		watchedGeneration: make(map[string]uint64), watchLocks: make(map[string]*sync.Mutex),
+		liveItemTimes:  make(map[string]*liveTurnTimestamps),
 		threadSettings: make(map[string]cachedThreadSettings), settingsChanged: make(chan struct{}),
 		settingsUpdates: make(map[string]*sync.Mutex),
 		queueUpdates:    make(map[string]*sync.Mutex), queueAttempts: make(map[string]map[string]string),
@@ -665,6 +668,9 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 		}
 		if message.Method == "thread/settings/updated" {
 			c.handleThreadSettingsUpdated(message.Params, generation)
+		}
+		if message.Method == "item/started" || message.Method == "item/completed" {
+			c.observeItemTimestamp(message.Method, message.Params)
 		}
 		if message.Method != "" {
 			c.broadcast(threadIDFromParams(message.Params))
@@ -909,6 +915,7 @@ func (c *Client) removeWatch(threadID string) {
 	if c.watched[threadID] <= 1 {
 		delete(c.watched, threadID)
 		delete(c.watchedGeneration, threadID)
+		delete(c.liveItemTimes, threadID)
 		removed = true
 	} else {
 		c.watched[threadID]--
@@ -2644,85 +2651,6 @@ func (c *Client) refreshThreadSettings(ctx context.Context, threadID string) (ca
 	return cachedThreadSettings{}, errors.New("Codex thread settings did not stabilize while being read")
 }
 
-func collaborationModeFromRollout(path string) (string, error) {
-	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return "", errors.New("thread/read returned an invalid rollout path")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open Codex thread rollout: %w", err)
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return "", fmt.Errorf("inspect Codex thread rollout: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", errors.New("Codex thread rollout is not a regular file")
-	}
-	offset := int64(0)
-	if info.Size() > readLimit {
-		offset = info.Size() - readLimit
-		if _, err := file.Seek(offset, io.SeekStart); err != nil {
-			return "", fmt.Errorf("seek Codex thread rollout: %w", err)
-		}
-	}
-	reader := bufio.NewReader(file)
-	if offset > 0 {
-		for {
-			_, err := reader.ReadSlice('\n')
-			if err == nil {
-				break
-			}
-			if errors.Is(err, bufio.ErrBufferFull) {
-				continue
-			}
-			if errors.Is(err, io.EOF) {
-				return "", errors.New("Codex thread rollout tail has no complete record")
-			}
-			return "", fmt.Errorf("read Codex thread rollout tail: %w", err)
-		}
-	}
-	mode := ""
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), readLimit)
-	for scanner.Scan() {
-		var entry struct {
-			Type    string `json:"type"`
-			Payload struct {
-				Type              string `json:"type"`
-				CollaborationMode struct {
-					Mode string `json:"mode"`
-				} `json:"collaboration_mode"`
-				ThreadSettings struct {
-					CollaborationMode struct {
-						Mode string `json:"mode"`
-					} `json:"collaboration_mode"`
-				} `json:"thread_settings"`
-			} `json:"payload"`
-		}
-		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
-			continue
-		}
-		candidate := ""
-		if entry.Type == "turn_context" {
-			candidate = entry.Payload.CollaborationMode.Mode
-		} else if entry.Type == "event_msg" && entry.Payload.Type == "thread_settings_applied" {
-			candidate = entry.Payload.ThreadSettings.CollaborationMode.Mode
-		}
-		if candidate != "" && len(candidate) <= 1024 {
-			mode = candidate
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("scan Codex thread rollout: %w", err)
-	}
-	if mode == "" {
-		return "", errors.New("Codex thread rollout has no collaboration mode")
-	}
-	return mode, nil
-}
-
 func (c *Client) settingsUpdateLock(threadID string) *sync.Mutex {
 	c.settingsUpdateMu.Lock()
 	defer c.settingsUpdateMu.Unlock()
@@ -2877,17 +2805,8 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 		CollaborationMode: "default",
 		Entries:           make([]TranscriptEntry, 0),
 	}
-	modeFromRollout := false
-	if path := stringValue(metadata.Thread["path"]); path != "" {
-		if mode, err := collaborationModeFromRollout(path); err == nil {
-			transcript.CollaborationMode = mode
-			modeFromRollout = true
-		}
-	}
-	if !modeFromRollout {
-		if settings, _, ok := c.cachedSettings(threadID); ok {
-			transcript.CollaborationMode = settings.settings.CollaborationMode
-		}
+	if settings, _, ok := c.cachedSettings(threadID); ok {
+		transcript.CollaborationMode = settings.settings.CollaborationMode
 	}
 	var page struct {
 		Data *[]map[string]any `json:"data"`
@@ -2907,6 +2826,17 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 	for _, turn := range *page.Data {
 		transcript.Entries = append(transcript.Entries, transcriptEntries(turn)...)
 	}
+	wanted := make(map[transcriptItemKey]bool, len(transcript.Entries))
+	for _, entry := range transcript.Entries {
+		if entry.ItemID != "" {
+			wanted[transcriptItemKey{entry.TurnID, entry.ItemID}] = true
+		}
+	}
+	rollout, err := readRolloutMetadata(stringValue(metadata.Thread["path"]), wanted)
+	if err == nil && rollout.mode != "" {
+		transcript.CollaborationMode = rollout.mode
+	}
+	c.applyTranscriptTimestamps(threadID, transcript.Entries, rollout.itemTimes)
 	return transcript, nil
 }
 
@@ -3084,6 +3014,7 @@ func transcriptEntries(turn map[string]any) []TranscriptEntry {
 	} else if status := statusValue(turn["status"]); status == "failed" || status == "error" {
 		entries = append(entries, TranscriptEntry{TurnID: turnID, Kind: "error", Summary: "Turn " + status})
 	}
+	applyTurnTimestamps(entries, turn)
 	return entries
 }
 

@@ -27,9 +27,34 @@ class MemoryStorage {
 (async () => {
   const {
     createConversationClient, createDurableAttemptStore, createDurableSender, mountConversation,
+    formatTranscriptTimestamp,
   } = await import(
     "../conversation/assets/conversation.js"
   );
+  const timestampOptions = {locales: "en-GB", timeZone: "Europe/Amsterdam"};
+  const evening = formatTranscriptTimestamp({timestamp: "2026-09-11T21:59:00Z"}, timestampOptions);
+  assert.equal(evening.text, "23:59");
+  assert.equal(evening.dateKey, "2026-09-11");
+  assert.equal(evening.dateLabel, "11 September 2026");
+  assert.equal(evening.dateTime, "2026-09-11T21:59:00.000Z");
+  assert.match(evening.title, /23:59:00/);
+  assert.equal(evening.approximate, false);
+  const midnight = formatTranscriptTimestamp({
+    timestamp: "2026-09-11T22:00:00Z", timestampApproximate: true,
+  }, timestampOptions);
+  assert.equal(midnight.text, "~00:00");
+  assert.equal(midnight.dateKey, "2026-09-12");
+  assert.equal(midnight.approximate, true);
+  assert.match(midnight.title, /approximate, based on turn timing/);
+  const winter = formatTranscriptTimestamp({timestamp: "2026-12-31T23:00:00Z"}, timestampOptions);
+  assert.equal(winter.text, "00:00");
+  assert.equal(winter.dateKey, "2027-01-01");
+  for (const timestamp of [undefined, null, "", "not a date"]) {
+    assert.deepEqual(formatTranscriptTimestamp({timestamp}, timestampOptions), {
+      text: "Time unavailable", title: "This message has no recorded time.",
+      dateTime: "", dateKey: "", dateLabel: "", approximate: false,
+    });
+  }
   const requests = [];
   const fetchRequest = async (path, options = {}) => {
     requests.push({path, options});
@@ -485,7 +510,12 @@ class MemoryStorage {
     async thread() {
       mountedCalls.push("thread");
       return {
-        entries: [], status: "idle", model: "model-b", reasoningEffort: "xhigh",
+        entries: [
+          {kind: "userMessage", text: "First", timestamp: "2026-09-10T12:00:00Z"},
+          {kind: "agentMessage", text: "Second", timestamp: "2026-09-11T12:00:00Z", timestampApproximate: true},
+          {kind: "agentMessage", text: "Unknown time"},
+          {kind: "commandExecution", summary: "Activity", timestamp: "2026-09-11T12:01:00Z"},
+        ], status: "idle", model: "model-b", reasoningEffort: "xhigh",
         collaborationMode: "plan",
       };
     },
@@ -519,6 +549,14 @@ class MemoryStorage {
   assert.equal(findControl("Reasoning effort").value, "xhigh");
   assert.equal(findControl("Collaboration mode").value, "plan");
   assert.deepEqual(mountedCalls.sort(), ["models", "modes", "thread"]);
+  const mountedTimes = root.descendants().filter((element) => element.attributes.class === "codex-entry-time");
+  assert.equal(mountedTimes.length, 4);
+  assert.equal(mountedTimes[0].name, "time");
+  assert.equal(mountedTimes[0].attributes.datetime, "2026-09-10T12:00:00.000Z");
+  assert.match(mountedTimes[1].textContent, /^~/);
+  assert.equal(mountedTimes[2].name, "span");
+  assert.equal(mountedTimes[2].textContent, "Time unavailable");
+  assert.equal(root.descendants().filter((element) => element.attributes.class === "codex-conversation-date").length, 2);
   unmount();
 
   const promptRoot = new FakeElement("main");

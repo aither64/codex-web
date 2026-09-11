@@ -42,6 +42,13 @@ verify that the
 trusted thread is still bound to the trusted working directory before it
 performs any operation.
 
+Transcript entries can include `timestamp` (RFC3339) and
+`timestampApproximate`. Item lifecycle times come from live events and the
+bounded local rollout tail, preferring the item start over its completion or
+record time. When an item has no available time, a known turn
+time is marked approximate; otherwise the timestamp is omitted. This display
+metadata does not change stored conversations or require a migration.
+
 The handler also serves `assets/conversation.js`. Import
 `createConversationClient()` for the HTTP API, `createDurableSender()` for
 response-loss-safe message delivery, or `mountConversation()` for the complete
@@ -55,6 +62,14 @@ same target can pass the same application-owned `durableNamespace`. A send
 receipt is cleared only after the matching message is visible in the transcript
 and acknowledged by the server. Pass an explicit `capabilities` object when
 mounting a restricted interface.
+
+`formatTranscriptTimestamp(entry)` supplies the mounted interface's local clock
+label, full timestamp tooltip and local calendar date for custom renderers.
+It returns `text`, `title`, `dateTime`, `dateKey`, `dateLabel` and `approximate`.
+Use nonempty `dateKey` changes to insert date separators without changing entry
+order. Missing times return `Time unavailable` and empty date fields.
+An optional second argument accepts `locales` and `timeZone`; the default is
+the browser's locale and time zone, with a 24-hour clock.
 
 The client returned by `createConversationClient()` carries its effective
 endpoint identity into `createDurableSender()` and `mountConversation()`. A
