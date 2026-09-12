@@ -181,11 +181,17 @@ the browser's locale and time zone, with a 24-hour clock.
 file paths and patches, or other activity summaries and details. It reads the
 entry's source fields, including loaded content hidden by a custom renderer.
 `createTranscriptCopyButton(entry)` returns a native button using that helper
-and the Clipboard API. The button shows `Copied` or `Copy failed` briefly and
+and the Clipboard API. Its copy icon changes briefly to a check or error icon;
+accessible labels and tooltips report `Copied` or `Copy failed`. It
 has the `codex-entry-copy` class and `data-copy-state` (`idle`, `copied` or
 `error`) for styling. Create it with the current entry whenever the transcript
 updates. The mounted interface places this button and the timestamp in a
 bottom-right footer on every entry.
+
+`createCopyButton({text, getText, label})` supplies the same control for other
+content. Pass a string or callback as `text`, or a `getText` callback evaluated
+on click. `getText` takes precedence. Set `label` to describe what is copied;
+it defaults to `Copy`. The shared control uses the `codex-copy-button` class.
 
 The client returned by `createConversationClient()` carries its effective
 endpoint identity into `createDurableSender()` and `mountConversation()`. A

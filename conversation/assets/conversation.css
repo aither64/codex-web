@@ -26,7 +26,14 @@
   margin-top: 0.5rem;
 }
 
-.codex-entry-copy {
+.codex-copy-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
   border: 1px solid transparent;
   border-radius: 0.25rem;
   padding: 0.2rem 0.35rem;
@@ -38,10 +45,24 @@
   opacity: 0.75;
 }
 
-.codex-entry-copy:hover,
-.codex-entry-copy:focus-visible {
+.codex-copy-button:hover,
+.codex-copy-button:focus-visible {
   border-color: currentColor;
   opacity: 1;
+}
+
+.codex-copy-button svg { display: block; }
+.codex-copy-button[data-copy-state="copied"] { color: #3fb950; }
+.codex-copy-button[data-copy-state="error"] { color: #f85149; }
+.codex-copy-feedback {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .codex-entry-time {

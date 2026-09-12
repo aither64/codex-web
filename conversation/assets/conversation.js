@@ -141,37 +141,61 @@ export function transcriptEntryCopyText(entry) {
   return [summary, text, details].filter(Boolean).join("\n\n");
 }
 
-export function createTranscriptCopyButton(entry) {
-  const label = ["userMessage", "agentMessage"].includes(entry?.kind) ? "Copy message" : "Copy activity";
+// Text callbacks are read on click so streamed messages and changing links copy
+// their current value. Icons use SVG elements and inherit the surrounding color.
+export function createCopyButton({text = "", getText, label = "Copy"} = {}) {
   const button = createElement("button", {
-    type: "button", class: "codex-entry-copy", title: label,
-    "aria-label": label, "aria-live": "polite", "data-copy-state": "idle",
-  }, "Copy");
+    type: "button", class: "codex-copy-button", title: label,
+    "aria-label": label, "data-copy-state": "idle",
+  });
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  for (const [name, value] of Object.entries({
+    viewBox: "0 0 16 16", width: "16", height: "16", fill: "none",
+    stroke: "currentColor", "stroke-width": "1.4", "stroke-linecap": "round",
+    "stroke-linejoin": "round", "aria-hidden": "true", focusable: "false",
+  })) icon.setAttribute(name, value);
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  icon.append(path);
+  const feedback = createElement("span", {
+    class: "codex-copy-feedback", role: "status", "aria-live": "polite",
+  });
+  button.append(icon, feedback);
+  const paths = {
+    idle: "M6 5V2.5h7.5V10H11 M2.5 6H10v7.5H2.5Z",
+    copied: "m3 8 3 3 7-7",
+    error: "M8 2 1 14h14L8 2Zm0 4v4m0 2v.1",
+  };
+  const setState = (state) => {
+    const status = state === "copied" ? "Copied" : state === "error" ? "Copy failed. Try again." : "";
+    path.setAttribute("d", paths[state]);
+    feedback.textContent = status;
+    button.setAttribute("aria-label", status || label);
+    button.setAttribute("title", status || label);
+    button.setAttribute("data-copy-state", state);
+  };
+  setState("idle");
   let feedbackTimer;
   button.addEventListener("click", async () => {
     clearTimeout(feedbackTimer);
     button.disabled = true;
     try {
-      await globalThis.navigator.clipboard.writeText(transcriptEntryCopyText(entry));
-      button.textContent = "Copied";
-      button.setAttribute("aria-label", "Copied");
-      button.setAttribute("title", "Copied");
-      button.setAttribute("data-copy-state", "copied");
+      const value = typeof getText === "function" ? getText() : typeof text === "function" ? text() : text;
+      await globalThis.navigator.clipboard.writeText(value);
+      setState("copied");
     } catch (_error) {
-      button.textContent = "Copy failed";
-      button.setAttribute("aria-label", "Copy failed. Try again.");
-      button.setAttribute("title", "Copy failed. Try again.");
-      button.setAttribute("data-copy-state", "error");
+      setState("error");
     } finally {
       button.disabled = false;
-      feedbackTimer = setTimeout(() => {
-        button.textContent = "Copy";
-        button.setAttribute("aria-label", label);
-        button.setAttribute("title", label);
-        button.setAttribute("data-copy-state", "idle");
-      }, 2000);
+      feedbackTimer = setTimeout(() => setState("idle"), 2000);
     }
   });
+  return button;
+}
+
+export function createTranscriptCopyButton(entry) {
+  const label = ["userMessage", "agentMessage"].includes(entry?.kind) ? "Copy message" : "Copy activity";
+  const button = createCopyButton({getText: () => transcriptEntryCopyText(entry), label});
+  button.setAttribute("class", "codex-copy-button codex-entry-copy");
   return button;
 }
 

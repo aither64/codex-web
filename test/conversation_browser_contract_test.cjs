@@ -27,7 +27,7 @@ class MemoryStorage {
 (async () => {
   const {
     createConversationClient, createDurableAttemptStore, createDurableSender, mountConversation,
-    formatTranscriptTimestamp, transcriptEntryCopyText, createTranscriptCopyButton,
+    formatTranscriptTimestamp, transcriptEntryCopyText, createTranscriptCopyButton, createCopyButton,
     createTranscriptActivity,
   } = await import(
     "../conversation/assets/conversation.js"
@@ -534,7 +534,10 @@ class MemoryStorage {
     descendants() { return [this, ...this.children.flatMap((child) => child.descendants())]; }
   }
   globalThis.Element = FakeElement;
-  globalThis.document = {createElement: (name) => new FakeElement(name)};
+  globalThis.document = {
+    createElement: (name) => new FakeElement(name),
+    createElementNS: (_namespace, name) => new FakeElement(name),
+  };
   const typedSearch = createTranscriptActivity({
     kind: "webSearch", summary: "Web search", details: "fallback raw details",
     activity: {queries: ["literal <search>"], links: [
@@ -565,7 +568,9 @@ class MemoryStorage {
   assert.equal(copyButton.name, "button");
   assert.equal(copyButton.attributes.type, "button");
   assert.equal(copyButton.attributes["aria-label"], "Copy message");
-  assert.equal(copyButton.textContent, "Copy");
+  assert.equal(copyButton.children[0].name, "svg");
+  assert.equal(copyButton.children[0].attributes["aria-hidden"], "true");
+  assert.equal(copyButton.children[1].textContent, "");
   const scheduledFeedback = [];
   const savedSetTimeout = globalThis.setTimeout;
   const savedClearTimeout = globalThis.clearTimeout;
@@ -578,23 +583,37 @@ class MemoryStorage {
   try {
     await copyButton.listeners.get("click")();
     assert.deepEqual(copied, ["First streamed text"]);
-    assert.equal(copyButton.textContent, "Copied");
+    assert.equal(copyButton.children[1].textContent, "Copied");
+    assert.equal(copyButton.children[0].children[0].attributes.d, "m3 8 3 3 7-7");
     assert.equal(copyButton.attributes["data-copy-state"], "copied");
     scheduledFeedback.pop()();
-    assert.equal(copyButton.textContent, "Copy");
+    assert.equal(copyButton.children[1].textContent, "");
     assert.equal(copyButton.attributes["aria-label"], "Copy message");
     streamingEntry.text += " with the latest chunk";
     await copyButton.listeners.get("click")();
     assert.equal(copied[1], "First streamed text with the latest chunk");
+    const hash = "a".repeat(40);
+    const hashButton = createCopyButton({text: hash, label: "Copy commit hash"});
+    await hashButton.listeners.get("click")();
+    assert.equal(copied.at(-1), hash);
+    assert.equal(hashButton.children[1].attributes.role, "status");
+    let address = "https://example.test/first";
+    const linkButton = createCopyButton({text: () => address, label: "Copy comparison link"});
+    address = "https://example.test/updated#new-L42";
+    await linkButton.listeners.get("click")();
+    assert.equal(copied.at(-1), address);
+    const getterButton = createCopyButton({text: "ignored", getText: () => "getter"});
+    await getterButton.listeners.get("click")();
+    assert.equal(copied.at(-1), "getter");
     clipboard.writeText = async () => { throw new Error("permission denied"); };
     await copyButton.listeners.get("click")();
-    assert.equal(copyButton.textContent, "Copy failed");
+    assert.equal(copyButton.children[1].textContent, "Copy failed. Try again.");
     assert.equal(copyButton.attributes["data-copy-state"], "error");
     assert.equal(copyButton.attributes.title, "Copy failed. Try again.");
     assert.equal(copyButton.disabled, false);
     delete globalThis.navigator.clipboard;
     await copyButton.listeners.get("click")();
-    assert.equal(copyButton.textContent, "Copy failed");
+    assert.equal(copyButton.children[1].textContent, "Copy failed. Try again.");
     scheduledFeedback.pop()();
     assert.equal(copyButton.attributes["data-copy-state"], "idle");
   } finally {
@@ -655,7 +674,7 @@ class MemoryStorage {
   const mountedFooters = root.descendants().filter((element) => element.attributes.class === "codex-entry-footer");
   assert.equal(mountedFooters.length, 4);
   mountedFooters.forEach((footer, index) => {
-    assert.equal(footer.children[0].attributes.class, "codex-entry-copy");
+    assert.equal(footer.children[0].attributes.class, "codex-copy-button codex-entry-copy");
     assert.equal(footer.children[1], mountedTimes[index]);
     const item = root.descendants().find((element) => element.children.includes(footer));
     assert.equal(item.children.at(-1), footer);
