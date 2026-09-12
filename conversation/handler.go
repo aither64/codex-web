@@ -545,6 +545,18 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 			handler.rejectOperation(response, request)
 			return
 		}
+		if client, ok := target.Client.(QueueDeletionCompleter); ok {
+			complete := func(id string) error {
+				if target.Attachments != nil {
+					return target.Attachments.QueueDeleted(request.Context(), id)
+				}
+				return nil
+			}
+			if err := client.ReconcileQueueDeletionsWithCompletion(request.Context(), target.ThreadID, complete); err != nil {
+				handler.serverError(response, request, err)
+				return
+			}
+		}
 		entries, err := target.Client.ListQueue(request.Context(), target.ThreadID)
 		if err != nil {
 			handler.serverError(response, request, err)
@@ -614,16 +626,23 @@ func (handler *Handler) deleteQueue(
 		writeError(response, http.StatusBadRequest, "queued message ID is invalid")
 		return
 	}
-	if err := target.Client.DeleteQueueEntry(request.Context(), target.ThreadID, decoded); err != nil {
+	if target.Attachments != nil {
+		client, ok := target.Client.(QueueDeletionCompleter)
+		if !ok {
+			writeError(response, http.StatusServiceUnavailable, "Attachment deletion recovery is unavailable")
+			return
+		}
+		err = client.DeleteQueueEntryWithCompletion(request.Context(), target.ThreadID, decoded, func() error {
+			return target.Attachments.QueueDeleted(request.Context(), decoded)
+		})
+	} else {
+		err = target.Client.DeleteQueueEntry(request.Context(), target.ThreadID, decoded)
+	}
+	if err != nil {
 		handler.serverError(response, request, err)
 		return
 	}
-	if target.Attachments != nil {
-		if err := target.Attachments.QueueDeleted(request.Context(), decoded); err != nil {
-			uploadError(response, err)
-			return
-		}
-	}
+
 	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
 }
 

@@ -2,6 +2,7 @@ package conversation
 
 import (
 	"context"
+	"errors"
 	"github.com/aither64/codex-web/codex"
 	"io"
 	"net/http"
@@ -143,5 +144,66 @@ func TestAttachmentOnlyMessageUsesProviderBeforeSubmission(t *testing.T) {
 		if operation == "queue" && !provider.queued {
 			t.Fatal("accepted queue was not associated before acknowledgement")
 		}
+	}
+}
+
+type completingQueueClient struct {
+	*fakeClient
+	pending bool
+}
+
+func (client *completingQueueClient) DeleteQueueEntryWithCompletion(ctx context.Context, thread, id string, complete func() error) error {
+	client.pending = true
+	if err := complete(); err != nil {
+		return err
+	}
+	client.pending = false
+	return nil
+}
+func (client *completingQueueClient) ReconcileQueueDeletionsWithCompletion(ctx context.Context, thread string, complete func(string) error) error {
+	if client.pending {
+		if err := complete("queued-1"); err != nil {
+			return err
+		}
+		client.pending = false
+	}
+	return nil
+}
+
+type failingQueueProvider struct {
+	attachmentFixture
+	fail    bool
+	deleted int
+}
+
+func (provider *failingQueueProvider) QueueDeleted(context.Context, string) error {
+	if provider.fail {
+		return errors.New("catalog unavailable")
+	}
+	provider.deleted++
+	return nil
+}
+func TestAttachmentQueueDeletionRecoversOnRefresh(t *testing.T) {
+	client := &completingQueueClient{fakeClient: &fakeClient{}}
+	provider := &failingQueueProvider{fail: true}
+	handler, err := NewHandler(Options{BasePath: "/codex", AllowedOrigins: []string{"https://portal.test"}, Resolver: ResolverFunc(func(context.Context, ResolveRequest) (Target, error) {
+		return Target{Client: client, Attachments: provider, ThreadID: "trusted", Directory: "/workspace", MutationLock: NewMutationLock(), Capabilities: Capabilities{Queue: true, QueueRead: true}}, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "/codex/conversations/opaque/queue"+path, nil)
+		req.Header.Set("Origin", "https://portal.test")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	if response := call("DELETE", "/queued-1"); response.Code != 503 || !client.pending {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	provider.fail = false
+	if response := call("GET", ""); response.Code != 200 || client.pending || provider.deleted != 1 {
+		t.Fatal(response.Code, response.Body.String())
 	}
 }

@@ -2243,20 +2243,12 @@ func (c *Client) clearQueueDeletionAndAttempt(
 }
 
 func (c *Client) RequireSubmissionAttemptsResolved(ctx context.Context, threadID string) error {
-	deletionIDs, err := queueLedgerTransaction(c, func() ([]string, error) {
-		ids := make([]string, 0, len(c.queueDeletions[threadID]))
-		for queuedSubmissionID := range c.queueDeletions[threadID] {
-			ids = append(ids, queuedSubmissionID)
-		}
-		return ids, nil
-	})
+	deletionCount, err := queueLedgerTransaction(c, func() (int, error) { return len(c.queueDeletions[threadID]), nil })
 	if err != nil {
 		return err
 	}
-	for _, queuedSubmissionID := range deletionIDs {
-		if err := c.DeleteQueueEntry(ctx, threadID, queuedSubmissionID); err != nil {
-			return fmt.Errorf("reconcile queued message deletion: %w", err)
-		}
+	if deletionCount != 0 {
+		return fmt.Errorf("Codex thread %s has %d unresolved queue deletion(s); reopen its queue and retry deletion", threadID, deletionCount)
 	}
 
 	type resolutionSnapshot struct {
@@ -3509,6 +3501,12 @@ func (c *Client) waitForSentByClientID(
 }
 
 func (c *Client) DeleteQueueEntry(ctx context.Context, threadID, id string) error {
+	return c.DeleteQueueEntryWithCompletion(ctx, threadID, id, nil)
+}
+
+// DeleteQueueEntryWithCompletion retains the existing deletion intent until the
+// application durably records completion. The callback must be idempotent.
+func (c *Client) DeleteQueueEntryWithCompletion(ctx context.Context, threadID, id string, complete func() error) error {
 	updateLock := c.queueUpdateLock(threadID)
 	updateLock.Lock()
 	defer updateLock.Unlock()
@@ -3530,7 +3528,7 @@ func (c *Client) DeleteQueueEntry(ctx context.Context, threadID, id string) erro
 	}
 	if target == nil {
 		if attempted {
-			return c.finishAbsentQueueDeletion(ctx, threadID, id, attempt)
+			return c.finishAbsentQueueDeletion(ctx, threadID, id, attempt, complete)
 		}
 		return errors.New("queued message was not found")
 	}
@@ -3559,7 +3557,7 @@ func (c *Client) DeleteQueueEntry(ctx context.Context, threadID, id string) erro
 	}, &response); err != nil {
 		entries, reconcileErr := c.ListQueue(ctx, threadID)
 		if reconcileErr == nil && !queueContainsSubmission(entries, id) {
-			return c.finishAbsentQueueDeletion(ctx, threadID, id, attempt)
+			return c.finishAbsentQueueDeletion(ctx, threadID, id, attempt, complete)
 		}
 		return err
 	}
@@ -3571,9 +3569,52 @@ func (c *Client) DeleteQueueEntry(ctx context.Context, threadID, id string) erro
 		if queueContainsSubmission(entries, id) {
 			return errors.New("queued message deletion was not accepted")
 		}
-		return c.finishAbsentQueueDeletion(ctx, threadID, id, attempt)
+		return c.finishAbsentQueueDeletion(ctx, threadID, id, attempt, complete)
+	}
+	if complete != nil {
+		if err := complete(); err != nil {
+			return err
+		}
 	}
 	return c.clearQueueDeletionAndAttempt(threadID, id, attempt.ClientUserMessageID)
+}
+
+// ReconcileQueueDeletionsWithCompletion finishes only recorded deletions whose
+// queue entry is already absent. It never deletes a still-present queue entry,
+// so an application can call it while refreshing a readable queue.
+func (c *Client) ReconcileQueueDeletionsWithCompletion(ctx context.Context, threadID string, complete func(string) error) error {
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
+	attempts, err := queueLedgerTransaction(c, func() (map[string]queueDeletionAttempt, error) {
+		result := make(map[string]queueDeletionAttempt)
+		for id, attempt := range c.queueDeletions[threadID] {
+			result[id] = attempt
+		}
+		return result, nil
+	})
+	if err != nil || len(attempts) == 0 {
+		return err
+	}
+	entries, err := c.ListQueue(ctx, threadID)
+	if err != nil {
+		return err
+	}
+	for id, attempt := range attempts {
+		if queueContainsSubmission(entries, id) {
+			continue
+		}
+		callback := func() error {
+			if complete != nil {
+				return complete(id)
+			}
+			return nil
+		}
+		if err := c.finishAbsentQueueDeletion(ctx, threadID, id, attempt, callback); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func queueContainsSubmission(entries []QueueEntry, queuedSubmissionID string) bool {
@@ -3586,11 +3627,16 @@ func queueContainsSubmission(entries []QueueEntry, queuedSubmissionID string) bo
 }
 
 func (c *Client) finishAbsentQueueDeletion(
-	ctx context.Context, threadID, queuedSubmissionID string, attempt queueDeletionAttempt,
+	ctx context.Context, threadID, queuedSubmissionID string, attempt queueDeletionAttempt, complete func() error,
 ) error {
 	started, err := c.queueDeletionWasStarted(ctx, threadID, attempt)
 	if err != nil {
 		return err
+	}
+	if !started && complete != nil {
+		if err := complete(); err != nil {
+			return err
+		}
 	}
 	if err := c.clearQueueDeletionAndAttempt(
 		threadID, queuedSubmissionID, attempt.ClientUserMessageID,

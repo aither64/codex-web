@@ -222,6 +222,14 @@ Queue, then decorates transcript and queue entries with `displayText` and
 `attachments`. It must preserve the original `text` and submission digest.
 Applications own storage, authorization, retention and safe deletion.
 
+Attachment-aware queue deletion also requires `QueueDeletionCompleter`, which
+`codex.Client` implements. Its completion callback updates the provider before
+forgetting the durable deletion attempt. Queue refresh finishes recorded
+cancellations whose entries are already absent; it never deletes a remaining
+entry. Failed completion can therefore recover after a reload or restart.
+`RequireSubmissionAttemptsResolved` reports pending deletions without changing
+them. Retry a remaining deletion through its owning queue surface.
+
 `NewUploadHandler` serves an application's `UploadStore` beneath an exact
 HTTPS origin and base path. It supports file creation, offset and SHA-256 checked
 chunks, completion, deletion and download. Each request resolves its scope

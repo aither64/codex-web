@@ -4406,3 +4406,116 @@ func waitFor(t *testing.T, condition func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+func TestQueueDeletionCompletionSurvivesRestart(t *testing.T) {
+	for _, failure := range []string{"provider", "ledger", "started"} {
+		t.Run(failure, func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var deleted atomic.Bool
+			var started atomic.Bool
+			var deletes atomic.Int32
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				connection, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer connection.Close(websocket.StatusNormalClosure, "")
+				if err := handshake(connection); err != nil {
+					return
+				}
+				for {
+					request, err := readObject(connection)
+					if err != nil {
+						return
+					}
+					result := map[string]any{"data": []any{}, "nextCursor": nil}
+					switch request["method"] {
+					case "thread/queue/list":
+						if !deleted.Load() {
+							result["data"] = []any{map[string]any{"id": "queued-1", "clientUserMessageId": "client-1", "input": []any{map[string]any{"type": "text", "text": "queued text"}}}}
+						}
+					case "thread/queue/delete":
+						deleted.Store(true)
+						deletes.Add(1)
+						result = map[string]any{"deleted": true}
+					case "thread/items/list":
+						if started.Load() {
+							result["data"] = []any{map[string]any{"turnId": "turn-1", "item": map[string]any{"id": "user-1", "type": "userMessage", "clientId": "client-1", "content": []any{map[string]any{"type": "text", "text": "queued text"}}}}}
+						}
+					default:
+						t.Errorf("unexpected request: %v", request["method"])
+						return
+					}
+					if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+						return
+					}
+				}
+			})}
+			go server.Serve(listener)
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			first := newTestClient(socket)
+			if err := first.recordQueueAttempt("thread-1", "client-1", "queued text"); err != nil {
+				t.Fatal(err)
+			}
+			err = first.DeleteQueueEntryWithCompletion(ctx, "thread-1", "queued-1", func() error {
+				if failure == "ledger" {
+					if err := os.Rename(first.queueLedgerPath, first.queueLedgerPath+".saved"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(first.queueLedgerPath, 0700); err != nil {
+						t.Fatal(err)
+					}
+					return nil
+				}
+				return errors.New("catalog persistence failed")
+			})
+			if err == nil {
+				t.Fatal("completion failure was hidden")
+			}
+			if failure == "ledger" {
+				if err := os.Remove(first.queueLedgerPath); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(first.queueLedgerPath+".saved", first.queueLedgerPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := first.RequireSubmissionAttemptsResolved(ctx, "thread-1"); err == nil {
+				t.Fatal("lifecycle check forgot unfinished deletion")
+			}
+			first.Close()
+			second := newTestClient(socket)
+			defer second.Close()
+			if failure == "started" {
+				started.Store(true)
+			}
+			completed := 0
+			err = second.ReconcileQueueDeletionsWithCompletion(ctx, "thread-1", func(id string) error {
+				if id != "queued-1" {
+					t.Fatal(id)
+				}
+				completed++
+				return nil
+			})
+			if failure == "started" {
+				if err == nil || !strings.Contains(err.Error(), "was started") || completed != 0 {
+					t.Fatal("started message was cancelled", err, completed)
+				}
+			} else if err != nil || completed != 1 {
+				t.Fatal("deletion did not recover", err, completed)
+			}
+			if deletes.Load() != 1 {
+				t.Fatal("refresh mutated App Server queue", deletes.Load())
+			}
+			if _, attempted, err := second.queueDeletionAttempt("thread-1", "queued-1"); err != nil || attempted {
+				t.Fatal("completed deletion retained intent", err)
+			}
+		})
+	}
+}
