@@ -58,6 +58,13 @@ record time. When an item has no available time, a known turn
 time is marked approximate; otherwise the timestamp is omitted. This display
 metadata does not change stored conversations or require a migration.
 
+Search, agent tool calls and agent lifecycle entries also include typed
+`activity` data. Their existing `summary` and `details` fields remain available
+for other renderers and future protocol fields. `createTranscriptActivity(entry)`
+returns the shared DOM body for these entries, or `null` for a generic fallback.
+Search links allow HTTP and HTTPS without credentials. Agent identities appear
+as text; an event does not authorize access to a child conversation.
+
 The handler also serves `assets/conversation.js`. Import
 `createConversationClient()` for the HTTP API, `createDurableSender()` for
 response-loss-safe message delivery, or `mountConversation()` for the complete

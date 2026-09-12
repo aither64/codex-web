@@ -57,6 +57,65 @@ function createElement(name, attributes = {}, text = "") {
   return element;
 }
 
+// Shared typed activity body. Thread identities are text only: a transcript
+// event cannot grant navigation to another conversation. URL schemes and
+// credentials are checked again at the browser boundary.
+export function createTranscriptActivity(entry) {
+  if (!entry?.activity || typeof entry.activity !== "object" || Array.isArray(entry.activity)) return null;
+  const activity = entry.activity;
+  const statusLabels = {
+    inProgress: "In progress", completed: "Completed", failed: "Failed", pendingInit: "Starting",
+    running: "Running", interrupted: "Interrupted", shutdown: "Stopped", notFound: "Not found",
+    started: "Started", interacted: "Updated", errored: "Failed",
+  };
+  const statusText = (status) => statusLabels[status] || status;
+  const body = createElement("div", {class: "codex-typed-activity"});
+  body.append(createElement("p", {class: "codex-activity-summary"}, entry.summary || "Activity"));
+  if (activity.status) body.append(createElement("span", {class: "codex-activity-status"}, statusText(activity.status)));
+  for (const query of Array.isArray(activity.queries) ? activity.queries : []) {
+    if (typeof query === "string") body.append(createElement("p", {class: "codex-activity-query"}, query));
+  }
+  if (entry.text) body.append(createElement("p", {}, entry.text));
+  const links = createElement("ul", {class: "codex-activity-links"});
+  for (const link of Array.isArray(activity.links) ? activity.links : []) {
+    if (typeof link?.url !== "string") continue;
+    let url;
+    try { url = new URL(link.url); } catch { continue; }
+    if (!["https:", "http:"].includes(url.protocol) || !url.hostname || url.username || url.password ||
+        /[\u0000-\u0020\u007f]/.test(link.url)) continue;
+    const row = createElement("li");
+    row.append(createElement("a", {href: url.href, target: "_blank", rel: "noopener noreferrer"},
+      typeof link.title === "string" && link.title ? link.title : url.href));
+    links.append(row);
+  }
+  if (links.childNodes.length) body.append(links);
+  if (activity.agentPath) body.append(createElement("p", {class: "codex-activity-agent"}, activity.agentPath));
+  const agents = Array.isArray(activity.agents) ? activity.agents : [];
+  if (agents.length) {
+    const list = createElement("ul", {class: "codex-activity-agents"});
+    for (const agent of agents) {
+      if (!agent || typeof agent !== "object" || Array.isArray(agent)) continue;
+      const row = createElement("li");
+      row.append(createElement("span", {}, [agent.threadId, statusText(agent.status)].filter(Boolean).join(" · ")));
+      if (agent.message) {
+        const details = createElement("details");
+        details.append(createElement("summary", {}, "Agent result"), createElement("pre", {}, agent.message));
+        row.append(details);
+      }
+      list.append(row);
+    }
+    body.append(list);
+  }
+  const settings = [activity.model, activity.reasoningEffort].filter(Boolean).join(" · ");
+  if (settings) body.append(createElement("p", {class: "codex-activity-settings"}, settings));
+  if (entry.details) {
+    const details = createElement("details", {class: "codex-activity-details"});
+    details.append(createElement("summary", {}, "Details"), createElement("pre", {}, entry.details));
+    body.append(details);
+  }
+  return body;
+}
+
 // Copy source fields rather than rendered DOM so collapsed details and Markdown
 // survive, while headings, controls and timestamps stay out of the clipboard.
 export function transcriptEntryCopyText(entry) {
@@ -624,7 +683,7 @@ export function mountConversation(root, options) {
       const header = createElement("div", {class: "codex-entry-header"});
       header.append(createElement("strong", {}, heading || "Activity"));
       item.append(header);
-      item.append(createElement("pre", {}, entry.text || entry.summary || entry.details || ""));
+      item.append(createTranscriptActivity(entry) || createElement("pre", {}, entry.text || entry.summary || entry.details || ""));
       const footer = createElement("div", {class: "codex-entry-footer"});
       const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
       if (timestamp.dateTime) timeAttributes.datetime = timestamp.dateTime;

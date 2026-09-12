@@ -66,3 +66,10 @@
   display: flex;
   gap: 0.5rem;
 }
+
+.codex-typed-activity { overflow-wrap: anywhere; }
+.codex-activity-summary { margin-bottom: 0.25rem; font-weight: 600; }
+.codex-activity-status, .codex-activity-settings { opacity: 0.75; }
+.codex-activity-details, .codex-activity-agents details { margin-top: 0.5rem; }
+.codex-typed-activity summary { cursor: pointer; }
+.codex-activity-links, .codex-activity-agents { padding-left: 1.25rem; }

@@ -28,6 +28,7 @@ class MemoryStorage {
   const {
     createConversationClient, createDurableAttemptStore, createDurableSender, mountConversation,
     formatTranscriptTimestamp, transcriptEntryCopyText, createTranscriptCopyButton,
+    createTranscriptActivity,
   } = await import(
     "../conversation/assets/conversation.js"
   );
@@ -521,6 +522,7 @@ class MemoryStorage {
       this.value = "";
     }
     setAttribute(key, value) { this.attributes[key] = String(value); }
+    get childNodes() { return this.children; }
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) {
       this.children = children;
@@ -533,6 +535,28 @@ class MemoryStorage {
   }
   globalThis.Element = FakeElement;
   globalThis.document = {createElement: (name) => new FakeElement(name)};
+  const typedSearch = createTranscriptActivity({
+    kind: "webSearch", summary: "Web search", details: "fallback raw details",
+    activity: {queries: ["literal <search>"], links: [
+      {url: "https://example.test/page", title: "<script>literal title</script>"},
+      {url: "javascript:alert(1)", title: "blocked"},
+      {url: "https://user:secret@example.test/", title: "blocked credentials"},
+      {url: "data:text/html,test", title: "blocked data"},
+    ]},
+  });
+  const typedLinks = typedSearch.descendants().filter((element) => element.name === "a");
+  assert.equal(typedLinks.length, 1);
+  assert.equal(typedLinks[0].attributes.rel, "noopener noreferrer");
+  assert.equal(typedLinks[0].textContent, "<script>literal title</script>");
+  assert.equal(typedSearch.descendants().filter((element) => element.name === "details").length, 1);
+  const typedAgent = createTranscriptActivity({kind: "subAgentActivity", summary: "Agent completed",
+    activity: {agentPath: "/root/review", agents: [{threadId: "untrusted-child", status: "completed", message: "Result"}]},
+  });
+  assert.equal(typedAgent.descendants().filter((element) => element.name === "a").length, 0);
+  assert.equal(createTranscriptActivity({kind: "unknown", details: "fallback"}), null);
+  assert.equal(createTranscriptActivity({kind: "webSearch", activity: []}), null);
+  const futureActivity = createTranscriptActivity({kind: "futureTypedKind", activity: {queries: ["Future query"], agents: [null]}});
+  assert.ok(futureActivity.descendants().some((element) => element.textContent === "Future query"));
   const copied = [];
   const clipboard = {async writeText(text) { copied.push(text); }};
   Object.defineProperty(globalThis, "navigator", {value: {clipboard}, configurable: true});

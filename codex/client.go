@@ -115,18 +115,19 @@ type Transcript struct {
 }
 
 type TranscriptEntry struct {
-	TurnID                  string `json:"turnId,omitempty"`
-	TurnStatus              string `json:"turnStatus,omitempty"`
-	ItemID                  string `json:"itemId,omitempty"`
-	ClientUserMessageID     string `json:"clientUserMessageId,omitempty"`
-	ClientUserMessageDigest string `json:"clientUserMessageDigest,omitempty"`
-	Kind                    string `json:"kind"`
-	Summary                 string `json:"summary,omitempty"`
-	Text                    string `json:"text,omitempty"`
-	HTML                    string `json:"html,omitempty"`
-	Details                 string `json:"details,omitempty"`
-	Timestamp               string `json:"timestamp,omitempty"`
-	TimestampApproximate    bool   `json:"timestampApproximate,omitempty"`
+	TurnID                  string              `json:"turnId,omitempty"`
+	TurnStatus              string              `json:"turnStatus,omitempty"`
+	ItemID                  string              `json:"itemId,omitempty"`
+	ClientUserMessageID     string              `json:"clientUserMessageId,omitempty"`
+	ClientUserMessageDigest string              `json:"clientUserMessageDigest,omitempty"`
+	Kind                    string              `json:"kind"`
+	Summary                 string              `json:"summary,omitempty"`
+	Text                    string              `json:"text,omitempty"`
+	HTML                    string              `json:"html,omitempty"`
+	Details                 string              `json:"details,omitempty"`
+	Timestamp               string              `json:"timestamp,omitempty"`
+	TimestampApproximate    bool                `json:"timestampApproximate,omitempty"`
+	Activity                *TranscriptActivity `json:"activity,omitempty"`
 }
 
 type SendReceipt struct {
@@ -3031,6 +3032,8 @@ func transcriptEntries(turn map[string]any) []TranscriptEntry {
 		case "plan":
 			entry.Summary = "Plan"
 			entry.Text = stringValue(item["text"])
+		case "webSearch", "collabAgentToolCall", "subAgentActivity":
+			normalizeTranscriptActivity(&entry, item)
 		default:
 			if entry.Kind == "" {
 				entry.Kind = "unknown"
