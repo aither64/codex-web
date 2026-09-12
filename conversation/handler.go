@@ -34,7 +34,7 @@ var browserAttemptPattern = regexp.MustCompile(
 var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
-//go:embed assets/conversation.js assets/conversation.css
+//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css
 var assetFiles embed.FS
 
 // Capabilities grants an opaque conversation ID access to individual
@@ -96,6 +96,7 @@ type ResolveRequest struct {
 // that mutates the same conversation. Release is called after the operation,
 // including an event stream.
 type Target struct {
+	Attachments         AttachmentProvider
 	Client              Client
 	Activity            ActivityProvider
 	ThreadID            string
@@ -367,6 +368,12 @@ func (handler *Handler) serveOperation(
 		if target.TransformTranscript != nil {
 			target.TransformTranscript(&transcript)
 		}
+		if target.Attachments != nil {
+			if err := target.Attachments.ObserveTranscript(ctx, &transcript); err != nil {
+				uploadError(response, err)
+				return
+			}
+		}
 		writeJSON(response, http.StatusOK, transcript)
 	case "pending":
 		if request.Method != http.MethodGet || !target.Capabilities.Pending {
@@ -453,18 +460,25 @@ func (handler *Handler) send(response http.ResponseWriter, request *http.Request
 		return
 	}
 	var body struct {
-		Message             string `json:"message"`
-		ClientUserMessageID string `json:"clientUserMessageId"`
-		Retry               bool   `json:"retry"`
+		Message             string   `json:"message"`
+		ClientUserMessageID string   `json:"clientUserMessageId"`
+		Retry               bool     `json:"retry"`
+		AttachmentIDs       []string `json:"attachmentIds,omitempty"`
 	}
 	if !handler.decode(response, request, &body) {
 		return
 	}
 	message := strings.TrimSpace(body.Message)
 	body.ClientUserMessageID = strings.TrimSpace(body.ClientUserMessageID)
-	if message == "" || len([]byte(message)) > handler.maxMessageBytes ||
+	if (message == "" && len(body.AttachmentIDs) == 0) || len([]byte(message)) > handler.maxMessageBytes ||
 		!browserAttemptPattern.MatchString(body.ClientUserMessageID) {
 		writeError(response, http.StatusBadRequest, "message and browser attempt ID are invalid")
+		return
+	}
+	var prepareErr error
+	message, prepareErr = handler.prepareAttachments(request.Context(), target, "send", body.ClientUserMessageID, message, body.AttachmentIDs)
+	if prepareErr != nil {
+		uploadError(response, prepareErr)
 		return
 	}
 	if body.Retry {
@@ -536,6 +550,12 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 			handler.serverError(response, request, err)
 			return
 		}
+		if target.Attachments != nil {
+			if err := target.Attachments.ObserveQueue(request.Context(), entries); err != nil {
+				uploadError(response, err)
+				return
+			}
+		}
 		writeJSON(response, http.StatusOK, nonNilQueue(entries))
 		return
 	}
@@ -544,17 +564,24 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 		return
 	}
 	var body struct {
-		Message             string `json:"message"`
-		ClientUserMessageID string `json:"clientUserMessageId"`
+		Message             string   `json:"message"`
+		ClientUserMessageID string   `json:"clientUserMessageId"`
+		AttachmentIDs       []string `json:"attachmentIds,omitempty"`
 	}
 	if !handler.decode(response, request, &body) {
 		return
 	}
 	message := strings.TrimSpace(body.Message)
 	body.ClientUserMessageID = strings.TrimSpace(body.ClientUserMessageID)
-	if message == "" || len([]byte(message)) > handler.maxMessageBytes ||
+	if (message == "" && len(body.AttachmentIDs) == 0) || len([]byte(message)) > handler.maxMessageBytes ||
 		!browserAttemptPattern.MatchString(body.ClientUserMessageID) {
 		writeError(response, http.StatusBadRequest, "message and browser attempt ID are invalid")
+		return
+	}
+	var prepareErr error
+	message, prepareErr = handler.prepareAttachments(request.Context(), target, "queue", body.ClientUserMessageID, message, body.AttachmentIDs)
+	if prepareErr != nil {
+		uploadError(response, prepareErr)
 		return
 	}
 	entry, err := target.Client.Queue(
@@ -563,6 +590,14 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 	if err != nil {
 		handler.serverError(response, request, err)
 		return
+	}
+	if target.Attachments != nil {
+		entries := []codex.QueueEntry{entry}
+		if err := target.Attachments.ObserveQueue(request.Context(), entries); err != nil {
+			uploadError(response, err)
+			return
+		}
+		entry = entries[0]
 	}
 	writeJSON(response, http.StatusAccepted, entry)
 }
@@ -582,6 +617,12 @@ func (handler *Handler) deleteQueue(
 	if err := target.Client.DeleteQueueEntry(request.Context(), target.ThreadID, decoded); err != nil {
 		handler.serverError(response, request, err)
 		return
+	}
+	if target.Attachments != nil {
+		if err := target.Attachments.QueueDeleted(request.Context(), decoded); err != nil {
+			uploadError(response, err)
+			return
+		}
 	}
 	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
 }

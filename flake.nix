@@ -25,7 +25,7 @@
             --coverage-only codex/client.go
           go test ./...
           ${pkgs.nodejs}/bin/node --check conversation/assets/conversation.js
-          ${pkgs.nodejs}/bin/node --test test/conversation_browser_contract_test.cjs
+          ${pkgs.nodejs}/bin/node --test test/conversation_browser_contract_test.cjs test/uploads_browser_contract_test.cjs
           runHook postCheck
         '';
         installPhase = ''

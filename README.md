@@ -216,6 +216,28 @@ cooperate with a long-lived server without losing attempts. Applications must
 still serialize same-conversation App Server mutations through the shared
 mutation lock supplied to the handler.
 
+Applications can opt into prompt attachments with `Target.Attachments`. The
+`AttachmentProvider` freezes a prompt from authorized file IDs before Send or
+Queue, then decorates transcript and queue entries with `displayText` and
+`attachments`. It must preserve the original `text` and submission digest.
+Applications own storage, authorization, retention and safe deletion.
+
+`NewUploadHandler` serves an application's `UploadStore` beneath an exact
+HTTPS origin and base path. It supports file creation, offset and SHA-256 checked
+chunks, completion, deletion and download. Each request resolves its scope
+independently; eight chunk requests can transfer concurrently. Upload requests
+have a two-minute deadline. Downloads use attachment disposition and stream
+without loading the whole file. The store supplies limits and must enforce them
+atomically across concurrent requests.
+
+The shared `uploads.js` module exports `mountUploads`, `createUploadClient` and
+`renderAttachments`. Serve `uploads.js` beside `conversation.js` and include
+`uploads.css` when using a custom composer. `mountConversation` accepts an
+optional `uploadBasePath`; custom clients pass attachment IDs to `message` as
+its fourth argument, or `queueMessage` as its third. Durable sender `send` and
+`queue` accept IDs as their second argument. A reload retains selection metadata;
+resuming an incomplete upload requires reselecting and verifying the file.
+
 `cmd/codex-web-example` is a standalone reference application. It accepts a
 trusted Unix socket, thread ID and working directory on the command line and
 serves the reusable browser client on loopback. It rejects non-loopback listen

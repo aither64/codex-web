@@ -1,3 +1,6 @@
+import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js";
+export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js";
+
 const defaultLabels = {
   send: "Send",
   sending: "Sending",
@@ -222,14 +225,14 @@ export function createConversationClient(options) {
     models: async () => (await request("models")) || [],
     modes: async () => (await request("collaboration-modes")) || [],
     queue: async () => (await request("queue")) || [],
-    message: (message, clientUserMessageId, retry = false) => request("message", {
-      method: "POST", body: JSON.stringify({message, clientUserMessageId, retry}),
+    message: (message, clientUserMessageId, retry = false, attachments = []) => request("message", {
+      method: "POST", body: JSON.stringify({message, clientUserMessageId, retry, ...(attachments.length ? {attachmentIds: attachmentIDs(attachments)} : {})}),
     }),
     acknowledgeMessages: (acknowledgements) => request("message-ack", {
       method: "POST", body: JSON.stringify({acknowledgements}),
     }),
-    queueMessage: (message, clientUserMessageId) => request("queue", {
-      method: "POST", body: JSON.stringify({message, clientUserMessageId}),
+    queueMessage: (message, clientUserMessageId, attachments = []) => request("queue", {
+      method: "POST", body: JSON.stringify({message, clientUserMessageId, ...(attachments.length ? {attachmentIds: attachmentIDs(attachments)} : {})}),
     }),
     deleteQueued: (id) => request(
       `queue/${encodeOpaquePathSegment(id, "queued message id")}`, {method: "DELETE"},
@@ -440,10 +443,12 @@ function pendingAttemptStore(storage, key) {
     storage,
     key,
     decode: (id, value) => {
-      if (!value || typeof value.message !== "string" || !value.message.trim()) return null;
+      if (!value || typeof value.message !== "string" || (!value.message.trim() && !value.attachmentIds?.length)) return null;
+      const attachments = attachmentIDs(value.attachmentIds);
       return {
         id,
         message: value.message,
+        ...(attachments.length ? {attachmentIds: attachments} : {}),
         receipt: value.receipt && typeof value.receipt === "object" ? value.receipt : null,
       };
     },
@@ -488,31 +493,32 @@ export function createDurableSender(options) {
       throw new Error("Durable browser storage did not retain the operation");
     }
   };
-  const submit = async (kind, text) => {
+  const submit = async (kind, text, attachments = []) => {
+    const ids = attachmentIDs(attachments);
     const store = kind === "send" ? sendStore : queueStore;
     const otherStore = kind === "send" ? queueStore : sendStore;
     const message = String(text || "").trim();
-    if (!message) throw new Error("Enter a message first");
+    if (!message && !ids.length) throw new Error("Enter a message or attach files first");
     if (parsePending(otherStore)) {
       throw new Error("Finish the pending conversation operation before starting another one");
     }
     let attempt = parsePending(store);
-    if (attempt && attempt.message !== message) {
+    if (attempt && (attempt.message !== message || !sameAttachments(attempt.attachmentIds, ids))) {
       throw new Error(`Retry the pending ${kind} operation before submitting another message`);
     }
     const retry = Boolean(attempt);
     if (!attempt) {
-      attempt = {id: randomUUID(), message, receipt: null};
+      attempt = {id: randomUUID(), message, receipt: null, ...(ids.length ? {attachmentIds: ids} : {})};
       save(store, attempt);
     }
     if (kind === "queue") {
-      const entry = await options.client.queueMessage(attempt.message, attempt.id);
+      const entry = await options.client.queueMessage(attempt.message, attempt.id, attempt.attachmentIds || []);
       if (!store.remove(attempt.id)) {
         throw new Error("Durable browser storage did not clear the queued operation");
       }
       return entry;
     }
-    const receipt = await options.client.message(attempt.message, attempt.id, retry);
+    const receipt = await options.client.message(attempt.message, attempt.id, retry, attempt.attachmentIds || []);
     attempt.receipt = receipt;
     save(store, attempt);
     return receipt;
@@ -520,11 +526,11 @@ export function createDurableSender(options) {
   return {
     pending: () => parsePending(sendStore),
     pendingQueue: () => parsePending(queueStore),
-    async send(text) {
-      return submit("send", text);
+    async send(text, attachments = []) {
+      return submit("send", text, attachments);
     },
-    async queue(text) {
-      return submit("queue", text);
+    async queue(text, attachments = []) {
+      return submit("queue", text, attachments);
     },
     async acknowledge(entries) {
       const attempt = parsePending(sendStore);
@@ -610,6 +616,21 @@ export function mountConversation(root, options) {
   if (capabilities.queueRead) children.push(queue);
   if (capabilities.send || capabilities.queue || capabilities.interrupt) children.push(form);
   root.replaceChildren(...children);
+  let uploads = null;
+  if (options?.uploadBasePath && (capabilities.send || capabilities.queue)) {
+    const uploadRoot = document.createElement("div");
+    form.insertBefore(uploadRoot, actions);
+    uploads = mountUploads(uploadRoot, {
+      basePath: options.uploadBasePath, dropTarget: form,
+      storage: options.storage || globalThis.localStorage,
+      storageKey: `codex-web:uploads:${options.uploadBasePath}`,
+      onChange: ({ready, count}) => { textarea.required = !count; send.disabled = !ready; queueButton.disabled = !ready; },
+    });
+  }
+  const removeAttachment = async (file) => {
+    await payloadForAttachmentRemoval(file.deleteUrl);
+    await refresh();
+  };
 
   const populateEfforts = (selectedEffort = "") => {
     const selected = modelCatalog.find((entry) => entry.model === model.value);
@@ -639,7 +660,8 @@ export function mountConversation(root, options) {
     queue.replaceChildren(createElement("h2", {}, "Queued messages"));
     for (const entry of entries || []) {
       const item = createElement("div", {class: "codex-queue-entry"});
-      item.append(createElement("span", {}, entry.text || "Queued message"));
+      item.append(createElement("span", {}, entry.displayText ?? entry.text ?? "Queued message"));
+      if (entry.attachments?.length) item.append(renderAttachments(entry.attachments));
       if (capabilities.queue) {
         const start = createElement("button", {type: "button"}, "Start");
         start.addEventListener("click", () => void client.startQueue(entry.id).then(refresh));
@@ -708,7 +730,8 @@ export function mountConversation(root, options) {
       const header = createElement("div", {class: "codex-entry-header"});
       header.append(createElement("strong", {}, heading || "Activity"));
       item.append(header);
-      item.append(createTranscriptActivity(entry) || createElement("pre", {}, entry.text || entry.summary || entry.details || ""));
+      item.append(createTranscriptActivity(entry) || createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? ""));
+      if (entry.attachments?.length) item.append(renderAttachments(entry.attachments, {onRemove: removeAttachment}));
       const footer = createElement("div", {class: "codex-entry-footer"});
       const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
       if (timestamp.dateTime) timeAttributes.datetime = timestamp.dateTime;
@@ -748,13 +771,16 @@ export function mountConversation(root, options) {
     send.disabled = true;
     send.textContent = labels.sending;
     try {
-      await sender.send(textarea.value);
+      uploads?.lock(true);
+      await sender.send(textarea.value, uploads?.ids() || []);
+      uploads?.clear();
       await refresh();
       if (!sender.pending()) textarea.value = "";
     } catch (error) {
       if (error.name !== "AbortError") status.textContent = error.message;
     } finally {
-      send.disabled = false;
+      uploads?.lock(false);
+      send.disabled = uploads ? !uploads.ready() : false;
       send.textContent = labels.send;
     }
   });
@@ -774,14 +800,16 @@ export function mountConversation(root, options) {
 
   if (capabilities.queue) queueButton.addEventListener("click", async () => {
     const message = textarea.value.trim();
-    if (!message) return;
+    if (!message && !uploads?.count()) return;
     try {
-      await sender.queue(message);
+      uploads?.lock(true);
+      await sender.queue(message, uploads?.ids() || []);
+      uploads?.clear();
       textarea.value = "";
       await refresh();
     } catch (error) {
       status.textContent = error.message;
-    }
+    } finally { uploads?.lock(false); }
   });
   if (capabilities.interrupt) interrupt.addEventListener("click", () => void client.interrupt().then(refresh).catch((error) => {
     status.textContent = error.message;
@@ -802,8 +830,17 @@ export function mountConversation(root, options) {
 
   return () => {
     stopped = true;
+    uploads?.destroy();
     abort.abort();
     events?.close();
     root.replaceChildren();
   };
+}
+
+async function payloadForAttachmentRemoval(path) {
+  const parsed = new URL(path, globalThis.location.href);
+  if (parsed.origin !== globalThis.location.origin) throw new Error("Invalid file endpoint");
+  const response = await fetch(`${parsed.pathname}?confirmed=true`, {method: "DELETE", credentials: "same-origin"});
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || "Unable to delete file");
 }

@@ -115,6 +115,8 @@ type Transcript struct {
 }
 
 type TranscriptEntry struct {
+	DisplayText             *string             `json:"displayText,omitempty"`
+	Attachments             []Attachment        `json:"attachments,omitempty"`
 	TurnID                  string              `json:"turnId,omitempty"`
 	TurnStatus              string              `json:"turnStatus,omitempty"`
 	ItemID                  string              `json:"itemId,omitempty"`
@@ -206,9 +208,11 @@ type RateLimitWindow struct {
 }
 
 type QueueEntry struct {
-	ID                  string `json:"id"`
-	Text                string `json:"text"`
-	ClientUserMessageID string `json:"clientUserMessageId"`
+	DisplayText         *string      `json:"displayText,omitempty"`
+	Attachments         []Attachment `json:"attachments,omitempty"`
+	ID                  string       `json:"id"`
+	Text                string       `json:"text"`
+	ClientUserMessageID string       `json:"clientUserMessageId"`
 }
 
 type cachedThreadSettings struct {

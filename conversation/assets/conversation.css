@@ -1,3 +1,4 @@
+@import url("./uploads.css");
 .codex-conversation-transcript {
   display: grid;
   gap: 0.75rem;

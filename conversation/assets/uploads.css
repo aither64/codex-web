@@ -1,0 +1,9 @@
+.codex-attachments { display: flex; flex-wrap: wrap; gap: .5rem; margin: .4rem 0; }
+.codex-attachment { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .65rem; padding: .5rem .65rem; border: 1px solid #526072; border-radius: .4rem; max-width: 100%; overflow-wrap: anywhere; font-size: .9rem; }
+.codex-attachment-detail, .codex-upload-notice { color: #a7b3c5; font-size: .8rem; }
+.codex-upload-notice { margin: .3rem 0; }
+.codex-attachment progress { width: 7rem; max-width: 100%; accent-color: #7eb6f6; }
+.codex-attachment button { padding: .2rem .45rem; font-size: .8rem; }
+.codex-upload-drag { outline: 2px dashed #7eb6f6; outline-offset: -2px; }
+.codex-upload-composer { max-height: 12rem; overflow-y: auto; }
+@media (max-width: 600px) { .codex-attachment { width: 100%; } }
