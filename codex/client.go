@@ -377,6 +377,7 @@ type Client struct {
 	socket            string
 	options           ClientOptions
 	activityNamespace string
+	observer          *observerState
 	turnHistoryMu     sync.Mutex
 	turnHistory       map[string]*threadHistoryCache
 	idleTurnHistory   []string
@@ -488,8 +489,13 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		policy := *options.NonBlockingUserInput
 		options.NonBlockingUserInput = &policy
 	}
+	var observer *observerState
+	if options.ObserverOnly {
+		observer = newObserverState()
+	}
 	return &Client{
-		socket: socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
+		observer: observer,
+		socket:   socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
 		requests: make(map[string]PendingRequest), notices: make(map[string][]Prompt),
 		subscribers: make(map[chan struct{}]string), watched: make(map[string]int),
 		watchedGeneration: make(map[string]uint64), watchLocks: make(map[string]*sync.Mutex),
@@ -534,6 +540,9 @@ func (c *Client) Ensure(ctx context.Context) error {
 	c.generation++
 	generation := c.generation
 	c.connection = connection
+	if c.observer != nil {
+		c.observer.connectionContext, c.observer.cancelConnection = context.WithCancel(c.observer.context)
+	}
 	c.connectionMu.Unlock()
 	go c.readLoop(connection, generation)
 
@@ -565,6 +574,10 @@ func (c *Client) Ensure(ctx context.Context) error {
 func (c *Client) Close() {
 	c.connectionMu.Lock()
 	c.closed = true
+	if c.observer != nil {
+		c.observer.cancel()
+		c.observer.clearQueue()
+	}
 	connection := c.connection
 	generation := c.generation
 	c.connectionMu.Unlock()
@@ -595,13 +608,45 @@ func (c *Client) Request(ctx context.Context, method string, params any, result 
 }
 
 func (c *Client) requestConnected(ctx context.Context, method string, params any, result any) error {
+	return c.requestConnectedGeneration(ctx, 0, method, params, result)
+}
+
+func (c *Client) requestConnectedGeneration(ctx context.Context, expectedGeneration uint64, method string, params any, result any) error {
 	c.connectionMu.Lock()
 	connection := c.connection
 	generation := c.generation
 	ready := c.ready
+	var disconnected context.Context
+	if c.observer != nil {
+		disconnected = c.observer.connectionContext
+	}
 	c.connectionMu.Unlock()
+	if expectedGeneration != 0 && generation != expectedGeneration {
+		return errors.New("Codex App Server connection changed before request admission")
+	}
 	if connection == nil || ready != generation {
 		return errors.New("Codex App Server is disconnected or initializing")
+	}
+	if c.observer != nil {
+		select {
+		case c.observer.slots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-disconnected.Done():
+			return errors.New("Codex App Server disconnected before request admission")
+		}
+		defer func() { <-c.observer.slots }()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if disconnected.Err() != nil {
+			return errors.New("Codex App Server disconnected before request admission")
+		}
+		// Queue admission does not consume the observer's per-RPC timeout. The
+		// caller deadline still bounds the entire operation, including its queue.
+		admitted, cancel := context.WithTimeout(ctx, observerRPCTimeout)
+		defer cancel()
+		ctx = admitted
 	}
 	return c.requestOn(ctx, connection, generation, method, params, result)
 }
@@ -899,6 +944,10 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 	}
 	c.connection = nil
 	c.ready = 0
+	if c.observer != nil && c.observer.cancelConnection != nil {
+		c.observer.cancelConnection()
+		c.observer.clearQueue()
+	}
 	c.options.ActivityRecorder.disconnected(c.activityConnection(generation), "")
 	c.pendingMu.Lock()
 	for id, call := range c.pending {
@@ -1005,6 +1054,10 @@ func (c *Client) restoreWatched() {
 		threadIDs = append(threadIDs, threadID)
 	}
 	c.watchedMu.Unlock()
+	if c.observer != nil {
+		c.restoreObserved(threadIDs)
+		return
+	}
 	for _, threadID := range threadIDs {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1017,24 +1070,48 @@ func (c *Client) restoreWatched() {
 }
 
 func (c *Client) resumeWatched(ctx context.Context, threadID string) error {
+	return c.resumeWatchedGeneration(ctx, threadID, 0)
+}
+
+func (c *Client) resumeWatchedGeneration(ctx context.Context, threadID string, expectedGeneration uint64) error {
 	lock := c.watchLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.connectionMu.Lock()
 	generation := c.generation
 	c.connectionMu.Unlock()
+	if expectedGeneration != 0 && generation != expectedGeneration {
+		return errors.New("Codex App Server connection changed before watch restoration")
+	}
 	c.watchedMu.Lock()
 	if c.watched[threadID] == 0 || c.watchedGeneration[threadID] == generation {
 		c.watchedMu.Unlock()
 		return nil
 	}
 	c.watchedMu.Unlock()
+	requestGeneration := uint64(0)
+	if c.observer != nil {
+		requestGeneration = generation
+	}
 	var result map[string]any
-	if err := c.requestConnected(ctx, "thread/resume", c.threadResumeParams(threadID), &result); err != nil {
+	if err := c.requestConnectedGeneration(ctx, requestGeneration, "thread/resume", c.threadResumeParams(threadID), &result); err != nil {
 		return err
 	}
 	c.connectionMu.Lock()
 	if c.connection == nil || c.generation != generation || c.ready != generation {
+		// Observer restoration can win the same-watch race with Subscribe.
+		// Share its accepted result even if the transport immediately closes;
+		// the next generation still resumes again without stale coverage.
+		if c.observer != nil && c.generation == generation {
+			c.watchedMu.Lock()
+			if c.watched[threadID] > 0 {
+				c.watchedGeneration[threadID] = generation
+			}
+			c.watchedMu.Unlock()
+		}
 		c.connectionMu.Unlock()
 		// The server accepted the subscription before disconnecting. Retain
 		// the watch for reconnection, without starting coverage on this stale
@@ -1047,8 +1124,13 @@ func (c *Client) resumeWatched(ctx context.Context, threadID string) error {
 	}
 	c.watchedMu.Unlock()
 	c.options.ActivityRecorder.connected(threadID, c.activityConnection(generation), time.Now().UnixMilli())
+	if c.observer != nil {
+		c.clearWatchError(threadID)
+	}
 	c.connectionMu.Unlock()
-	c.clearWatchError(threadID)
+	if c.observer == nil {
+		c.clearWatchError(threadID)
+	}
 	return nil
 }
 

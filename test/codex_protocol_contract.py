@@ -246,7 +246,7 @@ client_source += "\n" + "\n".join(
 )
 client_requests.append(request("thread/read", {"threadId": "thread-1", "excludeTurns": True}))
 call_pattern = re.compile(
-    r'\b(?:Request|requestConnected|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z]+)*)"',
+    r'\b(?:Request|requestConnected|requestConnectedGeneration|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z]+)*)"',
     re.DOTALL,
 )
 implemented_calls = Counter(call_pattern.findall(client_source))

@@ -93,6 +93,13 @@ Observer clients never answer requests, reject unsupported requests, apply
 developer instructions or change thread settings. The ordinary interactive
 client retains its response policy.
 
+Observer clients admit at most four connected RPCs at a time. Reads,
+subscriptions, reconnect restoration and unsubscribe requests share that
+limit. Reconnect uses four workers and replaces pending work when the
+connection generation changes. Disconnecting or closing the client cancels
+queued work. The observer's ten-second RPC timeout starts after admission;
+the caller's context also bounds time spent waiting for a slot.
+
 The recorder holds a lifetime lock on that directory. Each thread has an
 independent writer, a bounded current checkpoint, and a compact summary file
 for each observed turn. Directories use mode `0700`; files use mode `0600`.
