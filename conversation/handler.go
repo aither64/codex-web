@@ -416,6 +416,12 @@ func (handler *Handler) serveOperation(
 		writeJSON(response, http.StatusOK, modes)
 	case "queue":
 		handler.queue(response, request, target)
+	case "queue/reconcile":
+		if request.Method == http.MethodDelete {
+			handler.deleteQueue(response, request, target, "reconcile")
+		} else {
+			handler.reconcileQueue(response, request, target)
+		}
 	case "queue/start":
 		if request.Method == http.MethodDelete {
 			handler.deleteQueue(response, request, target, "start")
@@ -545,18 +551,7 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 			handler.rejectOperation(response, request)
 			return
 		}
-		if client, ok := target.Client.(QueueDeletionCompleter); ok {
-			complete := func(id string) error {
-				if target.Attachments != nil {
-					return target.Attachments.QueueDeleted(request.Context(), id)
-				}
-				return nil
-			}
-			if err := client.ReconcileQueueDeletionsWithCompletion(request.Context(), target.ThreadID, complete); err != nil {
-				handler.serverError(response, request, err)
-				return
-			}
-		}
+
 		entries, err := target.Client.ListQueue(request.Context(), target.ThreadID)
 		if err != nil {
 			handler.serverError(response, request, err)
@@ -612,6 +607,29 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 		entry = entries[0]
 	}
 	writeJSON(response, http.StatusAccepted, entry)
+}
+
+func (handler *Handler) reconcileQueue(response http.ResponseWriter, request *http.Request, target Target) {
+	if request.Method != http.MethodPost || !target.Capabilities.Queue {
+		handler.rejectOperation(response, request)
+		return
+	}
+	if client, ok := target.Client.(QueueDeletionCompleter); ok {
+		complete := func(id string) error {
+			if target.Attachments != nil {
+				return target.Attachments.QueueDeleted(request.Context(), id)
+			}
+			return nil
+		}
+		if err := client.ReconcileQueueDeletionsWithCompletion(request.Context(), target.ThreadID, complete); err != nil {
+			handler.serverError(response, request, err)
+			return
+		}
+	} else if target.Attachments != nil {
+		writeError(response, http.StatusServiceUnavailable, "Attachment deletion recovery is unavailable")
+		return
+	}
+	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (handler *Handler) deleteQueue(

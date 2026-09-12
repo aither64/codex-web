@@ -3581,7 +3581,7 @@ func (c *Client) DeleteQueueEntryWithCompletion(ctx context.Context, threadID, i
 
 // ReconcileQueueDeletionsWithCompletion finishes only recorded deletions whose
 // queue entry is already absent. It never deletes a still-present queue entry,
-// so an application can call it while refreshing a readable queue.
+// so an application can call it under mutation authority before reading a queue.
 func (c *Client) ReconcileQueueDeletionsWithCompletion(ctx context.Context, threadID string, complete func(string) error) error {
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
@@ -3675,6 +3675,9 @@ func (c *Client) queueDeletionWasStarted(
 }
 
 func (c *Client) StartQueue(ctx context.Context, threadID, queuedSubmissionID string) error {
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
 	entries, err := c.ListQueue(ctx, threadID)
 	if err != nil {
 		return err

@@ -225,6 +225,7 @@ export function createConversationClient(options) {
     models: async () => (await request("models")) || [],
     modes: async () => (await request("collaboration-modes")) || [],
     queue: async () => (await request("queue")) || [],
+    reconcileQueue: () => request("queue/reconcile", {method: "POST", body: "{}"}),
     message: (message, clientUserMessageId, retry = false, attachments = []) => request("message", {
       method: "POST", body: JSON.stringify({message, clientUserMessageId, retry, ...(attachments.length ? {attachmentIds: attachmentIDs(attachments)} : {})}),
     }),
@@ -753,6 +754,7 @@ export function mountConversation(root, options) {
   async function refresh() {
     if (stopped) return;
     try {
+      if (capabilities.queue && options.uploadBasePath) await client.reconcileQueue();
       const [thread, pendingEntries, queuedEntries] = await Promise.all([
         client.thread(),
         capabilities.pending ? client.pending() : Promise.resolve([]),

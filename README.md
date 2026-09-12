@@ -224,9 +224,10 @@ Applications own storage, authorization, retention and safe deletion.
 
 Attachment-aware queue deletion also requires `QueueDeletionCompleter`, which
 `codex.Client` implements. Its completion callback updates the provider before
-forgetting the durable deletion attempt. Queue refresh finishes recorded
-cancellations whose entries are already absent; it never deletes a remaining
-entry. Failed completion can therefore recover after a reload or restart.
+forgetting the durable deletion attempt. Editable browser surfaces use `POST /queue/reconcile` under the ordinary
+mutation authority and lock before reading the queue. Recovery finishes only
+recorded cancellations whose entries are already absent; it never deletes a
+remaining entry. `GET /queue` does not perform cancellation recovery. Failed completion can therefore recover after a reload or restart.
 `RequireSubmissionAttemptsResolved` reports pending deletions without changing
 them. Retry a remaining deletion through its owning queue surface.
 

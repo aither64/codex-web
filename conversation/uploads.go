@@ -28,7 +28,8 @@ type AttachmentProvider interface {
 
 // QueueDeletionCompleter is required only for attachment-aware queue deletion.
 // Completion runs before the durable deletion identity is forgotten. Refresh
-// reconciliation must never delete an entry that is still in the queue.
+// reconciliation must run under mutation authority and never delete an entry
+// that is still in the queue.
 type QueueDeletionCompleter interface {
 	DeleteQueueEntryWithCompletion(context.Context, string, string, func() error) error
 	ReconcileQueueDeletionsWithCompletion(context.Context, string, func(string) error) error

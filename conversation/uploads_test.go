@@ -183,11 +183,14 @@ func (provider *failingQueueProvider) QueueDeleted(context.Context, string) erro
 	provider.deleted++
 	return nil
 }
-func TestAttachmentQueueDeletionRecoversOnRefresh(t *testing.T) {
+func TestAttachmentQueueDeletionRecoveryRequiresMutationAuthority(t *testing.T) {
 	client := &completingQueueClient{fakeClient: &fakeClient{}}
 	provider := &failingQueueProvider{fail: true}
-	handler, err := NewHandler(Options{BasePath: "/codex", AllowedOrigins: []string{"https://portal.test"}, Resolver: ResolverFunc(func(context.Context, ResolveRequest) (Target, error) {
-		return Target{Client: client, Attachments: provider, ThreadID: "trusted", Directory: "/workspace", MutationLock: NewMutationLock(), Capabilities: Capabilities{Queue: true, QueueRead: true}}, nil
+	mutationLock := NewMutationLock()
+	resolved := make(chan ResolveRequest, 10)
+	handler, err := NewHandler(Options{BasePath: "/codex", AllowedOrigins: []string{"https://portal.test"}, Resolver: ResolverFunc(func(_ context.Context, request ResolveRequest) (Target, error) {
+		resolved <- request
+		return Target{Client: client, Attachments: provider, ThreadID: "trusted", Directory: "/workspace", MutationLock: mutationLock, Capabilities: Capabilities{Queue: true, QueueRead: true}}, nil
 	})})
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +206,39 @@ func TestAttachmentQueueDeletionRecoversOnRefresh(t *testing.T) {
 		t.Fatal(response.Code, response.Body.String())
 	}
 	provider.fail = false
-	if response := call("GET", ""); response.Code != 200 || client.pending || provider.deleted != 1 {
+	if response := call("GET", ""); response.Code != 200 || !client.pending || provider.deleted != 0 {
+		t.Fatal("GET recovered a deletion", response.Code)
+	}
+	<-resolved
+	<-resolved
+	if err := mutationLock.Lock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- call("POST", "/reconcile") }()
+	resolution := <-resolved
+	if !resolution.Mutation || resolution.Operation != "queue/reconcile" {
+		mutationLock.Unlock()
+		t.Fatal("recovery lacks mutation authority", resolution)
+	}
+	select {
+	case response := <-done:
+		mutationLock.Unlock()
+		t.Fatal("recovery bypassed queue-start lock", response.Code)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if provider.deleted != 0 {
+		mutationLock.Unlock()
+		t.Fatal("completion ran before mutation lock")
+	}
+	mutationLock.Unlock()
+	if response := <-done; response.Code != 200 || client.pending || provider.deleted != 1 {
 		t.Fatal(response.Code, response.Body.String())
+	}
+	req := httptest.NewRequest("POST", "/codex/conversations/opaque/queue/reconcile", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != 403 {
+		t.Fatal("recovery accepted a missing origin", response.Code)
 	}
 }
