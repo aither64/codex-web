@@ -191,6 +191,10 @@ client_requests = [
     ),
     request(
         "thread/turns/list",
+        {"threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": "notLoaded", "cursor": "older-page"},
+    ),
+    request(
+        "thread/turns/list",
         {"threadId": "thread-1", "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"},
     ),
     request(
@@ -234,6 +238,13 @@ client_requests = [
     request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
 ]
 client_source = CLIENT_SOURCE.read_text()
+# Public client behavior is split into small implementation files. Keep every
+# outgoing call in the schema corpus, including the optional activity reader.
+client_source += "\n" + "\n".join(
+    source.read_text() for source in sorted(CLIENT_SOURCE.parent.glob("*.go"))
+    if source != CLIENT_SOURCE and not source.name.endswith("_test.go")
+)
+client_requests.append(request("thread/read", {"threadId": "thread-1", "excludeTurns": True}))
 call_pattern = re.compile(
     r'\b(?:Request|requestConnected|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z]+)*)"',
     re.DOTALL,
@@ -719,3 +730,34 @@ for message in server_requests:
     )
 
 print("Codex App Server protocol contract is compatible")
+
+# Typed activity and observer fields consumed from the selected Codex schema.
+activity_items = [
+    {"id": "search", "type": "webSearch", "query": "protocol", "action": {"type": "search", "queries": ["protocol"]},
+     "results": [{"url": "https://example.test/", "title": "Example"}]},
+    {"id": "open", "type": "webSearch", "query": "", "action": {"type": "openPage", "url": "https://example.test/"}},
+    {"id": "find", "type": "webSearch", "query": "", "action": {"type": "findInPage", "url": "https://example.test/", "pattern": "text"}},
+    {"id": "agent", "type": "collabAgentToolCall", "tool": "spawnAgent", "status": "completed",
+     "senderThreadId": "thread-1", "receiverThreadIds": ["child"], "agentsStates": {"child": {"status": "completed", "message": "Result"}},
+     "model": "example", "reasoningEffort": "xhigh", "prompt": "Task"},
+    {"id": "lifecycle", "type": "subAgentActivity", "agentThreadId": "child", "agentPath": "/root/review", "kind": "completed"},
+]
+activity_turn = {"id": "turn-1", "status": "completed", "items": activity_items,
+                 "itemsView": "full", "startedAt": 1000, "completedAt": 1010, "durationMs": 10000}
+validate("v2/ThreadTurnsListResponse.json", {"data": [activity_turn], "nextCursor": "opaque"}, "typed activity turns")
+for view in ("full", "notLoaded"):
+    validate("ClientRequest.json", request("thread/turns/list", {
+        "threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": view, "cursor": "opaque",
+    }), "paginated activity history")
+for method in ("turn/started", "turn/completed"):
+    validate("ServerNotification.json", {"method": method, "params": {"threadId": "thread-1", "turn": activity_turn}}, "activity turn boundary")
+validate("ServerNotification.json", {"method": "thread/status/changed", "params": {
+    "threadId": "thread-1", "status": {"type": "active", "activeFlags": ["waitingOnApproval", "waitingOnUserInput"]},
+}}, "activity status coverage")
+validate("ClientRequest.json", request("thread/resume", {"threadId": "thread-1", "excludeTurns": True}), "observer resume without overrides")
+for definition, fields in {
+    "Turn": ["startedAt", "completedAt", "durationMs", "itemsView"],
+    "ThreadTurnsListResponse": [],
+}.items():
+    for field in fields:
+        require_declared_property("v2/ThreadTurnsListResponse.json", definition, field, "activity turn metadata")

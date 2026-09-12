@@ -487,6 +487,7 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 	}
 	client.watchedMu.Lock()
 	client.watched["thread-1"] = 1
+	client.retainTurnHistory("thread-1", true)
 	client.watchedMu.Unlock()
 	if err := client.resumeWatched(ctx, "thread-1"); err != nil {
 		t.Fatal(err)
@@ -4187,6 +4188,7 @@ func TestLastSubscriberInvalidatesSettingsAfterAConcurrentWatchTransition(t *tes
 	client := newTestClient(filepath.Join(t.TempDir(), "missing.sock"))
 	defer client.Close()
 	client.watched["thread-1"] = 1
+	client.retainTurnHistory("thread-1", true)
 	client.cacheThreadSettings("thread-1", ThreadSettings{
 		Model: "stale-model", ReasoningEffort: "medium", CollaborationMode: "default",
 	}, 0)

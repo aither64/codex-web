@@ -193,6 +193,7 @@ export function createConversationClient(options) {
   };
   const client = {
     thread: () => request("thread"),
+    activity: () => request("activity"),
     pending: async () => (await request("pending")) || [],
     models: async () => (await request("models")) || [],
     modes: async () => (await request("collaboration-modes")) || [],

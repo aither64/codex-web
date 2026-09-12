@@ -108,6 +108,7 @@ func TestLiveItemTimestampKeepsStartThroughCompletion(t *testing.T) {
 	client := newTestClient("/tmp/not-connected.sock")
 	defer client.Close()
 	client.watched["thread-1"] = 1
+	client.retainTurnHistory("thread-1", true)
 	client.observeItemTimestamp("item/started", json.RawMessage(
 		`{"threadId":"thread-1","turnId":"turn-1","item":{"id":"message"},"startedAtMs":1789120800123}`,
 	))
@@ -198,6 +199,7 @@ func TestReadLoopIncludesLiveTimestampBeforeRolloutPersistence(t *testing.T) {
 	}
 	client.watchedMu.Lock()
 	client.watched["thread-1"] = 1
+	client.retainTurnHistory("thread-1", true)
 	client.watchedMu.Unlock()
 	transcript, err := client.ReadThread(ctx, "thread-1")
 	if err != nil || len(transcript.Entries) != 1 ||

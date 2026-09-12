@@ -87,6 +87,58 @@ func (client *fakeClient) VerifyThread(_ context.Context, thread, cwd string) er
 func (client *fakeClient) ReadThread(_ context.Context, thread string) (codex.Transcript, error) {
 	return codex.Transcript{ThreadID: thread, Entries: []codex.TranscriptEntry{}}, nil
 }
+
+type fakeActivityProvider struct{ thread string }
+
+func (provider *fakeActivityProvider) ReadActivity(_ context.Context, thread string) (codex.ActivitySnapshot, error) {
+	provider.thread = thread
+	return codex.ActivitySnapshot{ThreadID: thread, CurrentState: "idle"}, nil
+}
+
+func TestActivityProviderIsOptionalAndReadAuthorized(t *testing.T) {
+	for _, test := range []struct {
+		name                     string
+		read, provider, verified bool
+		status                   int
+	}{
+		{"read", true, true, true, http.StatusOK},
+		{"no provider", true, false, true, http.StatusNotFound},
+		{"no read grant", false, true, true, http.StatusForbidden},
+		{"wrong identity", true, true, false, http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &fakeActivityProvider{}
+			client := &fakeClient{}
+			if !test.verified {
+				client.verifyErr = errors.New("wrong cwd")
+			}
+			handler, err := NewHandler(Options{AllowedOrigins: []string{"https://workspace.example.test"}, Logger: log.New(&bytes.Buffer{}, "", 0), Resolver: ResolverFunc(func(_ context.Context, request ResolveRequest) (Target, error) {
+				if request.Operation != "activity" || request.Mutation {
+					t.Fatal("activity used a mutation resolver request")
+				}
+				target := Target{Client: client, ThreadID: "trusted", Directory: "/trusted", Capabilities: Capabilities{Read: test.read}}
+				if test.provider {
+					target.Activity = provider
+				}
+				return target, nil
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/codex/conversations/opaque/activity", nil))
+			if response.Code != test.status {
+				t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+			}
+			if response.Code == http.StatusOK && provider.thread != "trusted" {
+				t.Fatal("provider did not use trusted thread")
+			}
+			if response.Code != http.StatusOK && provider.thread != "" {
+				t.Fatal("unauthorized activity provider invoked")
+			}
+		})
+	}
+}
 func (client *fakeClient) PromptsWithItems(context.Context, string) ([]codex.Prompt, error) {
 	return []codex.Prompt{}, nil
 }

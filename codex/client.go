@@ -374,8 +374,12 @@ func ResolveForkThreadSettings(
 }
 
 type Client struct {
-	socket  string
-	options ClientOptions
+	socket            string
+	options           ClientOptions
+	activityNamespace string
+	turnHistoryMu     sync.Mutex
+	turnHistory       map[string]*threadHistoryCache
+	idleTurnHistory   []string
 
 	ensureMu     sync.Mutex
 	connectionMu sync.Mutex
@@ -431,6 +435,10 @@ type ClientOptions struct {
 	// SubmissionLedgerPath selects application-owned durable retry storage.
 	// Empty preserves the compatibility path next to the App Server socket.
 	SubmissionLedgerPath string
+	// ObserverOnly prevents responses, unsupported-request rejections and
+	// thread-setting overrides. Use a dedicated client for passive monitoring.
+	ObserverOnly     bool
+	ActivityRecorder *ActivityRecorder
 }
 
 // NonBlockingUserInputPolicy opts a client into automatically answering
@@ -481,7 +489,7 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		options.NonBlockingUserInput = &policy
 	}
 	return &Client{
-		socket: socket, options: options, pending: make(map[uint64]pendingCall),
+		socket: socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
 		requests: make(map[string]PendingRequest), notices: make(map[string][]Prompt),
 		subscribers: make(map[chan struct{}]string), watched: make(map[string]int),
 		watchedGeneration: make(map[string]uint64), watchLocks: make(map[string]*sync.Mutex),
@@ -573,6 +581,13 @@ func (c *Client) Close() {
 }
 
 func (c *Client) Request(ctx context.Context, method string, params any, result any) error {
+	if c.options.ObserverOnly {
+		switch method {
+		case "thread/read", "thread/turns/list", "thread/items/list", "thread/list":
+		default:
+			return errors.New("observer client cannot mutate or answer a thread")
+		}
+	}
 	if err := c.Ensure(ctx); err != nil {
 		return err
 	}
@@ -662,7 +677,20 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 		if err := json.Unmarshal(data, &message); err != nil {
 			continue
 		}
+		if c.options.ActivityRecorder != nil {
+			threadID := threadIDFromParams(message.Params)
+			c.watchedMu.Lock()
+			watched := c.watched[threadID] > 0
+			c.watchedMu.Unlock()
+			if watched {
+				c.options.ActivityRecorder.observe(c.activityConnection(generation), message, time.Now().UnixMilli())
+			}
+		}
 		if message.Method != "" && len(message.ID) != 0 {
+			if c.options.ObserverOnly {
+				c.broadcast(threadIDFromParams(message.Params))
+				continue
+			}
 			key := string(message.ID)
 			request := PendingRequest{
 				ID: key, Method: message.Method, Params: message.Params,
@@ -871,6 +899,7 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 	}
 	c.connection = nil
 	c.ready = 0
+	c.options.ActivityRecorder.disconnected(c.activityConnection(generation), "")
 	c.pendingMu.Lock()
 	for id, call := range c.pending {
 		if call.generation != generation {
@@ -898,6 +927,10 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 }
 
 func (c *Client) Subscribe(ctx context.Context, threadID string) (<-chan struct{}, func(), error) {
+	if err := c.options.ActivityRecorder.retain(ctx, threadID, true); err != nil {
+		return nil, nil, err
+	}
+	c.retainTurnHistory(threadID, true)
 	channel := make(chan struct{}, 1)
 	c.watchedMu.Lock()
 	c.watched[threadID]++
@@ -930,6 +963,8 @@ func (c *Client) Subscribe(ctx context.Context, threadID string) (<-chan struct{
 }
 
 func (c *Client) removeWatch(threadID string) {
+	defer c.options.ActivityRecorder.release(threadID, true)
+	defer c.releaseTurnHistory(threadID, true)
 	transition := c.watchLock(threadID)
 	transition.Lock()
 	defer transition.Unlock()
@@ -945,6 +980,11 @@ func (c *Client) removeWatch(threadID string) {
 	}
 	c.watchedMu.Unlock()
 	if removed {
+		c.connectionMu.Lock()
+		generation := c.generation
+		c.connectionMu.Unlock()
+		c.options.ActivityRecorder.disconnected(c.activityConnection(generation), threadID)
+		c.options.ActivityRecorder.retire(threadID)
 		c.invalidateThreadSettings(threadID)
 		go c.unsubscribeThread(threadID)
 	}
@@ -993,11 +1033,21 @@ func (c *Client) resumeWatched(ctx context.Context, threadID string) error {
 	if err := c.requestConnected(ctx, "thread/resume", c.threadResumeParams(threadID), &result); err != nil {
 		return err
 	}
+	c.connectionMu.Lock()
+	if c.connection == nil || c.generation != generation || c.ready != generation {
+		c.connectionMu.Unlock()
+		// The server accepted the subscription before disconnecting. Retain
+		// the watch for reconnection, without starting coverage on this stale
+		// transport or turning a successful Subscribe into an error.
+		return nil
+	}
 	c.watchedMu.Lock()
 	if c.watched[threadID] > 0 {
 		c.watchedGeneration[threadID] = generation
 	}
 	c.watchedMu.Unlock()
+	c.options.ActivityRecorder.connected(threadID, c.activityConnection(generation), time.Now().UnixMilli())
+	c.connectionMu.Unlock()
 	c.clearWatchError(threadID)
 	return nil
 }
@@ -1248,6 +1298,9 @@ func (c *Client) releaseClaim(request PendingRequest) {
 }
 
 func (c *Client) finishResponse(ctx context.Context, request PendingRequest, result any) error {
+	if c.options.ObserverOnly {
+		return errors.New("observer client cannot answer a thread")
+	}
 	var rawID any
 	if err := json.Unmarshal([]byte(request.ID), &rawID); err != nil {
 		c.releaseClaim(request)
@@ -3122,7 +3175,7 @@ func (c *Client) resumeThread(ctx context.Context, threadID string) error {
 
 func (c *Client) threadResumeParams(threadID string) map[string]any {
 	params := map[string]any{"threadId": threadID, "excludeTurns": true}
-	if c.options.DeveloperInstructions != "" {
+	if c.options.DeveloperInstructions != "" && !c.options.ObserverOnly {
 		params["developerInstructions"] = c.options.DeveloperInstructions
 	}
 	return params

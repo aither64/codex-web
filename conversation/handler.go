@@ -75,6 +75,12 @@ type Client interface {
 	Subscribe(context.Context, string) (<-chan struct{}, func(), error)
 }
 
+// ActivityProvider is optional, preserving source compatibility for applications
+// implementing Client. The resolver selects its trusted authority separately.
+type ActivityProvider interface {
+	ReadActivity(context.Context, string) (codex.ActivitySnapshot, error)
+}
+
 // ResolveRequest describes the operation for which an application must resolve
 // authorization and runtime ownership.
 type ResolveRequest struct {
@@ -91,6 +97,7 @@ type ResolveRequest struct {
 // including an event stream.
 type Target struct {
 	Client              Client
+	Activity            ActivityProvider
 	ThreadID            string
 	Directory           string
 	Capabilities        Capabilities
@@ -328,6 +335,25 @@ func (handler *Handler) serveOperation(
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	ctx := request.Context()
 	switch operation {
+	case "activity":
+		if request.Method != http.MethodGet || !target.Capabilities.Read {
+			handler.rejectOperation(response, request)
+			return
+		}
+		if target.Activity == nil {
+			writeError(response, http.StatusNotFound, "activity is unavailable")
+			return
+		}
+		activity, err := target.Activity.ReadActivity(ctx, target.ThreadID)
+		if err != nil {
+			handler.serverError(response, request, err)
+			return
+		}
+		if activity.ThreadID != target.ThreadID {
+			handler.serverError(response, request, errors.New("activity provider returned a different thread"))
+			return
+		}
+		writeJSON(response, http.StatusOK, activity)
 	case "thread":
 		if request.Method != http.MethodGet || !target.Capabilities.Read {
 			handler.rejectOperation(response, request)
