@@ -20,13 +20,25 @@ export function createConversationSync(options) {
   let lastSuccessAt = null, lastTraffic = now(), heartbeatDeadline = null;
   let streamOpen = !streaming, streamFailed = false, needsSync = true, readError = null;
   let lastState = "";
+  let warningTimer = null, recoverySince = null;
 
   const publish = () => {
     const status = readError || streamFailed ?
       (browser.navigator?.onLine === false ? "offline" : "reconnecting") :
       needsSync ? (lastSuccessAt === null ? "connecting" : "syncing") :
       !streamOpen ? "reconnecting" : "connected";
-    const state = {status, lastSuccessAt, error: readError?.message || "", httpStatus: readError?.status || null};
+    const accessDenied = readError?.status === 401 || readError?.status === 403;
+    if (status === "connected" || hidden() || suspended) {
+      recoverySince = null;
+      clear(warningTimer); warningTimer = null;
+    } else if (recoverySince === null) {
+      recoverySince = now();
+    }
+    const showWarning = accessDenied || (recoverySince !== null && now() - recoverySince >= 10_000);
+    if (!showWarning && recoverySince !== null && warningTimer === null) {
+      warningTimer = later(() => { warningTimer = null; publish(); }, Math.max(0, 10_000 - (now() - recoverySince)));
+    }
+    const state = {status, showWarning, lastSuccessAt, error: readError?.message || "", httpStatus: readError?.status || null};
     const signature = JSON.stringify(state);
     if (!destroyed && signature !== lastState) {
       lastState = signature;
@@ -169,12 +181,15 @@ export function createConversationSync(options) {
     };
   }
 
-  const recover = () => {
+  const recover = (force = true) => {
     if (destroyed || suspended || hidden() || now() - lastRecovery < 250) return;
     lastRecovery = now(); lastWatch = now();
     clear(retryTimer); retryTimer = null;
-    cancelRead();
-    closeStream();
+    const stale = now() - lastTraffic > (heartbeatDeadline ?? 45_000);
+    if (force || !streamOpen || stale) {
+      cancelRead();
+      closeStream();
+    }
     needsSync = true;
     publish();
     connect();
@@ -197,7 +212,9 @@ export function createConversationSync(options) {
     lastWatch = at;
     watchTimer = later(watch, 5000);
   };
-  const visibility = () => { if (!hidden()) recover(); };
+  const visibility = () => { if (!hidden()) recover(false); else publish(); };
+  const focus = () => recover(false);
+  const online = () => recover(true);
   const offline = () => {
     if (destroyed || suspended) return;
     cancelRead(); closeStream(); streamFailed = true; needsSync = true;
@@ -205,6 +222,7 @@ export function createConversationSync(options) {
   };
   const pagehide = () => {
     suspended = true;
+    clear(warningTimer); warningTimer = null; recoverySince = null;
     cancelRead(); closeStream(); clearRefresh();
     clear(retryTimer); retryTimer = null;
     clear(watchTimer); watchTimer = null;
@@ -216,8 +234,8 @@ export function createConversationSync(options) {
     recover();
     if (live && watchTimer === null) watchTimer = later(watch, 5000);
   };
-  const listeners = [[page, "visibilitychange", visibility], [browser, "focus", recover],
-    [browser, "online", recover], [browser, "offline", offline],
+  const listeners = [[page, "visibilitychange", visibility], [browser, "focus", focus],
+    [browser, "online", online], [browser, "offline", offline],
     [browser, "pagehide", pagehide], [browser, "pageshow", pageshow]];
   for (const [target, name, callback] of listeners) target?.addEventListener?.(name, callback);
   publish(); connect(); scheduleRefresh(0);
@@ -233,7 +251,7 @@ export function createConversationSync(options) {
 }
 
 export function connectionMessage(state) {
-  if (state.status === "connected") return "";
+  if (state.showWarning === false || state.status === "connected") return "";
   if (state.status === "connecting") return "Connecting to conversation…";
   if (state.status === "syncing") return "Refreshing conversation…";
   if (state.httpStatus === 401 || state.httpStatus === 403) return "Conversation access denied. Check your access, then retry.";

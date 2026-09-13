@@ -253,3 +253,33 @@ test("the advertised heartbeat interval determines the stream deadline", async t
   await f.clock.advance(5000);
   assert.equal(f.sources[0].closed, true);
 });
+
+
+test("brief focus refresh keeps the healthy stream and stays quiet", async t => {
+  const f = await fixture(t); f.open(); await f.clock.advance(0);
+  f.browser.hidden = true; f.emit("visibilitychange"); await f.clock.advance(1000);
+  f.browser.hidden = false; f.emit("visibilitychange"); f.emit("focus");
+  assert.equal(f.sources.length, 1);
+  assert.equal(f.state().showWarning, false);
+  await f.clock.advance(0);
+  assert.equal(f.state().status, "connected");
+});
+
+test("recovery gets ten visible seconds regardless of hidden time or repeated focus", async t => {
+  const f = await fixture(t, {read: (_, n) => n === 1 ? "initial" : new Promise(() => {})});
+  f.open(); await f.clock.advance(0);
+  f.browser.hidden = true; f.emit("visibilitychange"); await f.clock.advance(120_000);
+  f.browser.hidden = false; f.emit("visibilitychange"); f.open(); await f.clock.advance(0);
+  assert.equal(f.state().showWarning, false);
+  await f.clock.advance(5000); f.emit("focus");
+  await f.clock.advance(4999); assert.equal(f.state().showWarning, false);
+  await f.clock.advance(1); assert.equal(f.state().showWarning, true);
+});
+
+test("access errors bypass the recovery grace", async t => {
+  const f = await fixture(t, {read: () => { throw Object.assign(new Error("denied"), {status: 403}); }});
+  f.open(); await f.clock.advance(0);
+  assert.equal(f.state().showWarning, true);
+  const {connectionMessage} = await moduleReady;
+  assert.match(connectionMessage(f.state()), /access denied/i);
+});
