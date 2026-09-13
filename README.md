@@ -51,6 +51,11 @@ verify that the
 trusted thread is still bound to the trusted working directory before it
 performs any operation.
 
+Transcripts expose `latestTurnId` from the newest turn in App Server history,
+even when that turn has no rendered items. Consumers offering a plan decision
+must require a completed plan entry belonging to that turn; older entries are
+history, and a missing turn identity does not establish a current proposal.
+
 Transcript entries can include `timestamp` (RFC3339) and
 `timestampApproximate`. Item lifecycle times come from live events and the
 bounded local rollout tail, preferring the item start over its completion or

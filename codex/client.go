@@ -108,6 +108,7 @@ type Option struct {
 type Transcript struct {
 	ThreadID          string            `json:"threadId"`
 	Status            string            `json:"status"`
+	LatestTurnID      string            `json:"latestTurnId,omitempty"`
 	Model             string            `json:"model,omitempty"`
 	ReasoningEffort   string            `json:"reasoningEffort,omitempty"`
 	CollaborationMode string            `json:"collaborationMode,omitempty"`
@@ -2987,6 +2988,7 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 	}
 	slices.Reverse(*page.Data)
 	for _, turn := range *page.Data {
+		transcript.LatestTurnID = stringValue(turn["id"])
 		transcript.Entries = append(transcript.Entries, transcriptEntries(turn)...)
 	}
 	wanted := make(map[transcriptItemKey]bool, len(transcript.Entries))
