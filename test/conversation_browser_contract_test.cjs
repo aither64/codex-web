@@ -730,6 +730,49 @@ class MemoryStorage {
   )).value, "mounted pending");
   unmountCoupled();
 
+  // Sending during an older refresh requires the dirty follow-up to clear
+  // acknowledged text, while edits made during acknowledgement must survive.
+  for (const editDuringAcknowledgement of [false, true]) {
+    let firstRead, acknowledgeEntered, releaseAcknowledgement;
+    const acknowledgementStarted = new Promise(resolve => { acknowledgeEntered = resolve; });
+    let sentID, readCount = 0;
+    const raceClient = {
+      thread() {
+        if (++readCount === 1) return new Promise(resolve => { firstRead = resolve; });
+        return Promise.resolve({status: "idle", entries: [{kind: "userMessage", text: "race message",
+          clientUserMessageId: sentID, clientUserMessageDigest: "a".repeat(64)}]});
+      },
+      async message(message, id) { sentID = id; return {clientUserMessageId: id}; },
+      async acknowledgeMessages() {
+        acknowledgeEntered();
+        await new Promise(resolve => { releaseAcknowledgement = resolve; });
+        return {acknowledgedClientUserMessageIds: [sentID]};
+      },
+    };
+    const raceRoot = new FakeElement("main");
+    const dispose = mountConversation(raceRoot, {
+      id: "race", basePath: "/codex", client: raceClient, storage: new MemoryStorage(),
+      randomUUID: () => "8b0e3d66-f923-4c79-bde5-c25c1edfd02b",
+      capabilities: {pending: false, queueRead: false, queue: false,
+        interrupt: false, settings: false, respond: false, eventStream: false},
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const textarea = raceRoot.descendants().find(element => element.name === "textarea");
+    const form = raceRoot.descendants().find(element => element.attributes.class === "codex-conversation-form");
+    textarea.value = "race message";
+    const submitted = form.listeners.get("submit")({preventDefault() {}});
+    await new Promise(resolve => setImmediate(resolve));
+    firstRead({status: "idle", entries: []});
+    await submitted;
+    assert.equal(textarea.value, "race message");
+    await acknowledgementStarted;
+    if (editDuringAcknowledgement) textarea.value = "race message ";
+    releaseAcknowledgement();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(textarea.value, editDuringAcknowledgement ? "race message " : "");
+    dispose();
+  }
+
   assert.throws(() => mountConversation(new FakeElement("main"), {
     id: "opaque", client: mountedClient, basePath: "/codex", EventSource: null,
   }), /Durable browser storage is unavailable/);

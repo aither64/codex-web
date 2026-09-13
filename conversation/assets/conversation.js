@@ -1,5 +1,7 @@
 import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=2";
 export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=2";
+import {createConversationSync, renderConnectionStatus} from "./sync.js?v=1";
+export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=1";
 
 const defaultLabels = {
   send: "Send",
@@ -208,24 +210,33 @@ export function createConversationClient(options) {
   const request = async (operation, init = {}) => {
     const headers = {...(init.headers || {})};
     if (init.body !== undefined) headers["Content-Type"] = "application/json";
-    const response = await fetchRequest(joinURLPath(target.apiBase, operation), {
-      credentials: "same-origin",
-      signal: options.signal,
-      ...init,
-      headers,
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
-    return payload;
+    const deadline = !init.method || init.method === "GET" ? new AbortController() : null;
+    const timer = deadline ? setTimeout(() => deadline.abort(new Error("Conversation request timed out")), 35_000) : null;
+    const signals = [options.signal, init.signal, deadline?.signal].filter(Boolean);
+    const signal = signals.length ? AbortSignal.any(signals) : undefined;
+    try {
+      const response = await fetchRequest(joinURLPath(target.apiBase, operation), {
+        credentials: "same-origin", ...init, signal, headers,
+      });
+      const payload = await response.json().catch(() => ({}));
+      signal?.throwIfAborted();
+      if (!response.ok) {
+        const error = new Error(payload.error || `Request failed (${response.status})`);
+        error.status = response.status;
+        throw error;
+      }
+      return payload;
+    } finally { clearTimeout(timer); }
   };
+  const read = (operation, options = {}) => request(operation, {signal: options.signal});
   const client = {
-    thread: () => request("thread"),
-    activity: () => request("activity"),
-    pending: async () => (await request("pending")) || [],
-    models: async () => (await request("models")) || [],
-    modes: async () => (await request("collaboration-modes")) || [],
-    queue: async () => (await request("queue")) || [],
-    reconcileQueue: () => request("queue/reconcile", {method: "POST", body: "{}"}),
+    thread: (options) => read("thread", options),
+    activity: (options) => read("activity", options),
+    pending: async (options) => (await read("pending", options)) || [],
+    models: async (options) => (await read("models", options)) || [],
+    modes: async (options) => (await read("collaboration-modes", options)) || [],
+    queue: async (options) => (await read("queue", options)) || [],
+    reconcileQueue: (options = {}) => request("queue/reconcile", {method: "POST", body: "{}", signal: options.signal}),
     message: (message, clientUserMessageId, retry = false, attachments = []) => request("message", {
       method: "POST", body: JSON.stringify({message, clientUserMessageId, retry, ...(attachments.length ? {attachmentIds: attachmentIDs(attachments)} : {})}),
     }),
@@ -572,7 +583,7 @@ export function mountConversation(root, options) {
     ...(options?.capabilities || {}),
   };
   if (!capabilities.read) throw new TypeError("the mounted conversation requires read capability");
-  const EventSourceClass = options?.EventSource || globalThis.EventSource;
+  const EventSourceClass = options?.EventSource === undefined ? globalThis.EventSource : options.EventSource;
   let sender = null;
   if (capabilities.send || capabilities.queue) {
     let storage;
@@ -584,11 +595,11 @@ export function mountConversation(root, options) {
       randomUUID: options?.randomUUID,
     });
   }
-  let stopped = false;
   let currentThread = null;
   let modelCatalog = [];
 
   const status = createElement("span", {class: "codex-conversation-status"}, labels.reconnecting);
+  const connectionStatus = createElement("div", {class: "codex-connection-status"});
   const transcript = createElement("ol", {class: "codex-conversation-transcript"});
   const prompts = createElement("section", {class: "codex-conversation-prompts"});
   const queue = createElement("section", {class: "codex-conversation-queue"});
@@ -610,7 +621,7 @@ export function mountConversation(root, options) {
   const mode = createElement("select", {"aria-label": "Collaboration mode"});
   const saveSettings = createElement("button", {type: "submit"}, "Save settings");
   settingsForm.append(model, effort, mode, saveSettings);
-  const children = [status];
+  const children = [status, connectionStatus];
   if (capabilities.settings) children.push(settingsForm);
   children.push(transcript);
   if (capabilities.pending) children.push(prompts);
@@ -676,7 +687,14 @@ export function mountConversation(root, options) {
     }
   };
 
+  let promptSignature = null;
+  const answerDrafts = new Map();
   const renderPrompts = (entries) => {
+    const signature = JSON.stringify(entries || []);
+    if (signature === promptSignature) return;
+    promptSignature = signature;
+    const ids = new Set((entries || []).map(entry => entry.id));
+    for (const id of answerDrafts.keys()) if (!ids.has(id)) answerDrafts.delete(id);
     prompts.replaceChildren(createElement("h2", {}, "Requests"));
     for (const entry of entries || []) {
       const item = createElement("div", {class: "codex-prompt"});
@@ -689,6 +707,8 @@ export function mountConversation(root, options) {
         const answer = createElement("textarea", {
           "aria-label": "Answers as JSON", rows: "3", placeholder: '{"question":{"answers":["value"]}}',
         });
+        answer.value = answerDrafts.get(entry.id) || "";
+        answer.addEventListener("input", () => answerDrafts.set(entry.id, answer.value));
         const submit = createElement("button", {type: "button"}, "Submit answers");
         submit.addEventListener("click", () => {
           try {
@@ -714,7 +734,16 @@ export function mountConversation(root, options) {
     }
   };
 
-  const renderThread = async (thread) => {
+  const renderThread = async (thread, isCurrent = () => true) => {
+    if (capabilities.send) {
+      const attempt = sender.pending();
+      const draft = textarea.value;
+      if (await sender.acknowledge(thread.entries || []) &&
+          draft.trim() === attempt?.message && textarea.value === draft) {
+        textarea.value = "";
+      }
+    }
+    if (!isCurrent()) return;
     currentThread = thread;
     applyThreadSettings();
     const entries = thread.entries || [];
@@ -745,30 +774,35 @@ export function mountConversation(root, options) {
       item.append(footer);
       elements.push(item);
     }
+    const previousTop = transcript.scrollTop;
     transcript.replaceChildren(...elements);
-    if (capabilities.send) await sender.acknowledge(entries);
+    transcript.scrollTop = previousTop;
     const active = thread.status === "active";
     status.textContent = active ? "Working" : labels.idle;
     if (capabilities.interrupt) interrupt.disabled = !active;
     if (capabilities.queue) queueButton.hidden = !active;
   };
 
-  async function refresh() {
-    if (stopped) return;
-    try {
-      if (capabilities.queue && options.uploadBasePath) await client.reconcileQueue();
-      const [thread, pendingEntries, queuedEntries] = await Promise.all([
-        client.thread(),
-        capabilities.pending ? client.pending() : Promise.resolve([]),
-        capabilities.queueRead ? client.queue() : Promise.resolve([]),
+  const sync = createConversationSync({
+    EventSource: EventSourceClass, eventStream: capabilities.eventStream,
+    eventsPath: capabilities.eventStream ? client.eventsPath() : null,
+    read: async (signal) => {
+      if (capabilities.queue && options.uploadBasePath) await client.reconcileQueue({signal});
+      return Promise.all([
+        client.thread({signal}),
+        capabilities.pending ? client.pending({signal}) : Promise.resolve([]),
+        capabilities.queueRead ? client.queue({signal}) : Promise.resolve([]),
       ]);
-      await renderThread(thread);
+    },
+    apply: async ([thread, pendingEntries, queuedEntries], {isCurrent}) => {
+      await renderThread(thread, isCurrent);
+      if (!isCurrent()) return;
       if (capabilities.pending) renderPrompts(pendingEntries);
       if (capabilities.queueRead) renderQueue(queuedEntries);
-    } catch (error) {
-      if (error.name !== "AbortError") status.textContent = error.message;
-    }
-  }
+    },
+    onStateChange: state => renderConnectionStatus(connectionStatus, state, () => sync.retry()),
+  });
+  const refresh = () => sync.refresh();
 
   if (capabilities.send) form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -779,7 +813,6 @@ export function mountConversation(root, options) {
       await sender.send(textarea.value, uploads?.ids() || []);
       uploads?.clear();
       await refresh();
-      if (!sender.pending()) textarea.value = "";
     } catch (error) {
       if (error.name !== "AbortError") status.textContent = error.message;
     } finally {
@@ -819,12 +852,6 @@ export function mountConversation(root, options) {
     status.textContent = error.message;
   }));
 
-  const events = capabilities.eventStream && EventSourceClass ? new EventSourceClass(client.eventsPath()) : null;
-  if (events) {
-    events.onmessage = refresh;
-    events.addEventListener("ready", refresh);
-    events.onerror = () => { status.textContent = labels.reconnecting; };
-  }
   void Promise.all([
     capabilities.settings ? loadSettings() : Promise.resolve(),
     refresh(),
@@ -833,10 +860,9 @@ export function mountConversation(root, options) {
   });
 
   return () => {
-    stopped = true;
     uploads?.destroy();
     abort.abort();
-    events?.close();
+    sync.destroy();
     root.replaceChildren();
   };
 }

@@ -205,6 +205,31 @@ sender options must resolve to the same durable identity. A custom client that
 does not come from `createConversationClient()` must supply a `basePath`,
 `conversationPath` or `durableNamespace` when durable sending is enabled.
 
+Custom interfaces can use `createConversationSync({eventsPath, read, apply,
+onStateChange})` for conversation recovery. `read(signal)` returns a snapshot;
+`apply(snapshot, {signal, isCurrent})` renders it. Check `isCurrent()` after
+asynchronous rendering steps before changing the interface. The controller
+provides `refresh()`, coalesced `scheduleRefresh(delay)`, `retry()`, and
+`destroy()`. Call `destroy()` when unmounting. `live: false` disables background
+polling and streaming; `eventStream: false` selects snapshot polling only.
+
+Refresh cycles expire after 35 seconds and cancel unfinished sibling work when
+they settle. The controller refreshes on reconnection,
+focus, visibility, pageshow and network restoration, and every 60 seconds while
+visible. It retries failures with backoff and detects stalled advertised
+heartbeats. The event endpoint emits `ready` with `heartbeatIntervalMs: 20000`
+and named `heartbeat` events every 20 seconds. The browser allows two advertised
+intervals plus five seconds before treating a stream as stale. Existing message notifications
+keep their format. Servers without this advertisement use snapshot polling.
+
+GET client methods accept an optional `{signal}` and have a 35-second request
+deadline. `reconcileQueue({signal})` also accepts cancellation; other mutation
+methods retain their existing behavior. Cancellation of a request does not
+prove that a server-side mutation failed. Keep normal durable receipt recovery.
+`onStateChange` receives `status`, `lastSuccessAt`, `error`, and `httpStatus`.
+`renderConnectionStatus(element, state, retry)` displays a connection notice
+separately from conversation activity and leaves message controls usable.
+
 Applications with a custom interface can use `createDurableAttemptStore()` as
 the same verified persistence boundary. It supports a fixed compatibility key
 or multiple attempts under an application-owned prefix, including application

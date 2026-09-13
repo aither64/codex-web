@@ -34,7 +34,7 @@ var browserAttemptPattern = regexp.MustCompile(
 var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
-//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css
+//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js
 var assetFiles embed.FS
 
 // Capabilities grants an opaque conversation ID access to individual
@@ -807,6 +807,8 @@ func (handler *Handler) respond(response http.ResponseWriter, request *http.Requ
 	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
 }
 
+const heartbeatInterval = 20 * time.Second
+
 func (handler *Handler) events(response http.ResponseWriter, request *http.Request, target Target) {
 	if request.Method != http.MethodGet || !target.Capabilities.EventStream {
 		handler.rejectOperation(response, request)
@@ -823,26 +825,36 @@ func (handler *Handler) events(response http.ResponseWriter, request *http.Reque
 		return
 	}
 	defer unsubscribe()
+	keepalive := time.NewTicker(heartbeatInterval)
+	defer keepalive.Stop()
+	handler.streamEvents(response, request, flusher, events, keepalive.C)
+}
+
+func (handler *Handler) streamEvents(response http.ResponseWriter, request *http.Request, flusher http.Flusher, events <-chan struct{}, keepalive <-chan time.Time) {
 	response.Header().Set("Content-Type", "text/event-stream")
 	response.Header().Set("X-Accel-Buffering", "no")
-	_, _ = io.WriteString(response, ": connected\n\n")
+	if _, err := fmt.Fprintf(response, "event: ready\ndata: {\"heartbeatIntervalMs\":%d}\n\n", heartbeatInterval.Milliseconds()); err != nil {
+		return
+	}
 	flusher.Flush()
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
 	for {
 		select {
 		case <-request.Context().Done():
 			return
 		case <-handler.shutdown:
 			return
-		case <-keepalive.C:
-			_, _ = io.WriteString(response, ": keepalive\n\n")
+		case <-keepalive:
+			if _, err := io.WriteString(response, "event: heartbeat\ndata: {}\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		case _, open := <-events:
 			if !open {
 				return
 			}
-			_, _ = io.WriteString(response, "data: update\n\n")
+			if _, err := io.WriteString(response, "data: update\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
