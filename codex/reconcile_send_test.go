@@ -82,3 +82,46 @@ func TestReconcileSendOnlyReadsHistoryForSubmittingAttempts(t *testing.T) {
 		})
 	}
 }
+
+func TestDiscardPreparedSendRetiresOnlyExactUnsubmittedRequests(t *testing.T) {
+	client := newTestClient(filepath.Join(t.TempDir(), "absent-socket"))
+	defer client.Close()
+	if err := client.PrepareSend("thread-1", "message", "legacy", "plan:digest", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RequireSubmissionAttemptsResolved(context.Background(), "thread-1"); err == nil {
+		t.Fatal("prepared attempt did not block lifecycle")
+	}
+	if _, err := client.DiscardPreparedSend("thread-1", "message", "legacy", "plan:another"); err == nil {
+		t.Fatal("discard accepted wrong context")
+	}
+	if _, err := client.DiscardPreparedSend("thread-1", "different", "legacy", "plan:digest"); err == nil {
+		t.Fatal("discard accepted wrong text")
+	}
+	for range 2 {
+		if retired, err := client.DiscardPreparedSend("thread-1", "message", "legacy", "plan:digest"); err != nil || !retired {
+			t.Fatalf("retire: %v, %v", retired, err)
+		}
+	}
+	if err := client.RequireSubmissionAttemptsResolved(context.Background(), "thread-1"); err != nil {
+		t.Fatalf("retired attempt blocks lifecycle: %v", err)
+	}
+	if err := client.PrepareSend("thread-1", "message", "submitted", "plan:digest", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendSubmitting("thread-1", "submitted"); err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := client.DiscardPreparedSend("thread-1", "message", "submitted", "plan:digest"); err != nil || retired {
+		t.Fatalf("discard submitting: %v, %v", retired, err)
+	}
+	if err := client.markSendAccepted("thread-1", "submitted", SendReceipt{TurnID: "accepted", ClientUserMessageID: "submitted"}); err != nil {
+		t.Fatal(err)
+	}
+	if retired, err := client.DiscardPreparedSend("thread-1", "message", "submitted", "plan:digest"); err != nil || retired {
+		t.Fatalf("discard accepted: %v, %v", retired, err)
+	}
+	if receipt, found, err := client.ReconcileSend(context.Background(), "thread-1", "message", "submitted", "plan:digest"); err != nil || !found || receipt.TurnID != "accepted" {
+		t.Fatalf("retained receipt: %#v %v %v", receipt, found, err)
+	}
+}

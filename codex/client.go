@@ -3729,6 +3729,39 @@ func (c *Client) StartQueue(ctx context.Context, threadID, queuedSubmissionID st
 	return nil
 }
 
+// DiscardPreparedSend retires an exact request that has not been submitted.
+// Already absent attempts are retired. Submitting and accepted attempts are
+// retained and return false; callers must reconcile their delivery instead.
+func (c *Client) DiscardPreparedSend(threadID, text, clientID, actionContext string) (bool, error) {
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
+	return queueLedgerTransaction(c, func() (bool, error) {
+		attempt, found := c.sendAttempts[threadID][clientID]
+		if !found {
+			return true, nil
+		}
+		if attempt.Digest != queueTextDigest(text) || attempt.Context != actionContext {
+			return false, errors.New("message identity was reused for another action")
+		}
+		if attempt.State != "prepared" {
+			return false, nil
+		}
+		delete(c.sendAttempts[threadID], clientID)
+		if len(c.sendAttempts[threadID]) == 0 {
+			delete(c.sendAttempts, threadID)
+		}
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			if c.sendAttempts[threadID] == nil {
+				c.sendAttempts[threadID] = make(map[string]sendAttempt)
+			}
+			c.sendAttempts[threadID][clientID] = attempt
+			return false, err
+		}
+		return true, nil
+	})
+}
+
 // ReconcileSend recovers an existing accepted or submitting attempt without
 // submitting a message. Prepared and absent attempts are left untouched.
 func (c *Client) ReconcileSend(
