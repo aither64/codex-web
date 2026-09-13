@@ -3729,6 +3729,53 @@ func (c *Client) StartQueue(ctx context.Context, threadID, queuedSubmissionID st
 	return nil
 }
 
+// ReconcileSend recovers an existing accepted or submitting attempt without
+// submitting a message. Prepared and absent attempts are left untouched.
+func (c *Client) ReconcileSend(
+	ctx context.Context, threadID, text, clientUserMessageID, actionContext string,
+) (SendReceipt, bool, error) {
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
+	attempt, _, err := c.sendAttempt(threadID, clientUserMessageID, text, actionContext)
+	if err != nil {
+		return SendReceipt{}, false, err
+	}
+	return c.reconcileSend(ctx, threadID, text, clientUserMessageID, attempt)
+}
+
+func (c *Client) reconcileSend(
+	ctx context.Context, threadID, text, clientUserMessageID string, attempt sendAttempt,
+) (SendReceipt, bool, error) {
+	if attempt.State == "accepted" {
+		return SendReceipt{
+			TurnID: attempt.TurnID, ClientUserMessageID: clientUserMessageID,
+			Steered: attempt.Steered,
+		}, true, nil
+	}
+	if attempt.State == "submitting" {
+		receipt, found, err := c.sentByClientID(
+			ctx, threadID, clientUserMessageID, text,
+		)
+		if err != nil {
+			return SendReceipt{}, false, err
+		}
+		if found {
+			receipt.Steered = attempt.Steered
+			if err := c.markSendAccepted(threadID, clientUserMessageID, receipt); err != nil {
+				return SendReceipt{}, false, &UnknownSendOutcomeError{Err: fmt.Errorf(
+					"message was accepted but its receipt could not be recorded: %w", err,
+				)}
+			}
+			return receipt, true, nil
+		}
+		return SendReceipt{}, false, &UnknownSendOutcomeError{
+			Err: errors.New("the earlier attempt is not present in Codex history yet"),
+		}
+	}
+	return SendReceipt{}, false, nil
+}
+
 func (c *Client) Send(
 	ctx context.Context, threadID, text, clientUserMessageID, actionContext string,
 ) (SendReceipt, error) {
@@ -3741,31 +3788,8 @@ func (c *Client) Send(
 	if err != nil {
 		return SendReceipt{}, err
 	}
-	if attempted && attempt.State == "accepted" {
-		return SendReceipt{
-			TurnID: attempt.TurnID, ClientUserMessageID: clientUserMessageID,
-			Steered: attempt.Steered,
-		}, nil
-	}
-	if attempted && attempt.State == "submitting" {
-		receipt, found, err := c.sentByClientID(
-			ctx, threadID, clientUserMessageID, text,
-		)
-		if err != nil {
-			return SendReceipt{}, err
-		}
-		if found {
-			receipt.Steered = attempt.Steered
-			if err := c.markSendAccepted(threadID, clientUserMessageID, receipt); err != nil {
-				return SendReceipt{}, &UnknownSendOutcomeError{Err: fmt.Errorf(
-					"message was accepted but its receipt could not be recorded: %w", err,
-				)}
-			}
-			return receipt, nil
-		}
-		return SendReceipt{}, &UnknownSendOutcomeError{
-			Err: errors.New("the earlier attempt is not present in Codex history yet"),
-		}
+	if receipt, found, err := c.reconcileSend(ctx, threadID, text, clientUserMessageID, attempt); err != nil || found {
+		return receipt, err
 	}
 	if err := c.resumeThread(ctx, threadID); err != nil {
 		return SendReceipt{}, err
