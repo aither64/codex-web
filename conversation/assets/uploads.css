@@ -7,3 +7,11 @@
 .codex-upload-drag { outline: 2px dashed #7eb6f6; outline-offset: -2px; }
 .codex-upload-composer { max-height: 12rem; overflow-y: auto; }
 @media (max-width: 600px) { .codex-attachment { width: 100%; } }
+
+.codex-upload-composer[hidden], .codex-attachments[hidden], .codex-upload-notice[hidden] { display: none; }
+.codex-upload-controls { display: inline-flex; align-items: center; }
+button.codex-upload-toggle { display: inline-flex; align-items: center; justify-content: center; padding: .45rem; width: 2.5rem; height: 2.5rem; border: 1px solid #526072; border-radius: 50%; background: transparent; color: inherit; }
+.codex-upload-toggle svg { width: 1.4rem; height: 1.4rem; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.codex-upload-menu { position: fixed; inset: auto; margin: 0; padding: .3rem; min-width: min(12rem, calc(100vw - 1rem)); max-width: calc(100vw - 1rem); box-sizing: border-box; border: 1px solid #526072; border-radius: .65rem; background: #18202d; color: #edf2f7; box-shadow: 0 .4rem 1.2rem #0005; }
+.codex-upload-menu > button { display: block; width: 100%; padding: .65rem .8rem; border: 0; border-radius: .4rem; background: transparent; color: inherit; text-align: left; font: inherit; cursor: pointer; }
+.codex-upload-menu > button:hover, .codex-upload-menu > button:focus-visible { background: #29374b; }

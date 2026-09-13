@@ -56,3 +56,65 @@ test('attachment-only durable submissions bind IDs and preserve retry identity',
   assert.equal(calls.length,2);assert.equal(calls[0][1],calls[1][1]);assert.deepEqual(calls[1][3],[id]);
   await assert.rejects(sender.send('different',[]),/pending|different|previous|unresolved/i);
 });
+
+test('upload controls can share an action row without owning adjacent actions', async (t) => {
+  // This DOM double covers component ownership; native popover behavior is
+  // exercised in the portal's real-browser acceptance fixture.
+  class Element extends EventTarget {
+    children = []; classList = {add() {}, remove() {}}; attributes = new Map(); style = {};
+    textContent = ''; hidden = false; open = false;
+    append(...children) { for (const child of children) {child.parent = this; this.children.push(child);} }
+    replaceChildren(...children) {this.children = []; this.append(...children);}
+    remove() {this.parent.children = this.parent.children.filter((child) => child !== this);}
+    setAttribute(key, value) {this.attributes.set(key, value);}
+    matches() {return this.open;}
+    showPopover() {this.open = true;}
+    hidePopover() {this.open = false;}
+    focus() {}
+    getBoundingClientRect() {return {left:100, top:200, bottom:240, width:180, height:50};}
+  }
+  const events = new EventTarget();
+  const globals = {
+    addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events),
+    document: {createElement: () => new Element(), createElementNS: () => new Element()}, innerWidth: 800, innerHeight: 600,
+  };
+  for (const [key, value] of Object.entries(globals)) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
+    Object.defineProperty(globalThis, key, {value, configurable: true});
+    t.after(() => {if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete globalThis[key];});
+  }
+  const values = new Map();
+  const storage = {getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value)};
+  const client = {list: async () => ({limits, files: []})};
+  const {mountUploads} = await modules;
+  const root = new Element(), actions = new Element(), send = new Element();
+  actions.append(send);
+  const uploads = mountUploads(root, {client, storage, storageKey: 'draft', controlsRoot: actions});
+  await uploads.initialized;
+  assert.equal(root.hidden, true);
+  assert.equal(actions.children[0], send);
+  const [button, picker, menu] = actions.children[1].children;
+  assert.equal(button.attributes.get('aria-label'), 'Add attachments');
+  button.dispatchEvent(new Event('click', {cancelable:true}));
+  assert.equal(menu.open, true);
+  uploads.lock(true);
+  assert.equal(menu.open, false);
+  assert.equal(button.disabled, true);
+  assert.equal(picker.multiple, true);
+  uploads.destroy();
+  assert.deepEqual(actions.children, [send]);
+  assert.deepEqual(root.children, []);
+  assert.equal(root.hidden, false);
+  const fallback = new Element();
+  const legacy = mountUploads(fallback, {client, storage, storageKey: 'legacy'});
+  await legacy.initialized;
+  assert.equal(fallback.hidden, false);
+  assert.equal(fallback.children[0].children[0].disabled, false);
+  legacy.destroy();
+  const errorRoot = new Element();
+  const failed = mountUploads(errorRoot, {client: {list: async () => {throw Error('Unavailable');}}, storage, storageKey: 'failed', controlsRoot: actions});
+  await failed.initialized;
+  assert.equal(errorRoot.hidden, false);
+  assert.equal(errorRoot.children[0].textContent, 'Unavailable');
+  failed.destroy();
+});

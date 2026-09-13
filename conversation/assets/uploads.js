@@ -163,7 +163,8 @@ export function renderAttachments(files, options = {}) {
 }
 
 // mountUploads owns draft selection only. Successfully submitted IDs are cleared
-// from the composer without deleting their server-side files.
+// from the composer without deleting their server-side files. An optional
+// controlsRoot places the menu beside host actions, leaving root for draft cards.
 export function mountUploads(root, options) {
   const storage = options.storage || globalThis.localStorage;
   const key = options.storageKey;
@@ -175,15 +176,71 @@ export function mountUploads(root, options) {
   let active = 0;
   let resumeEntry = null;
   const controllers = new Map();
+  const controlsRoot = options.controlsRoot || root;
+  const initiallyHidden = root.hidden;
+  const controls = document.createElement("span");
+  controls.className = "codex-upload-controls";
   const picker = document.createElement("input");
   picker.type = "file"; picker.multiple = true; picker.hidden = true;
   const button = document.createElement("button");
-  button.type = "button"; button.className = "quiet"; button.textContent = "Attach files";
+  button.type = "button"; button.className = "quiet codex-upload-toggle";
+  button.disabled = true;
+  button.setAttribute("aria-label", "Add attachments");
+  button.setAttribute("aria-haspopup", "menu");
+  button.setAttribute("aria-expanded", "false");
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("viewBox", "0 0 24 24"); icon.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M12 5v14M5 12h14"); icon.append(path); button.append(icon);
+  const menu = document.createElement("div");
+  menu.className = "codex-upload-menu"; menu.popover = "auto";
+  menu.id = `codex-upload-menu-${crypto.randomUUID()}`;
+  menu.setAttribute("role", "menu"); menu.setAttribute("aria-label", "Attachments");
+  button.setAttribute("aria-controls", menu.id);
+  button.popoverTargetElement = menu;
+  const attach = document.createElement("button");
+  attach.type = "button"; attach.textContent = "Attach files"; attach.setAttribute("role", "menuitem");
+  menu.append(attach);
+  const isOpen = () => menu.matches(":popover-open");
+  const closeMenu = (restoreFocus = false) => {
+    if (!isOpen()) return;
+    menu.hidePopover(); button.setAttribute("aria-expanded", "false");
+    if (restoreFocus) button.focus();
+  };
+  const positionMenu = () => {
+    if (!isOpen()) return;
+    const anchor = button.getBoundingClientRect();
+    const size = menu.getBoundingClientRect();
+    const gap = 6, margin = 8;
+    const above = anchor.top - size.height - gap;
+    const top = above >= margin ? above : anchor.bottom + gap;
+    menu.style.left = `${Math.max(margin, Math.min(anchor.left, innerWidth - size.width - margin))}px`;
+    menu.style.top = `${Math.max(margin, Math.min(top, innerHeight - size.height - margin))}px`;
+  };
+  const openMenu = () => {
+    if (button.disabled || stopped || isOpen()) return;
+    menu.showPopover(); button.setAttribute("aria-expanded", "true"); positionMenu(); attach.focus();
+  };
+  button.addEventListener("click", (event) => { event.preventDefault(); if (isOpen()) closeMenu(true); else openMenu(); });
+  button.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); openMenu(); }
+  });
+  menu.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); closeMenu(true); }
+    else if (event.key === "Tab") closeMenu(true);
+    else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) { event.preventDefault(); attach.focus(); }
+  });
+  menu.addEventListener("toggle", () => button.setAttribute("aria-expanded", String(isOpen())));
+  globalThis.addEventListener("resize", positionMenu);
+  globalThis.addEventListener("scroll", positionMenu, true);
   const notice = document.createElement("p");
   notice.className = "codex-upload-notice"; notice.setAttribute("role", "status");
   const list = document.createElement("div"); list.className = "codex-attachments";
   root.classList.add("codex-upload-composer");
-  root.append(button, picker, notice, list);
+  controls.append(button, picker, menu); controlsRoot.append(controls);
+  notice.hidden = true; list.hidden = true;
+  if (controlsRoot !== root) root.hidden = true;
+  root.append(notice, list);
   const ready = () => Boolean(limits) && entries.every((entry) => entry.state === "ready" && !entry.removing);
   const save = () => {
     const value = JSON.stringify(entries.map(({file, error, progress, running, removing, task, ...entry}) => entry));
@@ -191,7 +248,11 @@ export function mountUploads(root, options) {
     if (storage.getItem(key) !== value) throw new Error("Browser storage could not retain the attachment draft");
   };
   const render = () => {
-    button.disabled = locked || !limits;
+    if (stopped) return;
+    button.disabled = locked || !limits; attach.disabled = button.disabled;
+    if (button.disabled) closeMenu();
+    notice.hidden = !notice.textContent; list.hidden = entries.length === 0;
+    if (controlsRoot !== root) root.hidden = notice.hidden && list.hidden;
     list.replaceChildren();
     for (const entry of entries) {
       const card = document.createElement("div"); card.className = "codex-attachment";
@@ -249,6 +310,7 @@ export function mountUploads(root, options) {
   };
   const add = (files) => {
     if (locked || !limits) return;
+    notice.textContent = "";
     let total = entries.reduce((sum, entry) => sum + entry.size, 0);
     for (const file of files) {
       if (file.size > limits.fileBytes || entries.length >= limits.files || total + file.size > limits.promptBytes) {
@@ -259,7 +321,7 @@ export function mountUploads(root, options) {
     }
     try { save(); pump(); } catch (error) { notice.textContent = error.message; locked = true; render(); }
   };
-  button.addEventListener("click", () => { resumeEntry = null; picker.multiple = true; picker.click(); });
+  attach.addEventListener("click", () => { closeMenu(true); resumeEntry = null; picker.multiple = true; picker.click(); });
   picker.addEventListener("change", () => {
     if (resumeEntry && picker.files[0]) { resumeEntry.file = picker.files[0]; resumeEntry.error = null; resumeEntry = null; pump(); }
     else add(picker.files);
@@ -282,7 +344,6 @@ export function mountUploads(root, options) {
         if (entry.id && (!available.has(entry.id) || entry.state === "deleted")) { entry.state = "missing"; entry.error = "File expired or was removed. Remove it and upload again."; }
       }
       save();
-      notice.textContent = `Up to ${limits.files} files, ${fileSize(limits.fileBytes)} each; ${fileSize(limits.promptBytes)} per prompt.`;
     } catch (error) { notice.textContent = error.message; locked = true; }
     render();
   })();
@@ -293,6 +354,11 @@ export function mountUploads(root, options) {
     ids: () => { if (!ready()) throw new Error("Wait for uploads to finish, or remove the unfinished files"); return attachmentIDs(entries.map((entry) => entry.id)); },
     clear: () => { entries = []; save(); render(); },
     lock: (value) => { locked = value; render(); if (!value) pump(); },
-    destroy: () => { stopped = true; controllers.forEach((controller) => controller.abort()); dropTarget.removeEventListener("dragover", drag); dropTarget.removeEventListener("dragleave", leave); dropTarget.removeEventListener("drop", drop); root.replaceChildren(); },
+    destroy: () => {
+      closeMenu(); stopped = true; controllers.forEach((controller) => controller.abort());
+      globalThis.removeEventListener("resize", positionMenu); globalThis.removeEventListener("scroll", positionMenu, true);
+      dropTarget.removeEventListener("dragover", drag); dropTarget.removeEventListener("dragleave", leave); dropTarget.removeEventListener("drop", drop);
+      controls.remove(); root.replaceChildren(); root.hidden = initiallyHidden;
+    },
   };
 }

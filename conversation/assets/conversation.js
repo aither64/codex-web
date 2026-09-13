@@ -1,5 +1,5 @@
-import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js";
-export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js";
+import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=2";
+export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=2";
 
 const defaultLabels = {
   send: "Send",
@@ -621,8 +621,10 @@ export function mountConversation(root, options) {
   if (options?.uploadBasePath && (capabilities.send || capabilities.queue)) {
     const uploadRoot = document.createElement("div");
     form.insertBefore(uploadRoot, actions);
+    const uploadControls = document.createElement("span");
+    actions.prepend(uploadControls);
     uploads = mountUploads(uploadRoot, {
-      basePath: options.uploadBasePath, dropTarget: form,
+      basePath: options.uploadBasePath, dropTarget: form, controlsRoot: uploadControls,
       storage: options.storage || globalThis.localStorage,
       storageKey: `codex-web:uploads:${options.uploadBasePath}`,
       onChange: ({ready, count}) => { textarea.required = !count; send.disabled = !ready; queueButton.disabled = !ready; },

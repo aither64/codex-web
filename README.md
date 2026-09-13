@@ -246,6 +246,11 @@ optional `uploadBasePath`; custom clients pass attachment IDs to `message` as
 its fourth argument, or `queueMessage` as its third. Durable sender `send` and
 `queue` accept IDs as their second argument. A reload retains selection metadata;
 resuming an incomplete upload requires reselecting and verifying the file.
+`mountUploads(root, options)` renders draft cards and errors in `root`. Pass
+`options.controlsRoot` to put its + attachment menu beside your form actions;
+omit it to keep everything in `root`. A separate empty card root is hidden.
+`destroy()` removes the component's controls and listeners while preserving
+adjacent host actions. The menu uses the browser's Popover API.
 
 `cmd/codex-web-example` is a standalone reference application. It accepts a
 trusted Unix socket, thread ID and working directory on the command line and
