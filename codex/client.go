@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -62,7 +63,8 @@ type pendingCall struct {
 }
 
 type PendingRequest struct {
-	ID         string          `json:"id"`
+	ID         string `json:"id"`
+	token      string
 	Method     string          `json:"method"`
 	Params     json.RawMessage `json:"params"`
 	generation uint64
@@ -74,9 +76,11 @@ type PendingRequest struct {
 
 type Prompt struct {
 	ID                        string         `json:"id"`
+	Token                     string         `json:"token,omitempty"`
 	Method                    string         `json:"method"`
 	Kind                      string         `json:"kind"`
 	ThreadID                  string         `json:"threadId"`
+	TurnID                    string         `json:"turnId,omitempty"`
 	ItemID                    string         `json:"itemId,omitempty"`
 	Params                    map[string]any `json:"params"`
 	Item                      map[string]any `json:"item,omitempty"`
@@ -700,20 +704,40 @@ func (c *Client) requestOn(
 }
 
 func (c *Client) writeOn(ctx context.Context, connection *websocket.Conn, generation uint64, data []byte) error {
+	return c.writeOffer(ctx, connection, generation, data, nil)
+}
+
+// A claim can wait behind other writes. Validate it after acquiring writeMu and
+// keep retirement/admission serialized until the response has been written.
+func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, generation uint64, data []byte, offer *PendingRequest) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.connectionMu.Lock()
-	current := c.connection
-	currentGeneration := c.generation
+	if connection == nil || c.connection != connection || c.generation != generation {
+		c.connectionMu.Unlock()
+		return errConnectionChanged
+	}
+	if offer != nil {
+		c.pendingMu.Lock()
+		current, ok := c.requests[offer.ID]
+		if !ok || !current.claimed || current.token != offer.token || current.generation != generation || current.connection != connection {
+			c.pendingMu.Unlock()
+			c.connectionMu.Unlock()
+			return promptError("prompt_changed", "This question is no longer pending.")
+		}
+	}
 	c.connectionMu.Unlock()
-	if connection == nil || current != connection || currentGeneration != generation {
-		return errors.New("Codex App Server connection changed before the request was sent")
+	err := connection.Write(ctx, websocket.MessageText, data)
+	if offer != nil {
+		if err == nil {
+			delete(c.requests, offer.ID)
+		}
+		c.pendingMu.Unlock()
 	}
-	if err := connection.Write(ctx, websocket.MessageText, data); err != nil {
+	if err != nil {
 		c.markDisconnected(connection, generation, err)
-		return err
 	}
-	return nil
+	return err
 }
 
 func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
@@ -751,14 +775,14 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 				c.rejectUnsupported(request, promptErr)
 				continue
 			}
-			c.pendingMu.Lock()
-			c.requests[key] = request
-			c.pendingMu.Unlock()
+			if !c.admitPrompt(&request) {
+				continue
+			}
 			if prompt.Kind == "userInput" && !prompt.IsBlocking &&
 				c.options.NonBlockingUserInput != nil {
 				policy := c.options.NonBlockingUserInput
 				go c.autoResolveUserInput(
-					request.ID, prompt.ThreadID, policy.HiddenGrace+policy.VisibleCountdown,
+					request.ID, prompt.ThreadID, request.token, policy.HiddenGrace+policy.VisibleCountdown,
 				)
 			}
 			c.broadcast(prompt.ThreadID)
@@ -799,11 +823,29 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 	}
 }
 
-func (c *Client) autoResolveUserInput(id, threadID string, delay time.Duration) {
+// Admission and disconnect use the same lock order so a retired reader cannot
+// restore a stale offer after disconnect has removed its requests.
+func (c *Client) admitPrompt(request *PendingRequest) bool {
+	c.connectionMu.Lock()
+	defer c.connectionMu.Unlock()
+	if c.connection != request.connection || c.generation != request.generation || c.connection == nil {
+		return false
+	}
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if current, ok := c.requests[request.ID]; ok && current.generation == request.generation {
+		return false
+	}
+	request.token = rand.Text()
+	c.requests[request.ID] = *request
+	return true
+}
+
+func (c *Client) autoResolveUserInput(id, threadID, token string, delay time.Duration) {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	<-timer.C
-	request, ok := c.claimAutoResolvableUserInput(id, threadID)
+	request, ok := c.claimAutoResolvableUserInput(id, threadID, token)
 	if !ok {
 		return
 	}
@@ -814,11 +856,14 @@ func (c *Client) autoResolveUserInput(id, threadID string, delay time.Duration) 
 	})
 }
 
-func (c *Client) claimAutoResolvableUserInput(id, threadID string) (PendingRequest, bool) {
+func (c *Client) claimAutoResolvableUserInput(id, threadID, token string) (PendingRequest, bool) {
+	c.connectionMu.Lock()
+	defer c.connectionMu.Unlock()
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	request, ok := c.requests[id]
-	if !ok || request.claimed || request.snoozed {
+	if !ok || request.claimed || request.snoozed || request.token != token ||
+		request.generation != c.generation || request.connection != c.connection || c.connection == nil {
 		return PendingRequest{}, false
 	}
 	prompt, err := c.normalizePrompt(request)
@@ -831,11 +876,21 @@ func (c *Client) claimAutoResolvableUserInput(id, threadID string) (PendingReque
 }
 
 func (c *Client) SnoozeUserInput(id, threadID string) error {
+	return c.snoozeUserInput(id, threadID, "")
+}
+
+func (c *Client) snoozeUserInput(id, threadID, token string) error {
+	c.connectionMu.Lock()
+	defer c.connectionMu.Unlock()
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	request, ok := c.requests[id]
 	if !ok || request.claimed {
-		return errors.New("pending request not found")
+		return promptError("prompt_changed", "This question is no longer pending.")
+	}
+	if request.generation != c.generation || request.connection != c.connection || c.connection == nil ||
+		(token != "" && request.token != token) {
+		return promptError("prompt_changed", "This question needs to be refreshed.")
 	}
 	prompt, err := c.normalizePrompt(request)
 	if err != nil {
@@ -977,6 +1032,7 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 	c.settingsChanged = make(chan struct{})
 	c.settingsMu.Unlock()
 	c.connectionMu.Unlock()
+	connection.CloseNow()
 	c.broadcast("")
 }
 
@@ -1217,12 +1273,14 @@ func (c *Client) broadcast(threadID string) {
 }
 
 func (c *Client) Prompts(threadID string) []Prompt {
+	c.connectionMu.Lock()
+	defer c.connectionMu.Unlock()
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	result := make([]Prompt, 0, len(c.notices[threadID])+len(c.requests))
 	result = append(result, c.notices[threadID]...)
 	for _, request := range c.requests {
-		if request.claimed {
+		if request.claimed || request.generation != c.generation || request.connection != c.connection {
 			continue
 		}
 		prompt, err := c.normalizePrompt(request)
@@ -1263,13 +1321,17 @@ func (c *Client) PromptsWithItems(ctx context.Context, threadID string) ([]Promp
 }
 
 func (c *Client) RespondDecision(ctx context.Context, id, threadID, decision string) error {
-	request, prompt, err := c.claim(id, threadID)
+	return c.respondDecision(ctx, id, threadID, "", decision)
+}
+
+func (c *Client) respondDecision(ctx context.Context, id, threadID, token, decision string) error {
+	request, prompt, err := c.claim(id, threadID, token)
 	if err != nil {
 		return err
 	}
 	if !slices.Contains(prompt.AvailableDecisions, decision) {
 		c.releaseClaim(request)
-		return errors.New("decision was not offered by the Codex App Server")
+		return promptError("invalid_response", "This decision was not offered by Codex.")
 	}
 	if requiresThreadItem(prompt.Kind) {
 		items, itemErr := c.threadItems(ctx, threadID, prompt.ItemID)
@@ -1294,17 +1356,21 @@ func (c *Client) RespondDecision(ctx context.Context, id, threadID, decision str
 }
 
 func (c *Client) RespondAnswers(ctx context.Context, id, threadID string, answers map[string]map[string][]string) error {
-	request, prompt, err := c.claim(id, threadID)
+	return c.respondAnswers(ctx, id, threadID, "", answers)
+}
+
+func (c *Client) respondAnswers(ctx context.Context, id, threadID, token string, answers map[string]map[string][]string) error {
+	request, prompt, err := c.claim(id, threadID, token)
 	if err != nil {
 		return err
 	}
 	if prompt.Kind != "userInput" {
 		c.releaseClaim(request)
-		return errors.New("this request does not accept answers")
+		return promptError("invalid_response", "This request does not accept answers.")
 	}
 	if err := validateAnswers(prompt, answers); err != nil {
 		c.releaseClaim(request)
-		return err
+		return &PromptResponseError{Code: "invalid_response", NotSent: true, Err: err}
 	}
 	return c.finishResponse(ctx, request, map[string]any{"answers": answers})
 }
@@ -1355,12 +1421,18 @@ func validUserNote(value string) bool {
 	return strings.HasPrefix(value, prefix) && strings.TrimSpace(strings.TrimPrefix(value, prefix)) != ""
 }
 
-func (c *Client) claim(id, threadID string) (PendingRequest, Prompt, error) {
+func (c *Client) claim(id, threadID, token string) (PendingRequest, Prompt, error) {
+	c.connectionMu.Lock()
+	defer c.connectionMu.Unlock()
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	request, ok := c.requests[id]
 	if !ok || request.claimed {
-		return PendingRequest{}, Prompt{}, errors.New("pending request not found")
+		return PendingRequest{}, Prompt{}, promptError("prompt_changed", "This question is no longer pending.")
+	}
+	if request.generation != c.generation || request.connection != c.connection || c.connection == nil ||
+		(token != "" && request.token != token) {
+		return PendingRequest{}, Prompt{}, promptError("prompt_changed", "This question needs to be refreshed.")
 	}
 	prompt, err := c.normalizePrompt(request)
 	if err != nil {
@@ -1377,7 +1449,7 @@ func (c *Client) claim(id, threadID string) (PendingRequest, Prompt, error) {
 func (c *Client) releaseClaim(request PendingRequest) {
 	c.pendingMu.Lock()
 	current, ok := c.requests[request.ID]
-	if ok && current.generation == request.generation {
+	if ok && current.generation == request.generation && current.token == request.token {
 		current.claimed = false
 		c.requests[request.ID] = current
 	}
@@ -1398,16 +1470,14 @@ func (c *Client) finishResponse(ctx context.Context, request PendingRequest, res
 		c.releaseClaim(request)
 		return err
 	}
-	if err := c.writeOn(ctx, request.connection, request.generation, message); err != nil {
+	if err := c.writeOffer(ctx, request.connection, request.generation, message, &request); err != nil {
 		c.releaseClaim(request)
-		return err
+		var responseError *PromptResponseError
+		if errors.As(err, &responseError) {
+			return err
+		}
+		return &PromptResponseError{Code: "prompt_transport", NotSent: errors.Is(err, errConnectionChanged), Err: err}
 	}
-	c.pendingMu.Lock()
-	current, ok := c.requests[request.ID]
-	if ok && current.generation == request.generation {
-		delete(c.requests, request.ID)
-	}
-	c.pendingMu.Unlock()
 	c.broadcast(requestThreadID(request))
 	return nil
 }
@@ -1418,8 +1488,8 @@ func normalizePrompt(request PendingRequest) (Prompt, error) {
 		return Prompt{}, err
 	}
 	prompt := Prompt{
-		ID: request.ID, Method: request.Method, ThreadID: stringValue(params["threadId"]),
-		ItemID: stringValue(params["itemId"]), Params: params,
+		ID: request.ID, Token: request.token, Method: request.Method, ThreadID: stringValue(params["threadId"]),
+		ItemID: stringValue(params["itemId"]), TurnID: stringValue(params["turnId"]), Params: params,
 	}
 	switch request.Method {
 	case "item/commandExecution/requestApproval":

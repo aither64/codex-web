@@ -123,6 +123,16 @@ class MemoryStorage {
     "/shared/conversations/opaque/respond",
   ]);
   assert.equal(client.eventsPath(), "/shared/conversations/opaque/events");
+  await client.snooze("bound", "offer-token");
+  assert.deepEqual(JSON.parse(requests.at(-1).options.body), {id: "bound", snooze: true, token: "offer-token"});
+  for (const notSent of [true, false]) {
+    const unavailable = createConversationClient({id: "opaque", basePath: "/shared", fetch: async () => ({
+      ok: false, status: 503, json: async () => ({error: "Connection changed", code: "prompt_transport", notSent}),
+    })});
+    await assert.rejects(unavailable.respond("bound", {token: "offer-token", decision: "accept"}), error =>
+      error.status === 503 && error.code === "prompt_transport" && error.notSent === notSent);
+  }
+
   assert.equal(JSON.parse(requests[5].options.body).retry, true);
   const compatibilityClient = createConversationClient({
     id: "opaque", basePath: "/shared", conversationPath: "/api/sessions/opaque",
@@ -683,12 +693,16 @@ class MemoryStorage {
   unmount();
 
   const promptRoot = new FakeElement("main");
+  const promptActions = [];
   const promptClient = {
+    async respond(id, payload) { promptActions.push({id, ...payload}); },
+    async snooze(id, token) { promptActions.push({id, token, snooze: true}); },
     async thread() { return {entries: [], status: "idle"}; },
     async pending() {
       return [
-        {id: "untimed", kind: "userInput", item: {}},
-        {id: "timed", kind: "userInput", item: {}, autoResolutionAtMs: Date.now() + 1000},
+        {id: "untimed", token: "offer-untimed", kind: "userInput", item: {}},
+        {id: "timed", token: "offer-timed", kind: "userInput", item: {}, autoResolutionAtMs: Date.now() + 1000},
+        {id: "approval", token: "offer-approval", kind: "command", item: {}, availableDecisions: ["accept"]},
       ];
     },
   };
@@ -701,6 +715,17 @@ class MemoryStorage {
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(promptRoot.descendants().filter((element) => element.textContent === "Snooze").length, 1);
+  const findPromptControl = text => promptRoot.descendants().find(element => element.textContent === text);
+  promptRoot.descendants().find(element => element.name === "textarea").value = '{"choice":{"answers":["First"]}}';
+  findPromptControl("Submit answers").listeners.get("click")();
+  findPromptControl("Snooze").listeners.get("click")();
+  findPromptControl("accept").listeners.get("click")();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(promptActions, [
+    {id: "untimed", token: "offer-untimed", answers: {choice: {answers: ["First"]}}},
+    {id: "timed", token: "offer-timed", snooze: true},
+    {id: "approval", token: "offer-approval", decision: "accept"},
+  ]);
   unmountPrompts();
 
   const mountedCoupledStorage = new MemoryStorage();

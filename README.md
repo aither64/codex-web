@@ -24,6 +24,15 @@ Nonblocking user-input requests stay pending by default. Set
 `ClientOptions.NonBlockingUserInput` only when the embedding application owns
 an explicit automatic-response policy.
 
+Pending prompts expose an opaque `token` for each offer. Send that token with
+answers, decisions and snoozes through `RespondPrompt`; an expired offer returns
+`PromptResponseError`. Its `NotSent` field distinguishes a rejected response
+from an uncertain transport outcome. Only retry definitely unsent answers after
+restoring and checking the same thread, turn, item and question contents.
+The legacy Go response methods remain available to direct callers. HTTP clients
+backed by `PromptResponder` must supply tokens; older browser requests receive
+`reload_required`. Other implementations retain their existing HTTP contract.
+
 `Client.ReadAccountRateLimits(ctx)` reads current usage with
 `account/rateLimits/read`. Its typed result contains the legacy `RateLimits`
 snapshot and named `RateLimitsByLimitID` buckets, with nullable windows,

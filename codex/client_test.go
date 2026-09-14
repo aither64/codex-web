@@ -2757,6 +2757,9 @@ func TestRequireThreadIdleRejectsPendingRequestsAndQueuedMessages(t *testing.T) 
 			client := newTestClient(socket)
 			defer client.Close()
 			if testCase.pending {
+				if err := client.Ensure(context.Background()); err != nil {
+					t.Fatal(err)
+				}
 				params, err := json.Marshal(map[string]any{
 					"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
 					"questions": []any{map[string]any{
@@ -2767,9 +2770,13 @@ func TestRequireThreadIdleRejectsPendingRequestsAndQueuedMessages(t *testing.T) 
 				if err != nil {
 					t.Fatal(err)
 				}
-				client.requests["request-1"] = PendingRequest{
+				client.connectionMu.Lock()
+				request := PendingRequest{
 					ID: "request-1", Method: "item/tool/requestUserInput", Params: params,
+					connection: client.connection, generation: client.generation,
 				}
+				client.connectionMu.Unlock()
+				client.admitPrompt(&request)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()

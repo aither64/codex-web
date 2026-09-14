@@ -223,6 +223,8 @@ export function createConversationClient(options) {
       if (!response.ok) {
         const error = new Error(payload.error || `Request failed (${response.status})`);
         error.status = response.status;
+        error.code = typeof payload.code === "string" ? payload.code : "";
+        error.notSent = payload.notSent === true;
         throw error;
       }
       return payload;
@@ -265,8 +267,8 @@ export function createConversationClient(options) {
     respond: (id, payload) => request("respond", {
       method: "POST", body: JSON.stringify({id, ...payload}),
     }),
-    snooze: (id) => request("respond", {
-      method: "POST", body: JSON.stringify({id, snooze: true}),
+    snooze: (id, token) => request("respond", {
+      method: "POST", body: JSON.stringify({id, snooze: true, ...(token ? {token} : {})}),
     }),
     eventsPath: () => joinURLPath(target.apiBase, "events"),
   };
@@ -712,7 +714,7 @@ export function mountConversation(root, options) {
         const submit = createElement("button", {type: "button"}, "Submit answers");
         submit.addEventListener("click", () => {
           try {
-            void client.respond(entry.id, {answers: JSON.parse(answer.value)}).then(refresh);
+            void client.respond(entry.id, {token: entry.token, answers: JSON.parse(answer.value)}).then(refresh).catch(error => { status.textContent = error.message; });
           } catch (error) {
             status.textContent = error.message;
           }
@@ -720,13 +722,13 @@ export function mountConversation(root, options) {
         item.append(answer, submit);
         if (Number(entry.autoResolutionAtMs) > 0) {
           const snooze = createElement("button", {type: "button"}, "Snooze");
-          snooze.addEventListener("click", () => void client.snooze(entry.id).then(refresh));
+          snooze.addEventListener("click", () => void client.snooze(entry.id, entry.token).then(refresh).catch(error => { status.textContent = error.message; }));
           item.append(snooze);
         }
       } else {
         for (const decision of entry.availableDecisions || ["accept", "decline"]) {
           const button = createElement("button", {type: "button"}, decision);
-          button.addEventListener("click", () => void client.respond(entry.id, {decision}).then(refresh));
+          button.addEventListener("click", () => void client.respond(entry.id, {token: entry.token, decision}).then(refresh).catch(error => { status.textContent = error.message; }));
           item.append(button);
         }
       }

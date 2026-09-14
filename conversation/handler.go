@@ -81,6 +81,12 @@ type ActivityProvider interface {
 	ReadActivity(context.Context, string) (codex.ActivitySnapshot, error)
 }
 
+// PromptResponder adds request-bound responses without changing the legacy
+// Client interface used by existing embedding applications.
+type PromptResponder interface {
+	RespondPrompt(context.Context, string, codex.PromptResponse) error
+}
+
 // ResolveRequest describes the operation for which an application must resolve
 // authorization and runtime ownership.
 type ResolveRequest struct {
@@ -763,12 +769,7 @@ func (handler *Handler) respond(response http.ResponseWriter, request *http.Requ
 		handler.rejectOperation(response, request)
 		return
 	}
-	var body struct {
-		ID       string                         `json:"id"`
-		Decision string                         `json:"decision"`
-		Answers  map[string]map[string][]string `json:"answers"`
-		Snooze   bool                           `json:"snooze"`
-	}
+	var body codex.PromptResponse
 	if !handler.decode(response, request, &body) {
 		return
 	}
@@ -793,7 +794,21 @@ func (handler *Handler) respond(response http.ResponseWriter, request *http.Requ
 		return
 	}
 	var err error
-	if body.Snooze {
+	responder, bound := target.Client.(PromptResponder)
+	if bound && body.Token == "" {
+		writeJSON(response, http.StatusConflict, map[string]any{"error": "Reload this page to update the question controls.", "code": "reload_required", "notSent": true})
+		return
+	}
+	if body.Token != "" {
+		ok := bound
+		if !ok {
+			writeJSON(response, http.StatusConflict, map[string]any{
+				"error": "Reload this page to update the question controls.", "code": "reload_required", "notSent": true,
+			})
+			return
+		}
+		err = responder.RespondPrompt(request.Context(), target.ThreadID, body)
+	} else if body.Snooze {
 		err = target.Client.SnoozeUserInput(body.ID, target.ThreadID)
 	} else if len(body.Answers) > 0 {
 		err = target.Client.RespondAnswers(request.Context(), body.ID, target.ThreadID, body.Answers)
@@ -801,6 +816,23 @@ func (handler *Handler) respond(response http.ResponseWriter, request *http.Requ
 		err = target.Client.RespondDecision(request.Context(), body.ID, target.ThreadID, body.Decision)
 	}
 	if err != nil {
+		var prompt *codex.PromptResponseError
+		if errors.As(err, &prompt) {
+			status := http.StatusServiceUnavailable
+			message := "The connection changed before your response was sent."
+			if prompt.Code == "prompt_changed" {
+				status = http.StatusConflict
+				message = prompt.Error()
+			} else if prompt.Code == "invalid_response" {
+				status = http.StatusBadRequest
+				message = prompt.Error()
+			} else if !prompt.NotSent {
+				message = "Delivery could not be confirmed."
+			}
+			handler.logError(request, err)
+			writeJSON(response, status, map[string]any{"error": message, "code": prompt.Code, "notSent": prompt.NotSent})
+			return
+		}
 		handler.serverError(response, request, err)
 		return
 	}
