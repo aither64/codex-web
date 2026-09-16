@@ -175,6 +175,7 @@ export function mountUploads(root, options) {
   let stopped = false;
   let active = 0;
   let resumeEntry = null;
+  let persistenceError = "";
   const controllers = new Map();
   const controlsRoot = options.controlsRoot || root;
   const initiallyHidden = root.hidden;
@@ -241,16 +242,42 @@ export function mountUploads(root, options) {
   notice.hidden = true; list.hidden = true;
   if (controlsRoot !== root) root.hidden = true;
   root.append(notice, list);
-  const ready = () => Boolean(limits) && entries.every((entry) => entry.state === "ready" && !entry.removing);
-  const save = () => {
-    const value = JSON.stringify(entries.map(({file, error, progress, running, removing, task, ...entry}) => entry));
-    storage.setItem(key, value);
-    if (storage.getItem(key) !== value) throw new Error("Browser storage could not retain the attachment draft");
+  const ready = () => Boolean(limits) && !persistenceError && entries.every((entry) => entry.state === "ready" && !entry.error && !entry.removing);
+  const save = (next = entries) => {
+    try {
+      const value = JSON.stringify(next.map(({file, progress, running, removing, task, ...entry}) => entry));
+      storage.setItem(key, value);
+      if (storage.getItem(key) !== value) throw new Error("Browser storage could not retain the attachment draft");
+      if (notice.textContent === persistenceError) notice.textContent = "";
+      persistenceError = "";
+    } catch (error) { persistenceError = error.message; throw error; }
+  };
+  const failed = (entry, error) => {
+    entry.error = error.message;
+    try { save(); } catch (_error) { /* Keep removal available so persistence can be retried. */ }
+  };
+  const create = async (entry) => {
+    // Save uncertainty before sending. Old drafts without this field are also
+    // uncertain: their server acknowledgement may have been lost.
+    const previous = entry.creation;
+    entry.creation = "unknown";
+    try { save(); } catch (error) { entry.creation = previous; throw error; }
+    try {
+      Object.assign(entry, await client.create(entry, entry.clientId));
+      entry.creation = "created";
+    } catch (error) {
+      // Validation and quota rejection do not accept this creation request.
+      // Other failures may hide an accepted upload and need reconciliation.
+      if (error.status === 400 || error.status === 413) entry.creation = "rejected";
+      throw error;
+    }
+    save();
   };
   const render = () => {
     if (stopped) return;
     button.disabled = locked || !limits; attach.disabled = button.disabled;
     if (button.disabled) closeMenu();
+    if (persistenceError) notice.textContent = persistenceError;
     notice.hidden = !notice.textContent; list.hidden = entries.length === 0;
     if (controlsRoot !== root) root.hidden = notice.hidden && list.hidden;
     list.replaceChildren();
@@ -258,14 +285,15 @@ export function mountUploads(root, options) {
       const card = document.createElement("div"); card.className = "codex-attachment";
       const label = document.createElement("span"); label.textContent = entry.name;
       const detail = document.createElement("span"); detail.className = "codex-attachment-detail";
-      detail.textContent = entry.error || `${fileSize(entry.size)} · ${entry.state === "ready" ? "Ready" : entry.running ? `${Math.floor(100 * (entry.progress || 0) / Math.max(1, entry.size))}%` : "Paused"}`;
+      detail.textContent = entry.removing ? "Removing..." : entry.error || `${fileSize(entry.size)} · ${entry.state === "ready" ? "Ready" : entry.running ? `${Math.floor(100 * (entry.progress || 0) / Math.max(1, entry.size))}%` : "Paused"}`;
       card.append(label, detail);
       if (entry.state !== "ready") {
         const progress = document.createElement("progress"); progress.max = Math.max(1, entry.size); progress.value = entry.progress || 0;
         progress.setAttribute("aria-label", `Uploading ${entry.name}`); card.append(progress);
-        if (!entry.running) {
-          const retry = document.createElement("button"); retry.type = "button"; retry.className = "quiet"; retry.textContent = entry.file ? "Retry" : "Choose file to resume";
-          retry.disabled = locked;
+        if (!entry.running && entry.state !== "missing" && entry.state !== "deleted") {
+          const retry = document.createElement("button"); retry.type = "button"; retry.className = "quiet";
+          retry.textContent = entry.file ? "Retry" : entry.id ? "Choose file to resume" : "Choose file to retry";
+          retry.disabled = locked || entry.removing || !limits;
           retry.addEventListener("click", () => { if (entry.file) { entry.error = null; pump(); } else { resumeEntry = entry; picker.multiple = false; picker.click(); } });
           card.append(retry);
         }
@@ -273,16 +301,33 @@ export function mountUploads(root, options) {
       const remove = document.createElement("button"); remove.type = "button"; remove.className = "quiet"; remove.textContent = "Remove"; remove.disabled = locked || entry.removing;
       remove.setAttribute("aria-label", `Remove ${entry.name}`);
       remove.addEventListener("click", async () => {
+        if (locked || stopped || entry.removing || !entries.includes(entry)) return;
         entry.removing = true;
         controllers.get(entry.clientId)?.abort();
         render();
         try {
           if (entry.task) await entry.task;
-          // Repeating creation resolves a lost acknowledgement before deletion.
-          if (!entry.id) Object.assign(entry, await client.create(entry, entry.clientId));
-          await client.remove(entry.id);
-          entries = entries.filter((candidate) => candidate !== entry); save(); render();
-        } catch (error) { entry.removing = false; entry.error = error.message; render(); }
+          if (!entry.id && entry.creation !== "new" && entry.creation !== "rejected") {
+            // Reconcile only uncertain creations, including legacy drafts.
+            try { await create(entry); } catch (error) { if (entry.creation !== "rejected") throw error; }
+          }
+          if (entry.id) {
+            try { await client.remove(entry.id); } catch (error) {
+              if (error.status !== 404) throw error;
+              // Some hosts hide temporary scope/mutation refusals behind 404.
+              // Only an authorized read can establish that the file is gone.
+              const snapshot = await client.list();
+              if (snapshot.files.some((file) => file.id === entry.id && file.state !== "deleted")) throw error;
+            }
+            // If persisting removal fails, the retained card must never expose
+            // a deleted file as a ready attachment, even after another save.
+            entry.state = "deleted";
+          }
+          const next = entries.filter((candidate) => candidate !== entry);
+          save(next); entries = next;
+          if (resumeEntry === entry) resumeEntry = null;
+          render();
+        } catch (error) { entry.removing = false; failed(entry, error); render(); }
       });
       card.append(remove); list.append(card);
     }
@@ -297,12 +342,13 @@ export function mountUploads(root, options) {
       const controller = new AbortController(); controllers.set(entry.clientId, controller);
       entry.task = (async () => {
         try {
-          if (!entry.id) { Object.assign(entry, await client.create(entry.file, entry.clientId)); save(); }
+          if (entry.file.name !== entry.name || entry.file.size !== entry.size) throw new Error("Choose the same file to retry this upload");
+          if (!entry.id) await create(entry);
           if (controller.signal.aborted) throw new DOMException("Upload cancelled", "AbortError");
           Object.assign(entry, await transferUpload(client, entry, entry.file, limits,
             (bytes) => { entry.progress = bytes; render(); }, controller.signal));
           save();
-        } catch (error) { if (error.name !== "AbortError") entry.error = error.message; }
+        } catch (error) { if (error.name !== "AbortError") failed(entry, error); }
         finally { entry.running = false; active -= 1; controllers.delete(entry.clientId); render(); pump(); }
       })();
     }
@@ -316,14 +362,14 @@ export function mountUploads(root, options) {
       if (file.size > limits.fileBytes || entries.length >= limits.files || total + file.size > limits.promptBytes) {
         notice.textContent = `${file.name} exceeds the file or prompt upload limit.`; continue;
       }
-      entries.push({clientId: crypto.randomUUID(), name: file.name, size: file.size, state: "uploading", file});
+      entries.push({clientId: crypto.randomUUID(), name: file.name, size: file.size, state: "uploading", creation: "new", file});
       total += file.size;
     }
-    try { save(); pump(); } catch (error) { notice.textContent = error.message; locked = true; render(); }
+    try { save(); pump(); } catch (error) { notice.textContent = error.message; render(); }
   };
   attach.addEventListener("click", () => { closeMenu(true); resumeEntry = null; picker.multiple = true; picker.click(); });
   picker.addEventListener("change", () => {
-    if (resumeEntry && picker.files[0]) { resumeEntry.file = picker.files[0]; resumeEntry.error = null; resumeEntry = null; pump(); }
+    if (resumeEntry && entries.includes(resumeEntry) && picker.files[0]) { resumeEntry.file = picker.files[0]; resumeEntry.error = null; resumeEntry = null; pump(); }
     else add(picker.files);
     picker.value = "";
   });
@@ -340,11 +386,15 @@ export function mountUploads(root, options) {
       const snapshot = await client.list(); limits = snapshot.limits;
       const available = new Map(snapshot.files.map((file) => [file.id, file]));
       for (const entry of entries) {
-        if (entry.id && available.has(entry.id)) Object.assign(entry, available.get(entry.id));
+        if (entry.id && available.has(entry.id)) {
+          Object.assign(entry, available.get(entry.id));
+          entry.creation = "created";
+          if (entry.state === "ready") entry.error = null;
+        }
         if (entry.id && (!available.has(entry.id) || entry.state === "deleted")) { entry.state = "missing"; entry.error = "File expired or was removed. Remove it and upload again."; }
       }
       save();
-    } catch (error) { notice.textContent = error.message; locked = true; }
+    } catch (error) { notice.textContent = error.message; }
     render();
   })();
   return {
@@ -352,7 +402,7 @@ export function mountUploads(root, options) {
     ready,
     count: () => entries.length,
     ids: () => { if (!ready()) throw new Error("Wait for uploads to finish, or remove the unfinished files"); return attachmentIDs(entries.map((entry) => entry.id)); },
-    clear: () => { entries = []; save(); render(); },
+    clear: () => { save([]); entries = []; render(); },
     lock: (value) => { locked = value; render(); if (!value) pump(); },
     destroy: () => {
       closeMenu(); stopped = true; controllers.forEach((controller) => controller.abort());

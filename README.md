@@ -285,6 +285,17 @@ optional `uploadBasePath`; custom clients pass attachment IDs to `message` as
 its fourth argument, or `queueMessage` as its third. Durable sender `send` and
 `queue` accept IDs as their second argument. A reload retains selection metadata;
 resuming an incomplete upload requires reselecting and verifying the file.
+Failed selections remain removable after a reload. Never-started and rejected
+creations are removed locally; an uncertain creation is retried with the same
+client identity before deleting its server file. Stores must recover existing
+client identities before applying stricter rules to new uploads, and reject
+creation with HTTP 400 or 413 only when that request did not create an upload. Other
+errors retain the uncertain outcome. When deletion returns 404, an authorized
+listing must confirm the file is absent or deleted before the browser clears its
+selection. Hosts may use 404 for a temporarily unavailable scope. Browser storage
+must confirm the updated draft before the card disappears; an already deleted
+file cannot become ready again while its card awaits local removal.
+
 `mountUploads(root, options)` renders draft cards and errors in `root`. Pass
 `options.controlsRoot` to put its + attachment menu beside your form actions;
 omit it to keep everything in `root`. A separate empty card root is hidden.
