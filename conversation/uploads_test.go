@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/aither64/codex-web/codex"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +18,7 @@ type uploadFixture struct {
 	calls int
 	body  []byte
 	err   error
+	name  string
 }
 
 func (store *uploadFixture) Limits() UploadLimits                   { return UploadLimits{ChunkBytes: 4} }
@@ -36,7 +38,11 @@ type readSeekCloser struct{ *strings.Reader }
 
 func (r readSeekCloser) Close() error { return nil }
 func (store *uploadFixture) Open(context.Context, string) (UploadContent, error) {
-	return UploadContent{File: readSeekCloser{strings.NewReader("<script>alert(1)</script>")}, Name: "input.html", Modified: time.Now()}, nil
+	name := store.name
+	if name == "" {
+		name = "input.html"
+	}
+	return UploadContent{File: readSeekCloser{strings.NewReader("<script>alert(1)</script>")}, Name: name, Modified: time.Now()}, nil
 }
 func TestUploadTransportBoundsAndOrigin(t *testing.T) {
 	store := &uploadFixture{}
@@ -89,6 +95,10 @@ func TestUploadTransportBoundsAndOrigin(t *testing.T) {
 		t.Fatal("unbounded JSON")
 	}
 	store.err = &UploadError{Status: 413, Message: "Limit reached"}
+	response = call("POST", "/uploads/scope", "https://portal.test", "{\"name\":\"bad\xff.eml\"}")
+	if response.Code != 400 || store.calls != before {
+		t.Fatal("invalid UTF-8 accepted")
+	}
 	response = call("POST", "/uploads/scope", "https://portal.test", `{"name":"a","size":1}`)
 	if response.Code != 413 || !strings.Contains(response.Body.String(), "Limit reached") {
 		t.Fatal(response.Body.String())
@@ -240,5 +250,31 @@ func TestAttachmentQueueDeletionRecoveryRequiresMutationAuthority(t *testing.T) 
 	handler.ServeHTTP(response, req)
 	if response.Code != 403 {
 		t.Fatal("recovery accepted a missing origin", response.Code)
+	}
+}
+
+func TestUploadDownloadFilenameEncoding(t *testing.T) {
+	for _, name := range []string{`mail\' OR "1"=1; --.eml`, "Příliš žluťoučký 📨.eml", `<script>alert("x")</script>.eml`, "../../mail.eml"} {
+		t.Run(name, func(t *testing.T) {
+			store := &uploadFixture{name: name}
+			handler, err := NewUploadHandler(UploadOptions{
+				BasePath: "/uploads", AllowedOrigins: []string{"https://portal.test"},
+				Resolve: func(context.Context, string, bool) (UploadTarget, error) {
+					return UploadTarget{Store: store}, nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest("GET", "/uploads/scope/id/content", nil))
+			disposition, params, err := mime.ParseMediaType(response.Header().Get("Content-Disposition"))
+			if response.Code != 200 || err != nil || disposition != "attachment" || params["filename"] != name {
+				t.Fatalf("download filename changed: %v %q %v", response.Header(), params["filename"], err)
+			}
+			if response.Header().Get("Content-Type") != "application/octet-stream" || response.Header().Get("X-Content-Type-Options") != "nosniff" {
+				t.Fatal("download became active content", response.Header())
+			}
+		})
 	}
 }

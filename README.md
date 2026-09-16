@@ -296,6 +296,11 @@ selection. Hosts may use 404 for a temporarily unavailable scope. Browser storag
 must confirm the updated draft before the card disappears; an already deleted
 file cannot become ready again while its card awaits local removal.
 
+Upload names are untrusted display metadata. Render them as text, serialize
+prompt references as JSON, and derive storage paths from application-generated
+identities. Download responses use MIME filename encoding and attachment
+disposition. Upload creation accepts at most 4096 bytes of valid UTF-8 JSON;
+the store owns filename and file-size policy.
 `mountUploads(root, options)` renders draft cards and errors in `root`. Pass
 `options.controlsRoot` to put its + attachment menu beside your form actions;
 omit it to keep everything in `root`. A separate empty card root is hidden.

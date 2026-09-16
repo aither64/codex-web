@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aither64/codex-web/codex"
 )
@@ -198,7 +199,12 @@ func NewUploadHandler(options UploadOptions) (http.Handler, error) {
 				}{store.Limits(), files}
 			case http.MethodPost:
 				var request UploadRequest
-				decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+				body, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+				if readErr != nil || !utf8.Valid(body) {
+					writeError(w, http.StatusBadRequest, "upload request must be valid UTF-8 JSON within 4096 bytes")
+					return
+				}
+				decoder := json.NewDecoder(strings.NewReader(string(body)))
 				decoder.DisallowUnknownFields()
 				if decoder.Decode(&request) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 					writeError(w, http.StatusBadRequest, "invalid upload request")
