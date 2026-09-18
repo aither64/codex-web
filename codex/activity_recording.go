@@ -247,15 +247,10 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 			live.Active = false
 		}
 	default:
-		category, blocking := "unknown", false
-		switch message.Method {
-		case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval", "mcpServer/elicitation/request":
-			category, blocking = "approval", true
-		case "item/tool/requestUserInput":
-			category, blocking = "userInput", true
-			if params.IsBlocking != nil {
-				blocking = *params.IsBlocking
-			}
+		policy := requestPolicyFor(message.Method)
+		category, blocking := policy.category, policy.blocking
+		if message.Method == "item/tool/requestUserInput" && params.IsBlocking != nil {
+			blocking = *params.IsBlocking
 		}
 		id := string(message.ID)
 		if _, exists := live.Requests[id]; !exists && (len(live.Requests) >= activityPendingLimit || len(id) > 256) {

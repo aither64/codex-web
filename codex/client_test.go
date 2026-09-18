@@ -3670,6 +3670,26 @@ func TestPromptNormalizationMatchesPinnedProtocolDefaults(t *testing.T) {
 	}
 }
 
+func TestRequestPolicyKeepsPromptAndActivityBlockingMethodsAligned(t *testing.T) {
+	for _, test := range []struct {
+		method   string
+		category string
+		blocking bool
+	}{
+		{"item/commandExecution/requestApproval", "approval", true},
+		{"item/fileChange/requestApproval", "approval", true},
+		{"item/permissions/requestApproval", "approval", true},
+		{"mcpServer/elicitation/request", "approval", true},
+		{"item/tool/requestUserInput", "userInput", true},
+		{"future/unsupported", "unknown", false},
+	} {
+		policy := requestPolicyFor(test.method)
+		if policy.category != test.category || policy.blocking != test.blocking {
+			t.Fatalf("policy for %s = %#v", test.method, policy)
+		}
+	}
+}
+
 func TestRequestUserInputAnswerShapesMatchTheCLI(t *testing.T) {
 	prompt := Prompt{Questions: []Question{
 		{ID: "choice", IsOther: true, Options: []Option{{Label: "First"}, {Label: "Second"}}},
