@@ -3637,6 +3637,9 @@ func TestPromptNormalizationMatchesPinnedProtocolDefaults(t *testing.T) {
 	if got := strings.Join(command.AvailableDecisions, ","); got != "accept,acceptForSession,decline,cancel" {
 		t.Fatalf("default decisions = %q", got)
 	}
+	if !command.IsBlocking {
+		t.Fatalf("command approval is not blocking: %#v", command)
+	}
 
 	inputFixture := readProtocolFixture(t, "request-user-input")
 	input, err := normalizePrompt(PendingRequest{
@@ -3650,11 +3653,19 @@ func TestPromptNormalizationMatchesPinnedProtocolDefaults(t *testing.T) {
 		t.Fatalf("free-form input metadata was lost: %#v", input)
 	}
 
+	fileChange, err := normalizePrompt(PendingRequest{
+		ID: "3", Method: "item/fileChange/requestApproval",
+		Params: json.RawMessage(`{"threadId":"thread-1","changes":{}}`),
+	})
+	if err != nil || fileChange.Kind != "fileChange" || !fileChange.IsBlocking {
+		t.Fatalf("file change approval result = %#v, %v", fileChange, err)
+	}
+
 	permission, err := normalizePrompt(PendingRequest{
-		ID: "3", Method: "item/permissions/requestApproval",
+		ID: "4", Method: "item/permissions/requestApproval",
 		Params: json.RawMessage(`{"threadId":"thread-1","permissions":{"network":true}}`),
 	})
-	if err != nil || permission.Kind != "terminalOnly" || permission.AuthorityAvailable {
+	if err != nil || permission.Kind != "terminalOnly" || permission.AuthorityAvailable || !permission.IsBlocking {
 		t.Fatalf("permission approval result = %#v, %v", permission, err)
 	}
 }

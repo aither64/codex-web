@@ -1494,6 +1494,7 @@ func normalizePrompt(request PendingRequest) (Prompt, error) {
 	switch request.Method {
 	case "item/commandExecution/requestApproval":
 		prompt.Kind = "command"
+		prompt.IsBlocking = true
 		decisions, decisionsPresent := params["availableDecisions"].([]any)
 		if decisionsPresent {
 			for _, decision := range decisions {
@@ -1506,9 +1507,11 @@ func normalizePrompt(request PendingRequest) (Prompt, error) {
 		}
 	case "item/fileChange/requestApproval":
 		prompt.Kind = "fileChange"
+		prompt.IsBlocking = true
 		prompt.AvailableDecisions = []string{"accept", "acceptForSession", "decline", "cancel"}
 	case "item/permissions/requestApproval":
 		prompt.Kind = "terminalOnly"
+		prompt.IsBlocking = true
 	case "item/tool/requestUserInput":
 		prompt.Kind = "userInput"
 		prompt.AuthorityAvailable = true
