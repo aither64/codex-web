@@ -104,6 +104,28 @@ func TestActivityBlockingUnionNonblockingTerminalAndPrivacy(t *testing.T) {
 	}
 }
 
+func TestActivityUnsupportedMCPRejectionDoesNotOpenWaiting(t *testing.T) {
+	r := startActivity(t, filepath.Join(t.TempDir(), "activity.json"))
+	activityEvent(r, "connection:1", "mcpServer/elicitation/request", "mcp-1", map[string]any{
+		"threadId": "thread", "turnId": "turn", "message": "PRIVATE MCP REQUEST",
+	}, 2000)
+	snapshot := r.snapshot("thread", activityTurn("inProgress", 0), "thread", 2500)
+	if snapshot.CurrentState != "working" || snapshot.WaitingMS != 0 || snapshot.OpenWaitingMS != 0 {
+		t.Fatalf("unsupported MCP request opened waiting state: %#v", snapshot)
+	}
+	r.resolveRequest("connection:1", "thread", `"mcp-1"`, 2500)
+	snapshot = r.snapshot("thread", activityTurn("inProgress", 0), "thread", 3000)
+	if snapshot.CurrentState != "working" || snapshot.WaitingMS != 0 || snapshot.OpenWaitingMS != 0 {
+		t.Fatalf("MCP rejection left waiting state: %#v", snapshot)
+	}
+	thread := r.lookup("thread")
+	thread.mu.Lock()
+	defer thread.mu.Unlock()
+	if len(thread.live.Requests) != 0 {
+		t.Fatalf("MCP rejection retained activity request: %#v", thread.live.Requests)
+	}
+}
+
 func TestActivityRestartAndRequestIDReuseLeaveGap(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "activity.json")
 	r := startActivity(t, path)

@@ -268,6 +268,22 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 	}
 }
 
+// resolveRequest removes a locally rejected request using the same transition
+// as the App Server's serverRequest/resolved notification.
+func (r *ActivityRecorder) resolveRequest(connection, threadID, requestID string, now int64) {
+	if r == nil || threadID == "" || requestID == "" || !json.Valid([]byte(requestID)) {
+		return
+	}
+	params, err := json.Marshal(struct {
+		ThreadID  string          `json:"threadId"`
+		RequestID json.RawMessage `json:"requestId"`
+	}{ThreadID: threadID, RequestID: json.RawMessage(requestID)})
+	if err != nil {
+		return
+	}
+	r.observe(connection, rpcMessage{Method: "serverRequest/resolved", Params: params}, now)
+}
+
 func (r *ActivityRecorder) revision(threadID string) uint64 {
 	thread := r.lookup(threadID)
 	if thread == nil {

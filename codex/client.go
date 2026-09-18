@@ -958,6 +958,9 @@ func (c *Client) handleResolved(params json.RawMessage, generation uint64) {
 
 func (c *Client) rejectUnsupported(request PendingRequest, cause error) {
 	threadID := threadIDFromParams(request.Params)
+	if recorder := c.options.ActivityRecorder; recorder != nil {
+		recorder.resolveRequest(c.activityConnection(request.generation), threadID, request.ID, time.Now().UnixMilli())
+	}
 	if threadID != "" {
 		prompt := Prompt{
 			ID: request.ID, Method: request.Method, Kind: "unsupported",

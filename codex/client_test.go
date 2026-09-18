@@ -3679,7 +3679,7 @@ func TestRequestPolicyKeepsPromptAndActivityBlockingMethodsAligned(t *testing.T)
 		{"item/commandExecution/requestApproval", "approval", true},
 		{"item/fileChange/requestApproval", "approval", true},
 		{"item/permissions/requestApproval", "approval", true},
-		{"mcpServer/elicitation/request", "approval", true},
+		{"mcpServer/elicitation/request", "unsupported", false},
 		{"item/tool/requestUserInput", "userInput", true},
 		{"future/unsupported", "unknown", false},
 	} {
