@@ -3959,7 +3959,9 @@ func TestRequestUserInputDefaultsMissingBlockingStateToBlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !prompt.IsBlocking || prompt.AutoResolutionVisibleAtMS != 0 || prompt.AutoResolutionAtMS != 0 {
+	policy := requestPolicyFor("item/tool/requestUserInput")
+	if !policy.blocking || prompt.IsBlocking != policy.blocking ||
+		prompt.AutoResolutionVisibleAtMS != 0 || prompt.AutoResolutionAtMS != 0 {
 		t.Fatalf("missing blocking state = %#v", prompt)
 	}
 }

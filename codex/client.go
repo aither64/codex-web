@@ -1515,7 +1515,7 @@ func normalizePrompt(request PendingRequest) (Prompt, error) {
 	case "item/tool/requestUserInput":
 		prompt.Kind = "userInput"
 		prompt.AuthorityAvailable = true
-		prompt.IsBlocking = true
+		prompt.IsBlocking = requestPolicyFor(request.Method).blocking
 		if raw, exists := params["isBlocking"]; exists {
 			blocking, ok := raw.(bool)
 			if !ok {
