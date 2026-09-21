@@ -151,6 +151,13 @@ func TestSendZeroOptionsPreservesStartRequest(t *testing.T) {
 	if _, err := client.Send(ctx, "thread-1", "message", "client-message-1", ""); err != nil {
 		t.Fatal(err)
 	}
+	ledger, err := os.ReadFile(client.queueLedgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ledger), "optionsDigest") {
+		t.Fatalf("zero-option send wrote an options digest: %s", ledger)
+	}
 }
 
 func TestEnsureInitialMessageWithOptionsUsesStartFields(t *testing.T) {
@@ -240,6 +247,14 @@ func TestTurnOptionsRejectInvalidAndOversizedInput(t *testing.T) {
 			"application:one": {Kind: "application", Value: strings.Repeat("v", turnOptionMaxAdditionalContextValueBytes+1)},
 		}}},
 		{"oversized model", TurnOptions{Model: strings.Repeat("m", turnOptionMaxScalarBytes+1)}},
+		{"invalid reasoning effort Unicode", TurnOptions{ReasoningEffort: string([]byte{0xff})}},
+		{"oversized reasoning effort", TurnOptions{ReasoningEffort: strings.Repeat("r", turnOptionMaxScalarBytes+1)}},
+		{"oversized aggregate context", TurnOptions{AdditionalContext: map[string]AdditionalContextEntry{
+			"application:one":   {Kind: "application", Value: strings.Repeat("v", turnOptionMaxAdditionalContextValueBytes)},
+			"application:two":   {Kind: "application", Value: strings.Repeat("v", turnOptionMaxAdditionalContextValueBytes)},
+			"application:three": {Kind: "application", Value: strings.Repeat("v", turnOptionMaxAdditionalContextValueBytes)},
+			"application:four":  {Kind: "application", Value: strings.Repeat("v", turnOptionMaxAdditionalContextValueBytes)},
+		}}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -309,10 +324,129 @@ func TestLegacySendAttemptReadsAsZeroOptions(t *testing.T) {
 	if err != nil || receipt != want {
 		t.Fatalf("legacy zero-option retry = %#v, %v", receipt, err)
 	}
+	ledger, err := os.ReadFile(client.queueLedgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ledger), "optionsDigest") {
+		t.Fatalf("ordinary legacy retry rewrote an options digest: %s", ledger)
+	}
+	if err := client.recordQueueAttempt("thread-1", "queue-1", "unrelated queue message"); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err = os.ReadFile(client.queueLedgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(ledger), "optionsDigest") {
+		t.Fatalf("unrelated ledger write added an options digest: %s", ledger)
+	}
 	if _, err := client.SendWithOptions(
 		context.Background(), "thread-1", "message", "message-1", "", testTurnOptions(),
 	); err == nil || !strings.Contains(err.Error(), "another action") {
 		t.Fatalf("legacy retry accepted changed options: %v", err)
+	}
+}
+
+func TestOptionAwareDurableAttemptFamily(t *testing.T) {
+	options := testTurnOptions()
+	client := newTestClient(filepath.Join(t.TempDir(), "absent-socket"))
+	defer client.Close()
+	if err := client.PrepareSendWithOptions(
+		"thread-1", "message", "prepared-1", "action", false, options,
+	); err != nil {
+		t.Fatal(err)
+	}
+	changed := options
+	changed.Model = "model-2"
+	if _, err := client.DiscardPreparedSendWithOptions(
+		"thread-1", "message", "prepared-1", "action", changed,
+	); err == nil || !strings.Contains(err.Error(), "another action") {
+		t.Fatalf("discard accepted changed options: %v", err)
+	}
+	if discarded, err := client.DiscardPreparedSendWithOptions(
+		"thread-1", "message", "prepared-1", "action", options,
+	); err != nil || !discarded {
+		t.Fatalf("discard exact prepared attempt = %t, %v", discarded, err)
+	}
+
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		if request["method"] != "thread/items/list" {
+			return fmt.Errorf("send-attempt discovery request = %#v", request)
+		}
+		return writeObject(connection, map[string]any{
+			"id": request["id"], "result": map[string]any{"data": []any{map[string]any{
+				"turnId": "turn-1", "item": map[string]any{
+					"id": "item-1", "type": "userMessage", "clientId": "message-1",
+					"content": []any{map[string]any{"type": "text", "text": "message"}},
+				},
+			}}, "nextCursor": nil},
+		})
+	})
+	discovery := newTestClient(socket)
+	defer discovery.Close()
+	attempted, err := discovery.SendAttemptedWithOptions(
+		context.Background(), "thread-1", "message", "message-1", "action", options,
+	)
+	if err != nil || !attempted {
+		t.Fatalf("option-aware send discovery = %t, %v", attempted, err)
+	}
+	receipt, reconciled, err := discovery.ReconcileSendWithOptions(
+		context.Background(), "thread-1", "message", "message-1", "action", options,
+	)
+	if err != nil || !reconciled || receipt.TurnID != "turn-1" {
+		t.Fatalf("option-aware reconciliation = %#v, %t, %v", receipt, reconciled, err)
+	}
+	if _, _, err := discovery.ReconcileSendWithOptions(
+		context.Background(), "thread-1", "message", "message-1", "action", changed,
+	); err == nil || !strings.Contains(err.Error(), "another action") {
+		t.Fatalf("reconciliation accepted changed options: %v", err)
+	}
+}
+
+func TestPreparedOptionedStartRefusesAnActiveTurn(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, method := range []string{"thread/resume", "thread/turns/list"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != method {
+				return fmt.Errorf("request %d = %#v, want %s", index, request, method)
+			}
+			result := map[string]any{}
+			if method == "thread/turns/list" {
+				result = map[string]any{"data": []any{map[string]any{"id": "turn-active", "status": "inProgress"}}}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := newTestClient(socket)
+	defer client.Close()
+	options := testTurnOptions()
+	if err := client.PrepareSendWithOptions(
+		"thread-1", "message", "message-1", "action", false, options,
+	); err != nil {
+		t.Fatal(err)
+	}
+	_, err := client.SendWithOptions(
+		context.Background(), "thread-1", "message", "message-1", "action", options,
+	)
+	if err == nil || !strings.Contains(err.Error(), "no longer matches the thread state") {
+		t.Fatalf("active turn accepted a prepared start: %v", err)
 	}
 }
 

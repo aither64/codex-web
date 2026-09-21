@@ -260,6 +260,24 @@ func zeroTurnOptionsDigest() string {
 	return options.Digest
 }
 
+// effectiveTurnOptionsDigest preserves the schema-3 zero-option wire form:
+// an omitted digest is the canonical zero options identity.
+func effectiveTurnOptionsDigest(stored string) string {
+	if stored == "" {
+		return zeroTurnOptionsDigest()
+	}
+	return stored
+}
+
+// persistedTurnOptionsDigest never adds a field to an ordinary schema-3
+// attempt. This keeps zero-option ledgers readable by the parent client.
+func persistedTurnOptionsDigest(digest string) string {
+	if digest == zeroTurnOptionsDigest() {
+		return ""
+	}
+	return digest
+}
+
 func (options normalizedTurnOptions) additionalContextParameter() map[string]map[string]string {
 	if len(options.AdditionalContext) == 0 {
 		return nil
@@ -1963,18 +1981,20 @@ func (c *Client) loadQueueLedgerLocked() error {
 			)
 		}
 		for clientID, attempt := range attempts {
-			if attempt.OptionsDigest == "" {
-				// Schema 3 ledgers predate turn options. Their sends used the
-				// same zero-option behavior as the preserved Send wrapper.
-				attempt.OptionsDigest = zeroTurnOptionsDigest()
-				attempts[clientID] = attempt
-			}
+			effectiveOptionsDigest := effectiveTurnOptionsDigest(attempt.OptionsDigest)
 			if clientID == "" || !validSubmissionDigest(attempt.Digest) ||
-				!validSubmissionDigest(attempt.OptionsDigest) ||
+				!validSubmissionDigest(effectiveOptionsDigest) ||
 				!validSendAttemptState(attempt) {
 				return c.failQueueLedgerLocked(
 					errors.New("queue attempt ledger contains an invalid send attempt"),
 				)
+			}
+			if attempt.OptionsDigest == zeroTurnOptionsDigest() {
+				// A pre-release options-aware client could have written the
+				// canonical zero digest. Normalize it only in memory so the
+				// next ordinary ledger write restores parent-reader bytes.
+				attempt.OptionsDigest = ""
+				attempts[clientID] = attempt
 			}
 		}
 	}
@@ -2167,7 +2187,7 @@ func (c *Client) sendAttemptWithOptions(
 	value, err := queueLedgerTransaction(c, func() (result, error) {
 		attempt, ok := c.sendAttempts[threadID][clientID]
 		if ok && (attempt.Digest != queueTextDigest(text) || attempt.Context != context ||
-			attempt.OptionsDigest != optionsDigest) {
+			effectiveTurnOptionsDigest(attempt.OptionsDigest) != optionsDigest) {
 			return result{}, errors.New("message identity was reused for another action")
 		}
 		return result{attempt: attempt, found: ok}, nil
@@ -2190,7 +2210,7 @@ func (c *Client) recordSendAttemptWithOptions(
 		digest := queueTextDigest(text)
 		if existing, ok := c.sendAttempts[threadID][clientID]; ok {
 			if existing.Digest != digest || existing.Context != context || existing.Steered != steered ||
-				existing.OptionsDigest != optionsDigest {
+				effectiveTurnOptionsDigest(existing.OptionsDigest) != optionsDigest {
 				return errors.New("message identity was reused for another action")
 			}
 			return nil
@@ -2200,7 +2220,7 @@ func (c *Client) recordSendAttemptWithOptions(
 		}
 		c.sendAttempts[threadID][clientID] = sendAttempt{
 			Digest: digest, State: "prepared", Context: context,
-			OptionsDigest: optionsDigest, Steered: steered,
+			OptionsDigest: persistedTurnOptionsDigest(optionsDigest), Steered: steered,
 		}
 		if err := c.writeQueueLedgerLocked(); err != nil {
 			delete(c.sendAttempts[threadID], clientID)
@@ -3964,6 +3984,20 @@ func (c *Client) StartQueue(ctx context.Context, threadID, queuedSubmissionID st
 // Already absent attempts are retired. Submitting and accepted attempts are
 // retained and return false; callers must reconcile their delivery instead.
 func (c *Client) DiscardPreparedSend(threadID, text, clientID, actionContext string) (bool, error) {
+	return c.DiscardPreparedSendWithOptions(
+		threadID, text, clientID, actionContext, TurnOptions{},
+	)
+}
+
+// DiscardPreparedSendWithOptions retires a prepared attempt only when its
+// exact turn options match the durable attempt identity.
+func (c *Client) DiscardPreparedSendWithOptions(
+	threadID, text, clientID, actionContext string, options TurnOptions,
+) (bool, error) {
+	normalizedOptions, err := normalizeTurnOptions(options)
+	if err != nil {
+		return false, err
+	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -3972,7 +4006,8 @@ func (c *Client) DiscardPreparedSend(threadID, text, clientID, actionContext str
 		if !found {
 			return true, nil
 		}
-		if attempt.Digest != queueTextDigest(text) || attempt.Context != actionContext {
+		if attempt.Digest != queueTextDigest(text) || attempt.Context != actionContext ||
+			effectiveTurnOptionsDigest(attempt.OptionsDigest) != normalizedOptions.Digest {
 			return false, errors.New("message identity was reused for another action")
 		}
 		if attempt.State != "prepared" {
@@ -3998,10 +4033,28 @@ func (c *Client) DiscardPreparedSend(threadID, text, clientID, actionContext str
 func (c *Client) ReconcileSend(
 	ctx context.Context, threadID, text, clientUserMessageID, actionContext string,
 ) (SendReceipt, bool, error) {
+	return c.ReconcileSendWithOptions(
+		ctx, threadID, text, clientUserMessageID, actionContext, TurnOptions{},
+	)
+}
+
+// ReconcileSendWithOptions recovers an existing accepted or submitting exact
+// attempt without submitting a message. Prepared and absent attempts remain
+// untouched.
+func (c *Client) ReconcileSendWithOptions(
+	ctx context.Context, threadID, text, clientUserMessageID, actionContext string,
+	options TurnOptions,
+) (SendReceipt, bool, error) {
+	normalizedOptions, err := normalizeTurnOptions(options)
+	if err != nil {
+		return SendReceipt{}, false, err
+	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
-	attempt, _, err := c.sendAttempt(threadID, clientUserMessageID, text, actionContext)
+	attempt, _, err := c.sendAttemptWithOptions(
+		threadID, clientUserMessageID, text, actionContext, normalizedOptions.Digest,
+	)
 	if err != nil {
 		return SendReceipt{}, false, err
 	}
@@ -4181,19 +4234,52 @@ func (c *Client) finishAcceptedSend(
 func (c *Client) PrepareSend(
 	threadID, text, clientUserMessageID, context string, steered bool,
 ) error {
+	return c.PrepareSendWithOptions(
+		threadID, text, clientUserMessageID, context, steered, TurnOptions{},
+	)
+}
+
+// PrepareSendWithOptions durably reserves an exact message identity and its
+// turn options before a caller performs another related state transition.
+func (c *Client) PrepareSendWithOptions(
+	threadID, text, clientUserMessageID, context string, steered bool, options TurnOptions,
+) error {
+	normalizedOptions, err := normalizeTurnOptions(options)
+	if err != nil {
+		return err
+	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
-	return c.recordSendAttempt(threadID, clientUserMessageID, text, context, steered)
+	return c.recordSendAttemptWithOptions(
+		threadID, clientUserMessageID, text, context, steered, normalizedOptions.Digest,
+	)
 }
 
 func (c *Client) SendAttempted(
 	ctx context.Context, threadID, text, clientUserMessageID, context string,
 ) (bool, error) {
+	return c.SendAttemptedWithOptions(
+		ctx, threadID, text, clientUserMessageID, context, TurnOptions{},
+	)
+}
+
+// SendAttemptedWithOptions discovers a history-accepted exact attempt and
+// records it with the supplied turn-options identity.
+func (c *Client) SendAttemptedWithOptions(
+	ctx context.Context, threadID, text, clientUserMessageID, context string,
+	options TurnOptions,
+) (bool, error) {
+	normalizedOptions, err := normalizeTurnOptions(options)
+	if err != nil {
+		return false, err
+	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
-	_, found, err := c.sendAttempt(threadID, clientUserMessageID, text, context)
+	_, found, err := c.sendAttemptWithOptions(
+		threadID, clientUserMessageID, text, context, normalizedOptions.Digest,
+	)
 	if err != nil || found {
 		return found, err
 	}
@@ -4201,8 +4287,8 @@ func (c *Client) SendAttempted(
 	if err != nil || !found {
 		return found, err
 	}
-	if err := c.recordSendAttempt(
-		threadID, clientUserMessageID, text, context, receipt.Steered,
+	if err := c.recordSendAttemptWithOptions(
+		threadID, clientUserMessageID, text, context, receipt.Steered, normalizedOptions.Digest,
 	); err != nil {
 		return false, err
 	}

@@ -21,7 +21,9 @@ writable persistent state independently of a connect-only or ephemeral socket
 directory. Leave it empty to retain the compatibility path beside the socket;
 all cooperating processes must select the same path.
 
-`Client.SendWithOptions` and `Client.EnsureInitialMessageWithOptions` accept
+`Client.SendWithOptions`, `PrepareSendWithOptions`,
+`SendAttemptedWithOptions`, `ReconcileSendWithOptions`,
+`DiscardPreparedSendWithOptions`, and `EnsureInitialMessageWithOptions` accept
 `TurnOptions` for a caller-selected App Server model, reasoning effort and
 application context. Empty model and effort fields are omitted. Model and
 effort are emitted only for an idle `turn/start`; a send that steers an active
@@ -30,10 +32,17 @@ and steer, so a nonempty `AdditionalContext` map accompanies the message in
 either case. Its entries are keyed by an opaque application source identifier,
 must use `Kind: "application"`, and are bounded to 32 entries, 256-byte keys,
 64 KiB values and 256 KiB total. Options are canonicalized into the durable
-send-attempt identity, so retries must use the same options as the original
-attempt. Older ledgers without an option digest read as zero-option attempts.
-The existing `Send` and `EnsureInitialMessage` methods remain zero-option
-wrappers.
+send-attempt identity, so retries and every prepare/reconcile/discard call must
+use the original options. An omitted stored digest is the canonical zero
+options identity; zero-option activity never writes `optionsDigest`, retaining
+schema-3 reader and rollback compatibility. Existing methods remain exact
+zero-option wrappers.
+
+`EnsureInitialMessageWithOptions` does not itself durably bind options before
+an initial `turn/start`. A recovering application must prepublish and retain
+the exact binding before that call; the workspace team's Phase 2B creation
+flow owns that durable precondition. It must never retry a materialized initial
+thread with caller-supplied replacement options.
 
 Nonblocking user-input requests stay pending by default. Set
 `ClientOptions.NonBlockingUserInput` only when the embedding application owns
