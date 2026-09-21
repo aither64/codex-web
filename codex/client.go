@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"golang.org/x/sys/unix"
@@ -27,6 +28,12 @@ const (
 	readLimit          = 64 * 1024 * 1024
 	queueLedgerMaxSize = 1024 * 1024
 	recentTurnLimit    = 20
+
+	turnOptionMaxScalarBytes                 = 4 * 1024
+	turnOptionMaxAdditionalContextEntries    = 32
+	turnOptionMaxAdditionalContextKeyBytes   = 256
+	turnOptionMaxAdditionalContextValueBytes = 64 * 1024
+	turnOptionMaxAdditionalContextBytes      = 256 * 1024
 )
 
 type rpcMessage struct {
@@ -143,6 +150,127 @@ type SendReceipt struct {
 	Steered             bool   `json:"steered"`
 }
 
+// AdditionalContextEntry is application-owned context for one opaque source.
+// Codex clients send only the App Server's application kind.
+type AdditionalContextEntry struct {
+	Value string `json:"value"`
+	Kind  string `json:"kind"`
+}
+
+// TurnOptions selects optional App Server turn settings. Empty Model and
+// ReasoningEffort leave the corresponding App Server setting unchanged.
+// AdditionalContext is keyed by an opaque application source identifier.
+type TurnOptions struct {
+	Model             string                            `json:"model,omitempty"`
+	ReasoningEffort   string                            `json:"reasoningEffort,omitempty"`
+	AdditionalContext map[string]AdditionalContextEntry `json:"additionalContext,omitempty"`
+}
+
+type normalizedAdditionalContextEntry struct {
+	Source string `json:"source"`
+	Value  string `json:"value"`
+	Kind   string `json:"kind"`
+}
+
+type normalizedTurnOptions struct {
+	Model             string                             `json:"model,omitempty"`
+	ReasoningEffort   string                             `json:"reasoningEffort,omitempty"`
+	AdditionalContext []normalizedAdditionalContextEntry `json:"additionalContext,omitempty"`
+	Digest            string                             `json:"-"`
+}
+
+type turnOptionsIdentity struct {
+	Version           int                                `json:"version"`
+	Model             string                             `json:"model,omitempty"`
+	ReasoningEffort   string                             `json:"reasoningEffort,omitempty"`
+	AdditionalContext []normalizedAdditionalContextEntry `json:"additionalContext,omitempty"`
+}
+
+func normalizeTurnOptions(options TurnOptions) (normalizedTurnOptions, error) {
+	if err := validateTurnOptionScalar("model", options.Model); err != nil {
+		return normalizedTurnOptions{}, err
+	}
+	if err := validateTurnOptionScalar("reasoning effort", options.ReasoningEffort); err != nil {
+		return normalizedTurnOptions{}, err
+	}
+	if len(options.AdditionalContext) > turnOptionMaxAdditionalContextEntries {
+		return normalizedTurnOptions{}, fmt.Errorf(
+			"additional context has more than %d entries", turnOptionMaxAdditionalContextEntries,
+		)
+	}
+	context := make([]normalizedAdditionalContextEntry, 0, len(options.AdditionalContext))
+	totalBytes := 0
+	for source, entry := range options.AdditionalContext {
+		if source == "" || !utf8.ValidString(source) || len(source) > turnOptionMaxAdditionalContextKeyBytes {
+			return normalizedTurnOptions{}, fmt.Errorf(
+				"additional context source must be valid Unicode between 1 and %d bytes",
+				turnOptionMaxAdditionalContextKeyBytes,
+			)
+		}
+		if entry.Kind != "application" {
+			return normalizedTurnOptions{}, errors.New("additional context kind must be application")
+		}
+		if !utf8.ValidString(entry.Value) || len(entry.Value) > turnOptionMaxAdditionalContextValueBytes {
+			return normalizedTurnOptions{}, fmt.Errorf(
+				"additional context value must be valid Unicode and at most %d bytes",
+				turnOptionMaxAdditionalContextValueBytes,
+			)
+		}
+		totalBytes += len(source) + len(entry.Value)
+		if totalBytes > turnOptionMaxAdditionalContextBytes {
+			return normalizedTurnOptions{}, fmt.Errorf(
+				"additional context exceeds %d bytes", turnOptionMaxAdditionalContextBytes,
+			)
+		}
+		context = append(context, normalizedAdditionalContextEntry{
+			Source: source, Value: entry.Value, Kind: entry.Kind,
+		})
+	}
+	sort.Slice(context, func(i, j int) bool { return context[i].Source < context[j].Source })
+	identity := turnOptionsIdentity{
+		Version: 1, Model: options.Model, ReasoningEffort: options.ReasoningEffort,
+		AdditionalContext: context,
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return normalizedTurnOptions{}, fmt.Errorf("encode turn options: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return normalizedTurnOptions{
+		Model: options.Model, ReasoningEffort: options.ReasoningEffort,
+		AdditionalContext: context, Digest: fmt.Sprintf("%x", digest),
+	}, nil
+}
+
+func validateTurnOptionScalar(name, value string) error {
+	if value == "" {
+		return nil
+	}
+	if !utf8.ValidString(value) || len(value) > turnOptionMaxScalarBytes {
+		return fmt.Errorf("%s must be valid Unicode and at most %d bytes", name, turnOptionMaxScalarBytes)
+	}
+	return nil
+}
+
+func zeroTurnOptionsDigest() string {
+	options, err := normalizeTurnOptions(TurnOptions{})
+	if err != nil {
+		panic(err)
+	}
+	return options.Digest
+}
+
+func (options normalizedTurnOptions) additionalContextParameter() map[string]map[string]string {
+	if len(options.AdditionalContext) == 0 {
+		return nil
+	}
+	context := make(map[string]map[string]string, len(options.AdditionalContext))
+	for _, entry := range options.AdditionalContext {
+		context[entry.Source] = map[string]string{"value": entry.Value, "kind": entry.Kind}
+	}
+	return context
+}
+
 type SendAcknowledgement struct {
 	ClientUserMessageID string `json:"clientUserMessageId"`
 	Digest              string `json:"digest"`
@@ -245,11 +373,12 @@ type queueDeletionAttempt struct {
 }
 
 type sendAttempt struct {
-	Digest  string `json:"digest"`
-	State   string `json:"state"`
-	Context string `json:"context,omitempty"`
-	Steered bool   `json:"steered"`
-	TurnID  string `json:"turnId,omitempty"`
+	Digest        string `json:"digest"`
+	State         string `json:"state"`
+	Context       string `json:"context,omitempty"`
+	OptionsDigest string `json:"optionsDigest,omitempty"`
+	Steered       bool   `json:"steered"`
+	TurnID        string `json:"turnId,omitempty"`
 }
 
 type UnknownSendOutcomeError struct {
@@ -1834,7 +1963,14 @@ func (c *Client) loadQueueLedgerLocked() error {
 			)
 		}
 		for clientID, attempt := range attempts {
+			if attempt.OptionsDigest == "" {
+				// Schema 3 ledgers predate turn options. Their sends used the
+				// same zero-option behavior as the preserved Send wrapper.
+				attempt.OptionsDigest = zeroTurnOptionsDigest()
+				attempts[clientID] = attempt
+			}
 			if clientID == "" || !validSubmissionDigest(attempt.Digest) ||
+				!validSubmissionDigest(attempt.OptionsDigest) ||
 				!validSendAttemptState(attempt) {
 				return c.failQueueLedgerLocked(
 					errors.New("queue attempt ledger contains an invalid send attempt"),
@@ -2016,13 +2152,22 @@ func (c *Client) recordQueueAttempt(threadID, clientID, text string) error {
 func (c *Client) sendAttempt(
 	threadID, clientID, text, context string,
 ) (sendAttempt, bool, error) {
+	return c.sendAttemptWithOptions(
+		threadID, clientID, text, context, zeroTurnOptionsDigest(),
+	)
+}
+
+func (c *Client) sendAttemptWithOptions(
+	threadID, clientID, text, context, optionsDigest string,
+) (sendAttempt, bool, error) {
 	type result struct {
 		attempt sendAttempt
 		found   bool
 	}
 	value, err := queueLedgerTransaction(c, func() (result, error) {
 		attempt, ok := c.sendAttempts[threadID][clientID]
-		if ok && (attempt.Digest != queueTextDigest(text) || attempt.Context != context) {
+		if ok && (attempt.Digest != queueTextDigest(text) || attempt.Context != context ||
+			attempt.OptionsDigest != optionsDigest) {
 			return result{}, errors.New("message identity was reused for another action")
 		}
 		return result{attempt: attempt, found: ok}, nil
@@ -2033,10 +2178,19 @@ func (c *Client) sendAttempt(
 func (c *Client) recordSendAttempt(
 	threadID, clientID, text, context string, steered bool,
 ) error {
+	return c.recordSendAttemptWithOptions(
+		threadID, clientID, text, context, steered, zeroTurnOptionsDigest(),
+	)
+}
+
+func (c *Client) recordSendAttemptWithOptions(
+	threadID, clientID, text, context string, steered bool, optionsDigest string,
+) error {
 	return queueLedgerAction(c, func() error {
 		digest := queueTextDigest(text)
 		if existing, ok := c.sendAttempts[threadID][clientID]; ok {
-			if existing.Digest != digest || existing.Context != context || existing.Steered != steered {
+			if existing.Digest != digest || existing.Context != context || existing.Steered != steered ||
+				existing.OptionsDigest != optionsDigest {
 				return errors.New("message identity was reused for another action")
 			}
 			return nil
@@ -2045,7 +2199,8 @@ func (c *Client) recordSendAttempt(
 			c.sendAttempts[threadID] = make(map[string]sendAttempt)
 		}
 		c.sendAttempts[threadID][clientID] = sendAttempt{
-			Digest: digest, State: "prepared", Context: context, Steered: steered,
+			Digest: digest, State: "prepared", Context: context,
+			OptionsDigest: optionsDigest, Steered: steered,
 		}
 		if err := c.writeQueueLedgerLocked(); err != nil {
 			delete(c.sendAttempts[threadID], clientID)
@@ -3888,11 +4043,29 @@ func (c *Client) reconcileSend(
 func (c *Client) Send(
 	ctx context.Context, threadID, text, clientUserMessageID, actionContext string,
 ) (SendReceipt, error) {
+	return c.SendWithOptions(
+		ctx, threadID, text, clientUserMessageID, actionContext, TurnOptions{},
+	)
+}
+
+// SendWithOptions submits a client-correlated message with optional App Server
+// turn settings. Model and ReasoningEffort are sent only when this call starts
+// an idle turn. AdditionalContext is valid for both turn/start and turn/steer,
+// so it accompanies the message on the active turn rather than changing that
+// turn's model or effort.
+func (c *Client) SendWithOptions(
+	ctx context.Context, threadID, text, clientUserMessageID, actionContext string,
+	options TurnOptions,
+) (SendReceipt, error) {
+	normalizedOptions, err := normalizeTurnOptions(options)
+	if err != nil {
+		return SendReceipt{}, err
+	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
-	attempt, attempted, err := c.sendAttempt(
-		threadID, clientUserMessageID, text, actionContext,
+	attempt, attempted, err := c.sendAttemptWithOptions(
+		threadID, clientUserMessageID, text, actionContext, normalizedOptions.Digest,
 	)
 	if err != nil {
 		return SendReceipt{}, err
@@ -3913,8 +4086,8 @@ func (c *Client) Send(
 	}
 	input := []map[string]any{{"type": "text", "text": text}}
 	if !attempted {
-		if err := c.recordSendAttempt(
-			threadID, clientUserMessageID, text, actionContext, steered,
+		if err := c.recordSendAttemptWithOptions(
+			threadID, clientUserMessageID, text, actionContext, steered, normalizedOptions.Digest,
 		); err != nil {
 			return SendReceipt{}, fmt.Errorf("record message attempt before submission: %w", err)
 		}
@@ -3946,10 +4119,14 @@ func (c *Client) Send(
 		var response struct {
 			TurnID string `json:"turnId"`
 		}
-		err := c.Request(ctx, "turn/steer", map[string]any{
+		params := map[string]any{
 			"threadId": threadID, "expectedTurnId": turnID, "input": input,
 			"clientUserMessageId": clientUserMessageID,
-		}, &response)
+		}
+		if additionalContext := normalizedOptions.additionalContextParameter(); additionalContext != nil {
+			params["additionalContext"] = additionalContext
+		}
+		err := c.Request(ctx, "turn/steer", params, &response)
 		if err != nil {
 			return reconcile(err)
 		}
@@ -3965,10 +4142,20 @@ func (c *Client) Send(
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	err = c.Request(ctx, "turn/start", map[string]any{
+	params := map[string]any{
 		"threadId": threadID, "input": input,
 		"clientUserMessageId": clientUserMessageID,
-	}, &response)
+	}
+	if normalizedOptions.Model != "" {
+		params["model"] = normalizedOptions.Model
+	}
+	if normalizedOptions.ReasoningEffort != "" {
+		params["effort"] = normalizedOptions.ReasoningEffort
+	}
+	if additionalContext := normalizedOptions.additionalContextParameter(); additionalContext != nil {
+		params["additionalContext"] = additionalContext
+	}
+	err = c.Request(ctx, "turn/start", params, &response)
 	if err != nil {
 		return reconcile(err)
 	}
@@ -4029,6 +4216,22 @@ func (c *Client) SendAttempted(
 }
 
 func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text string, allowUnmaterializedStart bool) error {
+	return c.EnsureInitialMessageWithOptions(
+		ctx, threadID, cwd, text, allowUnmaterializedStart, TurnOptions{},
+	)
+}
+
+// EnsureInitialMessageWithOptions creates the initial message only for a fresh
+// idle thread. Its optional model, effort, and application context therefore
+// use turn/start and are never replayed against materialized history.
+func (c *Client) EnsureInitialMessageWithOptions(
+	ctx context.Context, threadID, cwd, text string, allowUnmaterializedStart bool,
+	options TurnOptions,
+) error {
+	normalizedOptions, err := normalizeTurnOptions(options)
+	if err != nil {
+		return err
+	}
 	materialized, err := c.HistoryMaterialized(ctx, threadID, cwd)
 	if err != nil {
 		return err
@@ -4038,7 +4241,17 @@ func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text s
 		if !allowUnmaterializedStart {
 			return errors.New("initial request may already have been accepted by the unmaterialized Codex thread")
 		}
-		if err := c.Request(ctx, "turn/start", map[string]any{"threadId": threadID, "input": input}, nil); err != nil {
+		params := map[string]any{"threadId": threadID, "input": input}
+		if normalizedOptions.Model != "" {
+			params["model"] = normalizedOptions.Model
+		}
+		if normalizedOptions.ReasoningEffort != "" {
+			params["effort"] = normalizedOptions.ReasoningEffort
+		}
+		if additionalContext := normalizedOptions.additionalContextParameter(); additionalContext != nil {
+			params["additionalContext"] = additionalContext
+		}
+		if err := c.Request(ctx, "turn/start", params, nil); err != nil {
 			return err
 		}
 		return c.waitForInitialMessage(ctx, threadID, cwd, text)

@@ -20,6 +20,21 @@ App Server client identity, developer instructions or durable storage.
 writable persistent state independently of a connect-only or ephemeral socket
 directory. Leave it empty to retain the compatibility path beside the socket;
 all cooperating processes must select the same path.
+
+`Client.SendWithOptions` and `Client.EnsureInitialMessageWithOptions` accept
+`TurnOptions` for a caller-selected App Server model, reasoning effort and
+application context. Empty model and effort fields are omitted. Model and
+effort are emitted only for an idle `turn/start`; a send that steers an active
+turn never changes them. App Server permits application context on both start
+and steer, so a nonempty `AdditionalContext` map accompanies the message in
+either case. Its entries are keyed by an opaque application source identifier,
+must use `Kind: "application"`, and are bounded to 32 entries, 256-byte keys,
+64 KiB values and 256 KiB total. Options are canonicalized into the durable
+send-attempt identity, so retries must use the same options as the original
+attempt. Older ledgers without an option digest read as zero-option attempts.
+The existing `Send` and `EnsureInitialMessage` methods remain zero-option
+wrappers.
+
 Nonblocking user-input requests stay pending by default. Set
 `ClientOptions.NonBlockingUserInput` only when the embedding application owns
 an explicit automatic-response policy.
