@@ -418,6 +418,8 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 }
 
 func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
+	policy := ThreadPolicy{DeveloperInstructions: "Review the assigned change. Do not edit source.", Sandbox: "read-only"}
+	combined := sessionLifecycleDeveloperInstructions + "\n\n" + policy.DeveloperInstructions
 	methods := []string{
 		"thread/start",
 		"thread/resume",
@@ -441,9 +443,19 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 				return fmt.Errorf("request %d = %#v, want %s", index, request, method)
 			}
 			params, _ := request["params"].(map[string]any)
-			if method != "thread/turns/list" &&
-				params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
-				return fmt.Errorf("%s omitted lifecycle instructions: %#v", method, params)
+			switch index {
+			case 0, 1, 7:
+				if params["developerInstructions"] != combined || params["sandbox"] != "read-only" {
+					return fmt.Errorf("%s omitted member policy: %#v", method, params)
+				}
+			case 5:
+				if params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
+					return fmt.Errorf("root reconciliation omitted lifecycle instructions: %#v", params)
+				}
+			case 2, 3:
+				if _, exists := params["developerInstructions"]; exists {
+					return fmt.Errorf("generic resume replaced retained instructions: %#v", params)
+				}
 			}
 			result := map[string]any{}
 			switch index {
@@ -471,15 +483,20 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 		}
 		return nil
 	})
-	client := newTestClient(socket)
+	client := NewWithOptions(socket, ClientOptions{
+		DeveloperInstructions:              sessionLifecycleDeveloperInstructions,
+		PreserveThreadInstructionsOnResume: true,
+	})
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	environment := map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"}
-	if _, err := client.StartThread(ctx, "/workspace/work/example", environment); err != nil {
+	if _, err := client.StartThreadWithSettings(ctx, "/workspace/work/example", environment,
+		ThreadSettings{Policy: policy}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.ResumeThread(ctx, "thread-1", "/workspace/work/example", environment); err != nil {
+	if _, err := client.ResumeThreadWithSettings(ctx, "thread-1", "/workspace/work/example", environment,
+		ThreadSettings{Policy: policy}); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.resumeThread(ctx, "thread-1"); err != nil {
@@ -496,9 +513,70 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := client.ForkThread(
-		ctx, "thread-1", "/workspace/work/fork", environment, ThreadSettings{},
+		ctx, "thread-1", "/workspace/work/fork", environment, ThreadSettings{Policy: policy},
 	); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUnscopedSettingsResumePreservesPersistedMemberPolicy(t *testing.T) {
+	client := NewWithOptions("/tmp/unconnected-team-policy.sock", ClientOptions{
+		DeveloperInstructions:              sessionLifecycleDeveloperInstructions,
+		PreserveThreadInstructionsOnResume: true,
+	})
+	params := client.threadResumeParams("thread-member")
+	client.settingsParams(ThreadSettings{Model: "gpt-6-sol"}, params, map[string]any{})
+	if _, exists := params["developerInstructions"]; exists {
+		t.Fatalf("unscoped settings resume overwrote retained role instructions: %#v", params)
+	}
+	if _, exists := params["sandbox"]; exists {
+		t.Fatalf("unscoped settings resume overwrote retained sandbox: %#v", params)
+	}
+	if err := validateThreadPolicy(ThreadPolicy{Sandbox: "danger-full-access"}); err == nil {
+		t.Fatal("unsupported member sandbox was accepted")
+	}
+}
+
+func TestProjectIDStartsAndListsOnlyMatchingThreads(t *testing.T) {
+	const projectID = "member:example:reviewer0"
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for index, method := range []string{"thread/start", "thread/list"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params := request["params"].(map[string]any)
+			if request["method"] != method || params["projectId"] != projectID {
+				return fmt.Errorf("project request %d = %#v", index, request)
+			}
+			result := map[string]any{}
+			if index == 0 {
+				result["thread"] = map[string]any{"id": "thread-1", "cwd": "/workspace/work/example", "projectId": projectID}
+			} else {
+				result["data"] = []any{map[string]any{"id": "thread-1", "cwd": "/workspace/work/example", "projectId": projectID}}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := newTestClient(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.StartThreadWithSettings(ctx, "/workspace/work/example", nil, ThreadSettings{ProjectID: projectID}); err != nil {
+		t.Fatal(err)
+	}
+	threads, _, err := client.ListThreads(ctx, ThreadListOptions{ProjectID: projectID})
+	if err != nil || len(threads) != 1 || threads[0].ProjectID == nil || *threads[0].ProjectID != projectID {
+		t.Fatalf("project threads = %#v, %v", threads, err)
+	}
+	if _, err := client.ResumeThreadWithSettings(ctx, "thread-1", "/workspace/work/example", nil, ThreadSettings{ProjectID: projectID}); err == nil {
+		t.Fatal("resume silently ignored project ID")
 	}
 }
 

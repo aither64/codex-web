@@ -261,6 +261,21 @@ if COVERAGE_ONLY:
 for message in client_requests:
     validate("ClientRequest.json", message, f"client request {message['method']}")
 
+for message in [
+    request("thread/start", {
+        "cwd": "/workspace/work/example",
+        "developerInstructions": lifecycle_developer_instructions + "\n\nReview the assigned change.",
+        "sandbox": "read-only", "projectId": "member:example:reviewer0",
+        "config": {"shell_environment_policy": {"set": environment}},
+    }),
+    request("thread/resume", {
+        "threadId": "thread-1", "developerInstructions": lifecycle_developer_instructions + "\n\nReview the assigned change.",
+        "sandbox": "read-only", "excludeTurns": True,
+    }),
+    request("thread/list", {"projectId": "member:example:reviewer0", "limit": 100}),
+]:
+    validate("ClientRequest.json", message, f"member policy request {message['method']}")
+
 validate("ClientNotification.json", {"method": "initialized"}, "initialized notification")
 
 rate_limits = {

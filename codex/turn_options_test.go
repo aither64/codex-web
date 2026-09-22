@@ -45,6 +45,7 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			policy := ThreadPolicy{DeveloperInstructions: "Review the assigned change.", Sandbox: "read-only"}
 			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 				if err := handshake(connection); err != nil {
 					return err
@@ -58,6 +59,10 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 						return fmt.Errorf("request %d = %#v, want %s", index, request, method)
 					}
 					params := request["params"].(map[string]any)
+					if index == 0 && (params["developerInstructions"] != sessionLifecycleDeveloperInstructions+"\n\n"+policy.DeveloperInstructions ||
+						params["sandbox"] != "read-only") {
+						return fmt.Errorf("assignment resume omitted retained policy: %#v", params)
+					}
 					result := map[string]any{}
 					switch index {
 					case 1:
@@ -98,8 +103,10 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 			defer client.Close()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			options := testTurnOptions()
+			options.ThreadPolicy = policy
 			receipt, err := client.SendWithOptions(
-				ctx, "thread-1", "message", "client-message-1", "", testTurnOptions(),
+				ctx, "thread-1", "message", "client-message-1", "", options,
 			)
 			if err != nil {
 				t.Fatal(err)

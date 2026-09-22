@@ -164,6 +164,15 @@ type TurnOptions struct {
 	Model             string                            `json:"model,omitempty"`
 	ReasoningEffort   string                            `json:"reasoningEffort,omitempty"`
 	AdditionalContext map[string]AdditionalContextEntry `json:"additionalContext,omitempty"`
+	ThreadPolicy      ThreadPolicy                      `json:"threadPolicy,omitempty"`
+}
+
+// ThreadPolicy supplies application-owned instructions and sandbox access for
+// a persistent thread. The client combines DeveloperInstructions with its
+// common lifecycle instructions whenever the policy is explicitly applied.
+type ThreadPolicy struct {
+	DeveloperInstructions string `json:"developerInstructions,omitempty"`
+	Sandbox               string `json:"sandbox,omitempty"`
 }
 
 type normalizedAdditionalContextEntry struct {
@@ -176,6 +185,7 @@ type normalizedTurnOptions struct {
 	Model             string                             `json:"model,omitempty"`
 	ReasoningEffort   string                             `json:"reasoningEffort,omitempty"`
 	AdditionalContext []normalizedAdditionalContextEntry `json:"additionalContext,omitempty"`
+	ThreadPolicy      ThreadPolicy                       `json:"threadPolicy,omitempty"`
 	Digest            string                             `json:"-"`
 }
 
@@ -184,9 +194,13 @@ type turnOptionsIdentity struct {
 	Model             string                             `json:"model,omitempty"`
 	ReasoningEffort   string                             `json:"reasoningEffort,omitempty"`
 	AdditionalContext []normalizedAdditionalContextEntry `json:"additionalContext,omitempty"`
+	ThreadPolicy      *ThreadPolicy                      `json:"threadPolicy,omitempty"`
 }
 
 func normalizeTurnOptions(options TurnOptions) (normalizedTurnOptions, error) {
+	if err := validateThreadPolicy(options.ThreadPolicy); err != nil {
+		return normalizedTurnOptions{}, err
+	}
 	if err := validateTurnOptionScalar("model", options.Model); err != nil {
 		return normalizedTurnOptions{}, err
 	}
@@ -227,9 +241,14 @@ func normalizeTurnOptions(options TurnOptions) (normalizedTurnOptions, error) {
 		})
 	}
 	sort.Slice(context, func(i, j int) bool { return context[i].Source < context[j].Source })
+	var policyIdentity *ThreadPolicy
+	if options.ThreadPolicy != (ThreadPolicy{}) {
+		policy := options.ThreadPolicy
+		policyIdentity = &policy
+	}
 	identity := turnOptionsIdentity{
 		Version: 1, Model: options.Model, ReasoningEffort: options.ReasoningEffort,
-		AdditionalContext: context,
+		AdditionalContext: context, ThreadPolicy: policyIdentity,
 	}
 	encoded, err := json.Marshal(identity)
 	if err != nil {
@@ -238,8 +257,26 @@ func normalizeTurnOptions(options TurnOptions) (normalizedTurnOptions, error) {
 	digest := sha256.Sum256(encoded)
 	return normalizedTurnOptions{
 		Model: options.Model, ReasoningEffort: options.ReasoningEffort,
-		AdditionalContext: context, Digest: fmt.Sprintf("%x", digest),
+		AdditionalContext: context, ThreadPolicy: options.ThreadPolicy, Digest: fmt.Sprintf("%x", digest),
 	}, nil
+}
+
+func validateThreadPolicy(policy ThreadPolicy) error {
+	if !utf8.ValidString(policy.DeveloperInstructions) || len(policy.DeveloperInstructions) > 64*1024 {
+		return errors.New("thread developer instructions must be valid Unicode and at most 64 KiB")
+	}
+	if policy.Sandbox != "" && policy.Sandbox != "read-only" && policy.Sandbox != "workspace-write" {
+		return errors.New("thread sandbox must be read-only or workspace-write")
+	}
+	return nil
+}
+
+func validateProjectID(projectID string) error {
+	if !utf8.ValidString(projectID) || len(projectID) > 512 ||
+		(projectID != "" && strings.TrimSpace(projectID) == "") {
+		return errors.New("thread project ID must be valid nonblank Unicode and at most 512 bytes")
+	}
+	return nil
 }
 
 func validateTurnOptionScalar(name, value string) error {
@@ -295,9 +332,11 @@ type SendAcknowledgement struct {
 }
 
 type ThreadSettings struct {
-	Model             string `json:"model,omitempty"`
-	ReasoningEffort   string `json:"reasoningEffort,omitempty"`
-	CollaborationMode string `json:"collaborationMode,omitempty"`
+	Model             string       `json:"model,omitempty"`
+	ReasoningEffort   string       `json:"reasoningEffort,omitempty"`
+	CollaborationMode string       `json:"collaborationMode,omitempty"`
+	Policy            ThreadPolicy `json:"policy,omitempty"`
+	ProjectID         string       `json:"projectId,omitempty"`
 }
 
 type ThreadSettingsUpdate struct {
@@ -311,6 +350,7 @@ type ThreadSettingsUpdate struct {
 type ThreadMetadata struct {
 	ID           string            `json:"id"`
 	Cwd          string            `json:"cwd"`
+	ProjectID    *string           `json:"projectId"`
 	ForkedFromID string            `json:"forkedFromId"`
 	Source       any               `json:"source"`
 	UpdatedAt    int64             `json:"updatedAt"`
@@ -324,6 +364,7 @@ type ThreadMetadata struct {
 
 type ThreadListOptions struct {
 	Cwd           string
+	ProjectID     string
 	SourceKinds   []string
 	Archived      *bool
 	Limit         int
@@ -586,9 +627,13 @@ type ClientInfo struct {
 type ClientOptions struct {
 	ClientInfo            ClientInfo
 	DeveloperInstructions string
-	RuntimeWorkspaceRoots []string
-	ThreadSourceKinds     []string
-	NonBlockingUserInput  *NonBlockingUserInputPolicy
+	// PreserveThreadInstructionsOnResume omits an instruction override from
+	// unscoped resumes, preserving each thread's persisted policy. Explicit
+	// starts, resumes, sends, and reconciliation still apply their policy.
+	PreserveThreadInstructionsOnResume bool
+	RuntimeWorkspaceRoots              []string
+	ThreadSourceKinds                  []string
+	NonBlockingUserInput               *NonBlockingUserInputPolicy
 	// SubmissionLedgerPath selects application-owned durable retry storage.
 	// Empty preserves the compatibility path next to the App Server socket.
 	SubmissionLedgerPath string
@@ -2661,14 +2706,29 @@ func stringValue(value any) string {
 }
 
 func (c *Client) settingsParams(settings ThreadSettings, params map[string]any, config map[string]any) {
-	if c.options.DeveloperInstructions != "" {
-		params["developerInstructions"] = c.options.DeveloperInstructions
-	}
+	_, existingThread := params["threadId"]
+	c.applyThreadPolicy(params, settings.Policy, !existingThread || settings.Policy != (ThreadPolicy{}))
 	if settings.Model != "" {
 		params["model"] = settings.Model
 	}
 	if settings.ReasoningEffort != "" {
 		config["model_reasoning_effort"] = settings.ReasoningEffort
+	}
+}
+
+func (c *Client) applyThreadPolicy(params map[string]any, policy ThreadPolicy, explicit bool) {
+	if !explicit && c.options.PreserveThreadInstructionsOnResume {
+		return
+	}
+	if policy.DeveloperInstructions != "" && c.options.DeveloperInstructions != "" {
+		params["developerInstructions"] = c.options.DeveloperInstructions + "\n\n" + policy.DeveloperInstructions
+	} else if policy.DeveloperInstructions != "" {
+		params["developerInstructions"] = policy.DeveloperInstructions
+	} else if c.options.DeveloperInstructions != "" {
+		params["developerInstructions"] = c.options.DeveloperInstructions
+	}
+	if policy.Sandbox != "" {
+		params["sandbox"] = policy.Sandbox
 	}
 }
 
@@ -2696,10 +2756,17 @@ func (c *Client) StartThread(ctx context.Context, cwd string, environment map[st
 func (c *Client) StartThreadWithSettings(
 	ctx context.Context, cwd string, environment map[string]string, settings ThreadSettings,
 ) (string, error) {
+	if err := validateThreadPolicy(settings.Policy); err != nil {
+		return "", err
+	}
+	if err := validateProjectID(settings.ProjectID); err != nil {
+		return "", err
+	}
 	var response struct {
 		Thread struct {
-			ID  string `json:"id"`
-			Cwd string `json:"cwd"`
+			ID        string  `json:"id"`
+			Cwd       string  `json:"cwd"`
+			ProjectID *string `json:"projectId"`
 		} `json:"thread"`
 	}
 	config := map[string]any{
@@ -2713,11 +2780,17 @@ func (c *Client) StartThreadWithSettings(
 		return "", err
 	}
 	c.settingsParams(settings, params, config)
+	if settings.ProjectID != "" {
+		params["projectId"] = settings.ProjectID
+	}
 	if err := c.Request(ctx, "thread/start", params, &response); err != nil {
 		return "", err
 	}
 	if response.Thread.ID == "" || response.Thread.Cwd != cwd {
 		return "", errors.New("thread/start returned no thread id or the wrong working directory")
+	}
+	if settings.ProjectID != "" && (response.Thread.ProjectID == nil || *response.Thread.ProjectID != settings.ProjectID) {
+		return "", errors.New("thread/start returned the wrong project ID")
 	}
 	return response.Thread.ID, nil
 }
@@ -2732,12 +2805,18 @@ func (c *Client) ReconcileThreadInstructions(ctx context.Context, threadID strin
 	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
 		return err
 	}
-	return c.resumeThread(ctx, threadID)
+	return c.resumeThreadWithPolicy(ctx, threadID, ThreadPolicy{}, true)
 }
 
 func (c *Client) ResumeThreadWithSettings(
 	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
 ) (string, error) {
+	if err := validateThreadPolicy(settings.Policy); err != nil {
+		return "", err
+	}
+	if settings.ProjectID != "" {
+		return "", errors.New("thread project ID can only be selected at start")
+	}
 	var response struct {
 		Thread struct {
 			ID  string `json:"id"`
@@ -2834,9 +2913,15 @@ func (c *Client) ReadThreadMetadata(
 func (c *Client) ListThreads(
 	ctx context.Context, options ThreadListOptions,
 ) ([]ThreadMetadata, *string, error) {
+	if err := validateProjectID(options.ProjectID); err != nil {
+		return nil, nil, err
+	}
 	params := map[string]any{}
 	if options.Cwd != "" {
 		params["cwd"] = options.Cwd
+	}
+	if options.ProjectID != "" {
+		params["projectId"] = options.ProjectID
 	}
 	if len(options.SourceKinds) > 0 {
 		params["sourceKinds"] = append([]string(nil), options.SourceKinds...)
@@ -2862,6 +2947,13 @@ func (c *Client) ListThreads(
 	}
 	if page.Data == nil {
 		return nil, nil, errors.New("thread/list returned no data")
+	}
+	if options.ProjectID != "" {
+		for _, thread := range *page.Data {
+			if thread.ProjectID == nil || *thread.ProjectID != options.ProjectID {
+				return nil, nil, errors.New("thread/list returned a thread outside the requested project")
+			}
+		}
 	}
 	return *page.Data, page.NextCursor, nil
 }
@@ -3163,6 +3255,12 @@ func (c *Client) UpdateThreadSettings(
 func (c *Client) ForkThread(
 	ctx context.Context, threadID, cwd string, environment map[string]string, settings ThreadSettings,
 ) (string, error) {
+	if err := validateThreadPolicy(settings.Policy); err != nil {
+		return "", err
+	}
+	if settings.ProjectID != "" {
+		return "", errors.New("thread project ID cannot be selected when forking")
+	}
 	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
 		return "", err
 	}
@@ -3500,14 +3598,20 @@ func jsonDetails(value any) string {
 }
 
 func (c *Client) resumeThread(ctx context.Context, threadID string) error {
+	return c.resumeThreadWithPolicy(ctx, threadID, ThreadPolicy{}, false)
+}
+
+func (c *Client) resumeThreadWithPolicy(ctx context.Context, threadID string, policy ThreadPolicy, explicit bool) error {
 	var response map[string]any
-	return c.Request(ctx, "thread/resume", c.threadResumeParams(threadID), &response)
+	params := c.threadResumeParams(threadID)
+	c.applyThreadPolicy(params, policy, explicit)
+	return c.Request(ctx, "thread/resume", params, &response)
 }
 
 func (c *Client) threadResumeParams(threadID string) map[string]any {
 	params := map[string]any{"threadId": threadID, "excludeTurns": true}
-	if c.options.DeveloperInstructions != "" && !c.options.ObserverOnly {
-		params["developerInstructions"] = c.options.DeveloperInstructions
+	if !c.options.ObserverOnly {
+		c.applyThreadPolicy(params, ThreadPolicy{}, false)
 	}
 	return params
 }
@@ -4126,7 +4230,7 @@ func (c *Client) SendWithOptions(
 	if receipt, found, err := c.reconcileSend(ctx, threadID, text, clientUserMessageID, attempt); err != nil || found {
 		return receipt, err
 	}
-	if err := c.resumeThread(ctx, threadID); err != nil {
+	if err := c.resumeThreadWithPolicy(ctx, threadID, normalizedOptions.ThreadPolicy, normalizedOptions.ThreadPolicy != (ThreadPolicy{})); err != nil {
 		return SendReceipt{}, err
 	}
 	turnID, err := c.ActiveTurnID(ctx, threadID)

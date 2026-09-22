@@ -21,6 +21,20 @@ writable persistent state independently of a connect-only or ephemeral socket
 directory. Leave it empty to retain the compatibility path beside the socket;
 all cooperating processes must select the same path.
 
+`ThreadSettings.Policy` supplies a persistent thread's role instructions and
+`read-only` or `workspace-write` sandbox for explicit start, resume and fork
+operations. The client appends role instructions to its common
+`ClientOptions.DeveloperInstructions`. Applications with different thread roles
+should set `PreserveThreadInstructionsOnResume`: unscoped reads, subscriptions
+and reconnects then leave the App Server's persisted instructions intact.
+Explicit member assignments can pass the same policy in
+`TurnOptions.ThreadPolicy`; it is included in the durable send identity and
+reapplied before either a new turn or a steer. `ReconcileThreadInstructions`
+remains an explicit way to refresh the common policy on an idle root thread.
+`ThreadSettings.ProjectID` selects an immutable project when starting a thread;
+`ThreadListOptions.ProjectID` lists that project's threads and rejects results
+outside it. A project ID cannot be selected during resume or fork.
+
 `Client.SendWithOptions`, `PrepareSendWithOptions`,
 `SendAttemptedWithOptions`, `ReconcileSendWithOptions`,
 `DiscardPreparedSendWithOptions`, and `EnsureInitialMessageWithOptions` accept
