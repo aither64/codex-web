@@ -3503,6 +3503,13 @@ func (c *Client) RequireThreadTurnsIdle(ctx context.Context, threadID string) er
 	if err := c.Request(ctx, "thread/turns/list", map[string]any{
 		"threadId": threadID, "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded",
 	}, &page); err != nil {
+		var metadata struct {
+			Thread map[string]any `json:"thread"`
+		}
+		if readErr := c.Request(ctx, "thread/read", map[string]any{"threadId": threadID}, &metadata); readErr == nil &&
+			c.freshThreadMissingSourceRollout(metadata.Thread, threadID, err) {
+			return nil
+		}
 		return err
 	}
 	if page.Data == nil {
