@@ -538,24 +538,42 @@ func TestUnscopedSettingsResumePreservesPersistedMemberPolicy(t *testing.T) {
 }
 
 func TestProjectIDStartsAndListsOnlyMatchingThreads(t *testing.T) {
-	const projectID = "member:example:reviewer0"
+	const projectID = "00000000-0000-7000-8000-000000000001"
+	const projectKey = "dev-workspace-member:example:reviewer0"
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
 			return err
 		}
-		for index, method := range []string{"thread/start", "thread/list"} {
+		for index, method := range []string{"project/create", "project/read", "thread/start", "thread/list"} {
 			request, err := readObject(connection)
 			if err != nil {
 				return err
 			}
 			params := request["params"].(map[string]any)
-			if request["method"] != method || params["projectId"] != projectID {
+			if request["method"] != method {
 				return fmt.Errorf("project request %d = %#v", index, request)
 			}
 			result := map[string]any{}
-			if index == 0 {
+			switch method {
+			case "project/create":
+				if params["idempotencyKey"] != projectKey || params["name"] != "example reviewer0" || len(params["roots"].([]any)) != 0 {
+					return fmt.Errorf("project/create params = %#v", params)
+				}
+				result["project"] = map[string]any{"id": projectID, "name": "example reviewer0"}
+			case "project/read":
+				if params["projectId"] != projectID {
+					return fmt.Errorf("project/read params = %#v", params)
+				}
+				result["project"] = map[string]any{"id": projectID, "name": "example reviewer0"}
+			case "thread/start":
+				if params["projectId"] != projectID {
+					return fmt.Errorf("thread/start params = %#v", params)
+				}
 				result["thread"] = map[string]any{"id": "thread-1", "cwd": "/workspace/work/example", "projectId": projectID}
-			} else {
+			case "thread/list":
+				if params["projectId"] != projectID {
+					return fmt.Errorf("thread/list params = %#v", params)
+				}
 				result["data"] = []any{map[string]any{"id": "thread-1", "cwd": "/workspace/work/example", "projectId": projectID}}
 			}
 			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
@@ -568,6 +586,14 @@ func TestProjectIDStartsAndListsOnlyMatchingThreads(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	created, err := client.CreateProject(ctx, "example reviewer0", projectKey)
+	if err != nil || created.ID != projectID {
+		t.Fatalf("created project = %#v, %v", created, err)
+	}
+	read, err := client.ReadProject(ctx, projectID)
+	if err != nil || read.ID != projectID {
+		t.Fatalf("read project = %#v, %v", read, err)
+	}
 	if _, err := client.StartThreadWithSettings(ctx, "/workspace/work/example", nil, ThreadSettings{ProjectID: projectID}); err != nil {
 		t.Fatal(err)
 	}
@@ -577,6 +603,32 @@ func TestProjectIDStartsAndListsOnlyMatchingThreads(t *testing.T) {
 	}
 	if _, err := client.ResumeThreadWithSettings(ctx, "thread-1", "/workspace/work/example", nil, ThreadSettings{ProjectID: projectID}); err == nil {
 		t.Fatal("resume silently ignored project ID")
+	}
+}
+
+func TestReadProjectClassifiesOnlyExactMissingIdentity(t *testing.T) {
+	const projectID = "dev-workspace-member:missing"
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		if request["method"] != "project/read" {
+			return fmt.Errorf("project lookup = %#v", request)
+		}
+		return writeObject(connection, map[string]any{"id": request["id"],
+			"error": map[string]any{"code": -32602, "message": "project not found: " + projectID}})
+	})
+	client := newTestClient(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.ReadProject(ctx, projectID)
+	if !IsProjectNotFound(err, projectID) || IsProjectNotFound(err, "another-project") {
+		t.Fatalf("project/read missing classification = %v", err)
 	}
 }
 

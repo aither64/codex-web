@@ -100,6 +100,11 @@ client_requests = [
             "config": {"shell_environment_policy": {"set": environment}},
         },
     ),
+    request("project/create", {
+        "name": "example reviewer0", "roots": [],
+        "idempotencyKey": "dev-workspace-member:example:reviewer0",
+    }),
+    request("project/read", {"projectId": "00000000-0000-7000-8000-000000000001"}),
     request(
         "thread/resume",
         {
@@ -563,6 +568,13 @@ validate(
     "model/list result",
 )
 validate("v2/ThreadListResponse.json", {"data": [thread]}, "thread/list result")
+project = {
+    "id": "00000000-0000-7000-8000-000000000001",
+    "name": "example reviewer0", "roots": [], "metadata": {},
+    "position": 0, "createdAt": 1, "updatedAt": 1, "recencyAt": None,
+}
+validate("v2/ProjectCreateResponse.json", {"project": project}, "project/create result")
+validate("v2/ProjectReadResponse.json", {"project": project}, "project/read result")
 validate(
     "v2/ThreadLoadedListResponse.json",
     {"data": ["thread-1"], "nextCursor": None},

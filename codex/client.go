@@ -55,6 +55,28 @@ type rpcCallError struct {
 	message string
 }
 
+type ProjectNotFoundError struct {
+	ProjectID string
+	Cause     error
+}
+
+func (e *ProjectNotFoundError) Error() string {
+	return fmt.Sprintf("Codex project not found: %s", e.ProjectID)
+}
+
+func (e *ProjectNotFoundError) Unwrap() error { return e.Cause }
+
+// IsProjectNotFound reports the App Server's exact missing-project response.
+func IsProjectNotFound(err error, projectID string) bool {
+	var missing *ProjectNotFoundError
+	if errors.As(err, &missing) {
+		return missing.ProjectID == projectID
+	}
+	var call *rpcCallError
+	return errors.As(err, &call) && call.code == -32602 &&
+		call.message == "project not found: "+projectID
+}
+
 func (e *rpcCallError) Error() string {
 	return fmt.Sprintf("Codex RPC %d: %s", e.code, e.message)
 }
@@ -337,6 +359,51 @@ type ThreadSettings struct {
 	CollaborationMode string       `json:"collaborationMode,omitempty"`
 	Policy            ThreadPolicy `json:"policy,omitempty"`
 	ProjectID         string       `json:"projectId,omitempty"`
+}
+
+// ProjectMetadata is the identity returned by the App Server project catalog.
+type ProjectMetadata struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// CreateProject is retry-safe when the caller retains the same idempotency key.
+func (c *Client) CreateProject(ctx context.Context, name, idempotencyKey string) (ProjectMetadata, error) {
+	if name == "" || idempotencyKey == "" {
+		return ProjectMetadata{}, errors.New("project name and idempotency key are required")
+	}
+	var response struct {
+		Project ProjectMetadata `json:"project"`
+	}
+	err := c.Request(ctx, "project/create", map[string]any{
+		"name": name, "roots": []any{}, "idempotencyKey": idempotencyKey,
+	}, &response)
+	if err != nil {
+		return ProjectMetadata{}, err
+	}
+	if response.Project.ID == "" {
+		return ProjectMetadata{}, errors.New("project/create returned no project identity")
+	}
+	return response.Project, nil
+}
+
+func (c *Client) ReadProject(ctx context.Context, projectID string) (ProjectMetadata, error) {
+	if projectID == "" {
+		return ProjectMetadata{}, errors.New("project ID is required")
+	}
+	var response struct {
+		Project ProjectMetadata `json:"project"`
+	}
+	if err := c.Request(ctx, "project/read", map[string]any{"projectId": projectID}, &response); err != nil {
+		if IsProjectNotFound(err, projectID) {
+			return ProjectMetadata{}, &ProjectNotFoundError{ProjectID: projectID, Cause: err}
+		}
+		return ProjectMetadata{}, err
+	}
+	if response.Project.ID != projectID {
+		return ProjectMetadata{}, errors.New("project/read returned the wrong project identity")
+	}
+	return response.Project, nil
 }
 
 type ThreadSettingsUpdate struct {
