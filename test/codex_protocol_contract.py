@@ -186,6 +186,7 @@ client_requests = [
     request("thread/name/set", {"threadId": "thread-1", "name": "example"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
+    request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
@@ -217,6 +218,18 @@ client_requests = [
     request("thread/unsubscribe", {"threadId": "thread-1"}),
     request("thread/archive", {"threadId": "thread-1"}),
     request("thread/unarchive", {"threadId": "thread-1"}),
+    request(
+        "thread/inject_items",
+        {
+            "threadId": "thread-1",
+            "items": [{
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Internal team member initialization"}],
+            }],
+        },
+    ),
+    request("thread/delete", {"threadId": "thread-1"}),
     request("thread/queue/list", {"threadId": "thread-1", "limit": 100}),
     request(
         "thread/queue/add",
@@ -251,7 +264,7 @@ client_source += "\n" + "\n".join(
 )
 client_requests.append(request("thread/read", {"threadId": "thread-1", "excludeTurns": True}))
 call_pattern = re.compile(
-    r'\b(?:Request|requestConnected|requestConnectedGeneration|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z]+)*)"',
+    r'\b(?:Request|requestConnected|requestConnectedGeneration|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
     re.DOTALL,
 )
 implemented_calls = Counter(call_pattern.findall(client_source))
