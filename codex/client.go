@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -35,6 +36,8 @@ const (
 	turnOptionMaxAdditionalContextValueBytes = 64 * 1024
 	turnOptionMaxAdditionalContextBytes      = 256 * 1024
 )
+
+var threadMCPNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type rpcMessage struct {
 	ID     json.RawMessage `json:"id,omitempty"`
@@ -214,9 +217,22 @@ type TurnOptions struct {
 // ThreadPolicy supplies application-owned instructions and sandbox access for
 // a persistent thread. The client combines DeveloperInstructions with its
 // common lifecycle instructions whenever the policy is explicitly applied.
+// MCPServer is a single application-owned, explicitly approved tool that must
+// be rebound on every member resume; App Server does not retain it otherwise.
 type ThreadPolicy struct {
-	DeveloperInstructions string `json:"developerInstructions,omitempty"`
-	Sandbox               string `json:"sandbox,omitempty"`
+	DeveloperInstructions string           `json:"developerInstructions,omitempty"`
+	Sandbox               string           `json:"sandbox,omitempty"`
+	MCPServer             *ThreadMCPServer `json:"mcpServer,omitempty"`
+}
+
+// ThreadMCPServer binds one stdio MCP tool to a trusted thread policy. It is
+// intentionally narrow: the application chooses the command and arguments;
+// the model can call only Tool. Callers must enforce their own tool semantics.
+type ThreadMCPServer struct {
+	Name    string   `json:"name"`
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+	Tool    string   `json:"tool"`
 }
 
 type normalizedAdditionalContextEntry struct {
@@ -311,6 +327,23 @@ func validateThreadPolicy(policy ThreadPolicy) error {
 	}
 	if policy.Sandbox != "" && policy.Sandbox != "read-only" && policy.Sandbox != "workspace-write" {
 		return errors.New("thread sandbox must be read-only or workspace-write")
+	}
+	if server := policy.MCPServer; server != nil {
+		if !threadMCPNamePattern.MatchString(server.Name) || !threadMCPNamePattern.MatchString(server.Tool) {
+			return errors.New("thread MCP server and tool names must be lowercase safe identifiers")
+		}
+		if !filepath.IsAbs(server.Command) || filepath.Clean(server.Command) != server.Command ||
+			!utf8.ValidString(server.Command) || strings.ContainsRune(server.Command, 0) || len(server.Command) > 4096 {
+			return errors.New("thread MCP command must be a canonical absolute path")
+		}
+		if len(server.Args) == 0 || len(server.Args) > 64 {
+			return errors.New("thread MCP server requires between 1 and 64 arguments")
+		}
+		for _, arg := range server.Args {
+			if arg == "" || !utf8.ValidString(arg) || strings.ContainsRune(arg, 0) || len(arg) > 4096 {
+				return errors.New("thread MCP arguments must be nonempty valid Unicode without NUL")
+			}
+		}
 	}
 	return nil
 }
@@ -2797,11 +2830,28 @@ func stringValue(value any) string {
 func (c *Client) settingsParams(settings ThreadSettings, params map[string]any, config map[string]any) {
 	_, existingThread := params["threadId"]
 	c.applyThreadPolicy(params, settings.Policy, !existingThread || settings.Policy != (ThreadPolicy{}))
+	applyThreadMCP(config, settings.Policy)
 	if settings.Model != "" {
 		params["model"] = settings.Model
 	}
 	if settings.ReasoningEffort != "" {
 		config["model_reasoning_effort"] = settings.ReasoningEffort
+	}
+}
+
+func applyThreadMCP(config map[string]any, policy ThreadPolicy) {
+	server := policy.MCPServer
+	if server == nil {
+		return
+	}
+	config["mcp_servers"] = map[string]any{
+		server.Name: map[string]any{
+			"command":       server.Command,
+			"args":          append([]string(nil), server.Args...),
+			"required":      true,
+			"enabled_tools": []string{server.Tool},
+			"tools":         map[string]any{server.Tool: map[string]any{"approval_mode": "approve"}},
+		},
 	}
 }
 
@@ -3707,6 +3757,11 @@ func (c *Client) resumeThreadWithPolicy(ctx context.Context, threadID string, po
 	var response map[string]any
 	params := c.threadResumeParams(threadID)
 	c.applyThreadPolicy(params, policy, explicit)
+	if policy.MCPServer != nil {
+		config := map[string]any{}
+		applyThreadMCP(config, policy)
+		params["config"] = config
+	}
 	return c.Request(ctx, "thread/resume", params, &response)
 }
 

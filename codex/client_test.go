@@ -418,7 +418,10 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 }
 
 func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
-	policy := ThreadPolicy{DeveloperInstructions: "Review the assigned change. Do not edit source.", Sandbox: "read-only"}
+	policy := ThreadPolicy{
+		DeveloperInstructions: "Review the assigned change. Do not edit source.", Sandbox: "read-only",
+		MCPServer: &ThreadMCPServer{Name: "team_bus", Command: "/usr/bin/team-bus", Args: []string{"--member", "reviewer0"}, Tool: "report"},
+	}
 	combined := sessionLifecycleDeveloperInstructions + "\n\n" + policy.DeveloperInstructions
 	methods := []string{
 		"thread/start",
@@ -448,6 +451,9 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 				if params["developerInstructions"] != combined || params["sandbox"] != "read-only" {
 					return fmt.Errorf("%s omitted member policy: %#v", method, params)
 				}
+				if err := checkThreadMCPConfig(params, policy.MCPServer); err != nil {
+					return fmt.Errorf("%s: %w", method, err)
+				}
 			case 5:
 				if params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
 					return fmt.Errorf("root reconciliation omitted lifecycle instructions: %#v", params)
@@ -455,6 +461,9 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 			case 2, 3:
 				if _, exists := params["developerInstructions"]; exists {
 					return fmt.Errorf("generic resume replaced retained instructions: %#v", params)
+				}
+				if _, exists := params["config"]; exists {
+					return fmt.Errorf("generic resume gained member MCP config: %#v", params)
 				}
 			}
 			result := map[string]any{}
@@ -516,6 +525,70 @@ func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
 		ctx, "thread-1", "/workspace/work/fork", environment, ThreadSettings{Policy: policy},
 	); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func checkThreadMCPConfig(params map[string]any, expected *ThreadMCPServer) error {
+	config, ok := params["config"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("missing thread config: %#v", params)
+	}
+	servers, ok := config["mcp_servers"].(map[string]any)
+	if !ok || len(servers) != 1 {
+		return fmt.Errorf("MCP servers = %#v", config["mcp_servers"])
+	}
+	server, ok := servers[expected.Name].(map[string]any)
+	if !ok || server["command"] != expected.Command || server["required"] != true {
+		return fmt.Errorf("MCP server = %#v", servers[expected.Name])
+	}
+	args, ok := server["args"].([]any)
+	if !ok || len(args) != len(expected.Args) {
+		return fmt.Errorf("MCP args = %#v", server["args"])
+	}
+	for i, arg := range expected.Args {
+		if args[i] != arg {
+			return fmt.Errorf("MCP arg %d = %#v", i, args[i])
+		}
+	}
+	enabled, ok := server["enabled_tools"].([]any)
+	if !ok || len(enabled) != 1 || enabled[0] != expected.Tool {
+		return fmt.Errorf("enabled MCP tools = %#v", server["enabled_tools"])
+	}
+	tools, ok := server["tools"].(map[string]any)
+	if !ok || len(tools) != 1 {
+		return fmt.Errorf("MCP tools = %#v", server["tools"])
+	}
+	tool, ok := tools[expected.Tool].(map[string]any)
+	if !ok || len(tool) != 1 || tool["approval_mode"] != "approve" {
+		return fmt.Errorf("MCP tool policy = %#v", tools[expected.Tool])
+	}
+	return nil
+}
+
+func TestValidateThreadMCPServer(t *testing.T) {
+	valid := ThreadMCPServer{Name: "team_bus", Command: "/usr/bin/team-bus", Args: []string{"--member", "reviewer0"}, Tool: "report"}
+	for _, test := range []struct {
+		name   string
+		change func(*ThreadMCPServer)
+	}{
+		{"unsafe server name", func(s *ThreadMCPServer) { s.Name = "team.bus" }},
+		{"unsafe tool name", func(s *ThreadMCPServer) { s.Tool = "report/work" }},
+		{"relative command", func(s *ThreadMCPServer) { s.Command = "team-bus" }},
+		{"unclean command", func(s *ThreadMCPServer) { s.Command = "/usr/../bin/team-bus" }},
+		{"missing args", func(s *ThreadMCPServer) { s.Args = nil }},
+		{"empty arg", func(s *ThreadMCPServer) { s.Args = []string{""} }},
+		{"NUL arg", func(s *ThreadMCPServer) { s.Args = []string{"x\x00y"} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := valid
+			test.change(&server)
+			if err := validateThreadPolicy(ThreadPolicy{MCPServer: &server}); err == nil {
+				t.Fatal("invalid MCP server accepted")
+			}
+		})
+	}
+	if err := validateThreadPolicy(ThreadPolicy{MCPServer: &valid}); err != nil {
+		t.Fatalf("valid MCP server rejected: %v", err)
 	}
 }
 

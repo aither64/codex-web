@@ -31,6 +31,17 @@ Explicit member assignments can pass the same policy in
 `TurnOptions.ThreadPolicy`; it is included in the durable send identity and
 reapplied before either a new turn or a steer. `ReconcileThreadInstructions`
 remains an explicit way to refresh the common policy on an idle root thread.
+An application may also bind one host-side stdio MCP tool through
+`ThreadPolicy.MCPServer: &ThreadMCPServer{Name, Command, Args, Tool}`. The command
+must be a canonical absolute path, the server and tool names must be lowercase
+safe identifiers, and arguments must be nonempty. The client emits
+`config.mcp_servers` with only that tool enabled, marks the server required, and
+sets the tool's approval mode to `approve`. Pass the same policy on every
+member start, explicit resume, fork and `SendWithOptions` assignment: App Server
+does not retain a thread's MCP configuration across resume. The application
+remains responsible for the tool's authorization and session isolation; this
+client only binds the tool to a trusted thread request. Unscoped requests do
+not acquire a tool.
 `ThreadSettings.ProjectID` selects an immutable project when starting a thread;
 `ThreadListOptions.ProjectID` lists that project's threads and rejects results
 outside it. A project ID cannot be selected during resume or fork.

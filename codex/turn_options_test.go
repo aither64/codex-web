@@ -45,7 +45,10 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			policy := ThreadPolicy{DeveloperInstructions: "Review the assigned change.", Sandbox: "read-only"}
+			policy := ThreadPolicy{
+				DeveloperInstructions: "Review the assigned change.", Sandbox: "read-only",
+				MCPServer: &ThreadMCPServer{Name: "team_bus", Command: "/usr/bin/team-bus", Args: []string{"--member", "reviewer0"}, Tool: "report"},
+			}
 			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 				if err := handshake(connection); err != nil {
 					return err
@@ -62,6 +65,11 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 					if index == 0 && (params["developerInstructions"] != sessionLifecycleDeveloperInstructions+"\n\n"+policy.DeveloperInstructions ||
 						params["sandbox"] != "read-only") {
 						return fmt.Errorf("assignment resume omitted retained policy: %#v", params)
+					}
+					if index == 0 {
+						if err := checkThreadMCPConfig(params, policy.MCPServer); err != nil {
+							return fmt.Errorf("assignment resume: %w", err)
+						}
 					}
 					result := map[string]any{}
 					switch index {
