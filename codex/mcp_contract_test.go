@@ -148,9 +148,11 @@ func TestPinnedMCPContract(t *testing.T) {
 		}
 		prompt := fmt.Sprintf("Use the team_probe report MCP tool exactly once with text %q. Then say done.", expected)
 		id := fmt.Sprintf("00000000-0000-4000-8000-%012d", index+1)
-		if _, err := client.SendWithOptions(ctx, threadID, prompt, id, "mcp-probe", TurnOptions{Model: "gpt-6-luna", ReasoningEffort: "low", ThreadPolicy: policy}); err != nil {
+		receipt, err := client.SendWithOptions(ctx, threadID, prompt, id, "mcp-probe", TurnOptions{Model: "gpt-6-luna", ReasoningEffort: "low", ThreadPolicy: policy})
+		if err != nil {
 			t.Fatalf("send %d: %v\n%s", index, err, output.String())
 		}
+		historyDeadline := time.Now().Add(30 * time.Second)
 		for {
 			body, _ := os.ReadFile(marker)
 			if strings.Contains(string(body), expected) {
@@ -159,7 +161,16 @@ func TestPinnedMCPContract(t *testing.T) {
 			}
 			if active, readErr := client.ActiveTurnID(ctx, threadID); readErr == nil && active == "" {
 				transcript, transcriptErr := client.ReadThread(ctx, threadID)
-				t.Fatalf("turn ended without MCP marker %s: transcript=%+v, read error=%v\n%s", expected, transcript.Entries, transcriptErr, output.String())
+				if transcriptErr == nil {
+					for _, entry := range transcript.Entries {
+						if entry.TurnID == receipt.TurnID && entry.TurnStatus == "completed" {
+							t.Fatalf("turn ended without MCP marker %s: transcript=%+v\n%s", expected, transcript.Entries, output.String())
+						}
+					}
+				}
+				if time.Now().After(historyDeadline) {
+					t.Fatalf("turn history did not appear for %s: transcript=%+v, read error=%v\n%s", expected, transcript.Entries, transcriptErr, output.String())
+				}
 			}
 			if err := ctx.Err(); err != nil {
 				t.Fatalf("MCP tool never recorded %s: %v; marker=%q\n%s", expected, err, string(body), output.String())
