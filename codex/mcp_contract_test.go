@@ -15,7 +15,15 @@ import (
 )
 
 func TestPinnedMCPContractServer(t *testing.T) {
-	if os.Getenv("CODEX_MCP_PROBE_SERVER") != "1" {
+	var marker string
+	for _, argument := range os.Args[1:] {
+		if root, found := strings.CutPrefix(argument, "-test.outputdir="); found && filepath.IsAbs(root) {
+			if _, err := os.Stat(filepath.Join(root, "mcp-probe-server")); err == nil {
+				marker = filepath.Join(root, "host-marker")
+			}
+		}
+	}
+	if marker == "" {
 		return
 	}
 	reader := bufio.NewScanner(os.Stdin)
@@ -48,8 +56,7 @@ func TestPinnedMCPContractServer(t *testing.T) {
 			if err := json.Unmarshal(request.Params, &params); err != nil || params.Name != "report" || params.Arguments.Text == "" {
 				result = map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "invalid report"}}}
 			} else {
-				path := os.Getenv("CODEX_MCP_PROBE_MARKER")
-				file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+				file, err := os.OpenFile(marker, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 				if err == nil {
 					_, err = fmt.Fprintln(file, params.Arguments.Text)
 					_ = file.Close()
@@ -84,8 +91,10 @@ func TestPinnedMCPContract(t *testing.T) {
 	}
 	socket := filepath.Join(root, "app-server.sock")
 	marker := filepath.Join(root, "host-marker")
+	if err := os.WriteFile(filepath.Join(root, "mcp-probe-server"), []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	command := exec.Command(binary, "app-server", "--listen", "unix://"+socket)
-	command.Env = append(os.Environ(), "CODEX_MCP_PROBE_SERVER=1", "CODEX_MCP_PROBE_MARKER="+marker)
 	var output bytes.Buffer
 	command.Stdout, command.Stderr = &output, &output
 	if err := command.Start(); err != nil {
@@ -116,7 +125,7 @@ func TestPinnedMCPContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := ThreadPolicy{Sandbox: "read-only", MCPServer: &ThreadMCPServer{
-		Name: "team_probe", Command: testBinary, Args: []string{"-test.run=^TestPinnedMCPContractServer$"}, Tool: "report",
+		Name: "team_probe", Command: testBinary, Args: []string{"-test.run=^TestPinnedMCPContractServer$", "-test.outputdir=" + root}, Tool: "report",
 	}}
 	threadID, err := client.StartThreadWithSettings(ctx, cwd, map[string]string{}, ThreadSettings{
 		Model: "gpt-6-luna", ReasoningEffort: "low", ProjectID: project.ID, Policy: policy,
