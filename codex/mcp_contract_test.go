@@ -118,7 +118,7 @@ func TestPinnedMCPContract(t *testing.T) {
 	policy := ThreadPolicy{Sandbox: "read-only", MCPServer: &ThreadMCPServer{
 		Name: "team_probe", Command: testBinary, Args: []string{"-test.run=^TestPinnedMCPContractServer$"}, Tool: "report",
 	}}
-	threadID, err := client.StartThreadWithSettings(ctx, cwd, nil, ThreadSettings{
+	threadID, err := client.StartThreadWithSettings(ctx, cwd, map[string]string{}, ThreadSettings{
 		Model: "gpt-6-luna", ReasoningEffort: "low", ProjectID: project.ID, Policy: policy,
 	})
 	if err != nil {
@@ -133,7 +133,7 @@ func TestPinnedMCPContract(t *testing.T) {
 		if index == 1 {
 			client.Close()
 			client = newClient()
-			if _, err := client.ResumeThreadWithSettings(ctx, threadID, cwd, nil, ThreadSettings{Policy: policy}); err != nil {
+			if _, err := client.ResumeThreadWithSettings(ctx, threadID, cwd, map[string]string{}, ThreadSettings{Policy: policy}); err != nil {
 				t.Fatalf("resume with MCP config: %v", err)
 			}
 		}
