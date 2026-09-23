@@ -30,7 +30,10 @@ and reconnects then leave the App Server's persisted instructions intact.
 Explicit member assignments can pass the same policy in
 `TurnOptions.ThreadPolicy`; it is included in the durable send identity and
 reapplied before either a new turn or a steer. `ReconcileThreadInstructions`
-remains an explicit way to refresh the common policy on an idle root thread.
+refreshes the common policy on an idle thread. Use
+`ReconcileThreadInstructionsWithPolicy` to refresh the common policy together
+with that thread's application-owned role instructions; it checks that the
+thread is idle before resuming it and leaves active turns unchanged.
 An application may also bind one host-side stdio MCP tool through
 `ThreadPolicy.MCPServer: &ThreadMCPServer{Name, Command, Args, Tool}`. The command
 must be a canonical absolute path, the server and tool names must be lowercase

@@ -3001,10 +3001,19 @@ func (c *Client) ResumeThread(ctx context.Context, threadID, cwd string, environ
 // ReconcileThreadInstructions refreshes the package-owned thread instruction
 // without interrupting or changing an active turn.
 func (c *Client) ReconcileThreadInstructions(ctx context.Context, threadID string) error {
+	return c.ReconcileThreadInstructionsWithPolicy(ctx, threadID, ThreadPolicy{})
+}
+
+// ReconcileThreadInstructionsWithPolicy refreshes the common instructions and
+// an application-owned thread policy only while the thread is idle.
+func (c *Client) ReconcileThreadInstructionsWithPolicy(ctx context.Context, threadID string, policy ThreadPolicy) error {
+	if err := validateThreadPolicy(policy); err != nil {
+		return err
+	}
 	if err := c.RequireThreadTurnsIdle(ctx, threadID); err != nil {
 		return err
 	}
-	return c.resumeThreadWithPolicy(ctx, threadID, ThreadPolicy{}, true)
+	return c.resumeThreadWithPolicy(ctx, threadID, policy, true)
 }
 
 func (c *Client) ResumeThreadWithSettings(

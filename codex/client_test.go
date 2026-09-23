@@ -761,6 +761,45 @@ func TestReconcileThreadInstructionsDoesNotResumeAnActiveTurn(t *testing.T) {
 	}
 }
 
+func TestReconcileThreadInstructionsWithPolicyPreservesCommonInstructions(t *testing.T) {
+	policy := ThreadPolicy{DeveloperInstructions: "Coordinate the ready team members."}
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for _, method := range []string{"thread/turns/list", "thread/resume"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != method {
+				return fmt.Errorf("expected %s, got %#v", method, request)
+			}
+			params, _ := request["params"].(map[string]any)
+			result := map[string]any{}
+			if method == "thread/turns/list" {
+				result["data"] = []any{}
+			} else if params["developerInstructions"] != sessionLifecycleDeveloperInstructions+"\n\n"+policy.DeveloperInstructions {
+				return fmt.Errorf("reconciled policy = %#v", params)
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := NewWithOptions(socket, ClientOptions{
+		DeveloperInstructions:              sessionLifecycleDeveloperInstructions,
+		PreserveThreadInstructionsOnResume: true,
+	})
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.ReconcileThreadInstructionsWithPolicy(ctx, "thread-1", policy); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestResolveNewThreadSettingsDefaultsToXhigh(t *testing.T) {
 	models := []Model{
 		{
