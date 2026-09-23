@@ -60,6 +60,28 @@ type ProjectNotFoundError struct {
 	Cause     error
 }
 
+type ThreadNotFoundError struct {
+	ThreadID string
+	Cause    error
+}
+
+func (e *ThreadNotFoundError) Error() string {
+	return fmt.Sprintf("Codex thread not found: %s", e.ThreadID)
+}
+
+func (e *ThreadNotFoundError) Unwrap() error { return e.Cause }
+
+// IsThreadNotFound reports the App Server's exact missing-thread response for
+// a read of the specified thread. Other RPC failures remain uncertain.
+func IsThreadNotFound(err error, threadID string) bool {
+	var missing *ThreadNotFoundError
+	if errors.As(err, &missing) {
+		return missing.ThreadID == threadID
+	}
+	var call *rpcCallError
+	return errors.As(err, &call) && call.code == -32001 && call.message == "thread not found"
+}
+
 func (e *ProjectNotFoundError) Error() string {
 	return fmt.Sprintf("Codex project not found: %s", e.ProjectID)
 }
@@ -2969,6 +2991,9 @@ func (c *Client) ReadThreadMetadata(
 		params["excludeTurns"] = true
 	}
 	if err := c.Request(ctx, "thread/read", params, &response); err != nil {
+		if IsThreadNotFound(err, threadID) {
+			return ThreadMetadata{}, &ThreadNotFoundError{ThreadID: threadID, Cause: err}
+		}
 		return ThreadMetadata{}, err
 	}
 	if response.Thread.ID != threadID {
@@ -3424,7 +3449,10 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 func (c *Client) freshThreadMissingSourceRollout(thread map[string]any, threadID string, err error) bool {
 	var rpcErr *rpcCallError
 	if !errors.As(err, &rpcErr) || rpcErr.code != -32600 ||
-		rpcErr.message != "invalid paginated history lineage for "+threadID+": missing source rollout" {
+		!slices.Contains([]string{
+			"invalid paginated history lineage for " + threadID + ": missing source rollout",
+			"thread " + threadID + " is not materialized yet; thread/turns/list is unavailable before first user message",
+		}, rpcErr.message) {
 		return false
 	}
 	if stringValue(thread["id"]) != threadID || !c.threadSource(thread["source"]) ||

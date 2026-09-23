@@ -255,6 +255,21 @@ func TestPinnedCodexHeadlessTeamContract(t *testing.T) {
 	if err != nil || metadata.ProjectID == nil || *metadata.ProjectID != project.ID {
 		t.Fatalf("bootstrap did not persist project identity: metadata=%+v err=%v", metadata, err)
 	}
+	freshProject, err := client.CreateProject(ctx, "unused architect0", "headless-contract-unused-project")
+	if err != nil {
+		t.Fatalf("register unused project: %v", err)
+	}
+	freshID, err := client.StartThreadWithSettings(ctx, sourceCwd, sourceEnvironment, ThreadSettings{ProjectID: freshProject.ID})
+	if err != nil {
+		t.Fatalf("start unused member: %v", err)
+	}
+	if err := client.DeleteFreshHeadlessThread(ctx, freshID, sourceCwd, freshProject.ID); err != nil {
+		t.Fatalf("delete unused member with no rollout: %v", err)
+	}
+	if _, err := client.ReadThreadMetadata(ctx, freshID, false); err == nil ||
+		!strings.Contains(err.Error(), "thread not loaded: "+freshID) {
+		t.Fatalf("deleted unused member was still loaded: %v", err)
+	}
 	client.Close()
 	client = newClient()
 	if _, err := client.ResumeThreadWithSettings(ctx, threadID, sourceCwd, sourceEnvironment, ThreadSettings{}); err != nil {

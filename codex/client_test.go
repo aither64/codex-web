@@ -632,6 +632,34 @@ func TestReadProjectClassifiesOnlyExactMissingIdentity(t *testing.T) {
 	}
 }
 
+func TestReadThreadMetadataClassifiesOnlyExactMissingThread(t *testing.T) {
+	const threadID = "thread-missing"
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		request, err := readObject(connection)
+		if err != nil {
+			return err
+		}
+		if request["method"] != "thread/read" {
+			return fmt.Errorf("thread lookup = %#v", request)
+		}
+		return writeObject(connection, map[string]any{"id": request["id"],
+			"error": map[string]any{"code": -32001, "message": "thread not found"}})
+	})
+	client := newTestClient(socket)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := client.ReadThreadMetadata(ctx, threadID, false)
+	if !IsThreadNotFound(err, threadID) || IsThreadNotFound(err, "another-thread") ||
+		IsThreadNotFound(&rpcCallError{code: -32001, message: "another error"}, threadID) ||
+		IsThreadNotFound(&rpcCallError{code: -32602, message: "thread not found"}, threadID) {
+		t.Fatalf("thread/read missing classification = %v", err)
+	}
+}
+
 func TestReconcileThreadInstructionsDoesNotResumeAnActiveTurn(t *testing.T) {
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
 		if err := handshake(connection); err != nil {
