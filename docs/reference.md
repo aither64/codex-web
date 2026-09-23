@@ -36,12 +36,14 @@ An application may also bind one host-side stdio MCP tool through
 must be a canonical absolute path, the server and tool names must be lowercase
 safe identifiers, and arguments must be nonempty. The client emits
 `config.mcp_servers` with only that tool enabled, marks the server required, and
-sets the tool's approval mode to `approve`. Pass the same policy on every
-member start, explicit resume, fork and `SendWithOptions` assignment: App Server
-does not retain a thread's MCP configuration across resume. The application
-remains responsible for the tool's authorization and session isolation; this
-client only binds the tool to a trusted thread request. Unscoped requests do
-not acquire a tool.
+sets the tool's approval mode to `approve`. Pass an MCP policy only when its
+binding is valid for that destination thread. A tool
+whose arguments include the destination thread ID must be omitted from start
+and fork, then bound on an explicit resume after the new ID is known and on
+each `SendWithOptions` assignment. App Server does not retain MCP configuration
+across resume. The application remains responsible for the tool's
+authorization and session isolation; this client only binds the tool to a
+trusted thread request. Unscoped requests do not acquire a tool.
 `ThreadSettings.ProjectID` selects an immutable project when starting a thread;
 `ThreadListOptions.ProjectID` lists that project's threads and rejects results
 outside it. A project ID cannot be selected during resume or fork.
