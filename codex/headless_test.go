@@ -39,7 +39,11 @@ func TestBootstrapHeadlessThreadReconcilesLostResponseWithoutDuplicate(t *testin
 			result := map[string]any{}
 			switch request["method"] {
 			case "thread/read":
-				result["thread"] = freshHeadlessMetadata(path, projectID)
+				metadata := freshHeadlessMetadata(path, projectID)
+				if injections == 0 {
+					metadata["projectId"] = nil // A fresh pinned-binary thread has no persisted project yet.
+				}
+				result["thread"] = metadata
 			case "thread/inject_items":
 				injections++
 				params := request["params"].(map[string]any)
@@ -225,25 +229,38 @@ func TestPinnedCodexHeadlessTeamContract(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	sourceEnvironment := map[string]string{
+		"DEV_SESSION_SLUG": "source", "DEV_SESSION_WORKSPACE": workspace,
+		"DEV_SESSION_WORK_DIR": sourceCwd, "DEV_SESSION_MEMBER_ADDRESS": "architect0",
+	}
+	forkEnvironment := map[string]string{
+		"DEV_SESSION_SLUG": "fork", "DEV_SESSION_WORKSPACE": workspace,
+		"DEV_SESSION_WORK_DIR": forkCwd, "DEV_SESSION_MEMBER_ADDRESS": "architect0",
+	}
 	client := newClient()
 	project, err := client.CreateProject(ctx, "source architect0", "headless-contract-project")
 	if err != nil {
 		t.Fatalf("register project: %v\n%s", err, output.String())
 	}
-	threadID, err := client.StartThreadWithSettings(ctx, sourceCwd, nil, ThreadSettings{ProjectID: project.ID})
+	threadID, err := client.StartThreadWithSettings(ctx, sourceCwd, sourceEnvironment, ThreadSettings{ProjectID: project.ID})
 	if err != nil {
 		t.Fatalf("start member: %v\n%s", err, output.String())
 	}
 	marker := "Internal team member initialization for thread " + threadID + ". No assignment has been sent yet."
 	if err := client.BootstrapHeadlessThread(ctx, threadID, sourceCwd, project.ID, marker); err != nil {
-		t.Fatalf("bootstrap member: %v\n%s", err, output.String())
+		metadata, readErr := client.ReadThreadMetadata(ctx, threadID, false)
+		t.Fatalf("bootstrap member: %v; metadata=%+v; read error=%v\n%s", err, metadata, readErr, output.String())
+	}
+	metadata, err := client.ReadThreadMetadata(ctx, threadID, false)
+	if err != nil || metadata.ProjectID == nil || *metadata.ProjectID != project.ID {
+		t.Fatalf("bootstrap did not persist project identity: metadata=%+v err=%v", metadata, err)
 	}
 	client.Close()
 	client = newClient()
-	if _, err := client.ResumeThreadWithSettings(ctx, threadID, sourceCwd, nil, ThreadSettings{}); err != nil {
+	if _, err := client.ResumeThreadWithSettings(ctx, threadID, sourceCwd, sourceEnvironment, ThreadSettings{}); err != nil {
 		t.Fatalf("resume member after client disconnect: %v\n%s", err, output.String())
 	}
-	forkID, err := client.ForkThread(ctx, threadID, forkCwd, nil, ThreadSettings{})
+	forkID, err := client.ForkThread(ctx, threadID, forkCwd, forkEnvironment, ThreadSettings{})
 	if err != nil {
 		t.Fatalf("fork member: %v\n%s", err, output.String())
 	}
@@ -254,7 +271,7 @@ func TestPinnedCodexHeadlessTeamContract(t *testing.T) {
 	client.Close()
 	client = newClient()
 	defer client.Close()
-	if _, err := client.ResumeThreadWithSettings(ctx, forkID, forkCwd, nil, ThreadSettings{}); err != nil {
+	if _, err := client.ResumeThreadWithSettings(ctx, forkID, forkCwd, forkEnvironment, ThreadSettings{}); err != nil {
 		t.Fatalf("resume fork after client disconnect: %v\n%s", err, output.String())
 	}
 	if err := client.RequireThreadIdle(ctx, forkID, forkCwd); err != nil {

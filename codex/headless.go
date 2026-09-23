@@ -32,7 +32,7 @@ func (c *Client) headlessThreadMaterialized(ctx context.Context, threadID, cwd, 
 	if err != nil {
 		return false, err
 	}
-	if thread.Cwd != cwd || (projectID != "" && (thread.ProjectID == nil || *thread.ProjectID != projectID || thread.ForkedFromID != "")) ||
+	if thread.Cwd != cwd || (projectID != "" && (thread.ProjectID != nil && *thread.ProjectID != projectID || thread.ForkedFromID != "")) ||
 		(sourceID != "" && thread.ForkedFromID != sourceID) || !c.threadSource(thread.Source) ||
 		thread.Ephemeral == nil || *thread.Ephemeral || thread.HistoryMode != "paginated" {
 		return false, errors.New("headless Codex thread has the wrong identity")
@@ -44,6 +44,9 @@ func (c *Client) headlessThreadMaterialized(ctx context.Context, threadID, cwd, 
 	if err == nil {
 		if !info.Mode().IsRegular() {
 			return false, errors.New("headless Codex thread rollout is not a regular file")
+		}
+		if projectID != "" && thread.ProjectID == nil {
+			return false, errors.New("materialized headless Codex thread has no project identity")
 		}
 		return true, nil
 	}
