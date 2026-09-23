@@ -44,6 +44,13 @@ each `SendWithOptions` assignment. App Server does not retain MCP configuration
 across resume. The application remains responsible for the tool's
 authorization and session isolation; this client only binds the tool to a
 trusted thread request. Unscoped requests do not acquire a tool.
+For queued member work, `StartQueueWithPolicy` rebinds that same policy before
+starting the queued turn; ordinary `StartQueue` retains its empty-policy
+behavior. Nonempty send options are stored with the durable attempt.
+`OriginalSendOptions` retrieves the exact saved options for a matching message
+identity, so an application can retry after its default model or effort
+changes. The caller must still verify current authority for the thread and
+must reject an old policy that is no longer authorized.
 `ThreadSettings.ProjectID` selects an immutable project when starting a thread;
 `ThreadListOptions.ProjectID` lists that project's threads and rejects results
 outside it. A project ID cannot be selected during resume or fork.

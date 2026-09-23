@@ -554,12 +554,13 @@ type queueDeletionAttempt struct {
 }
 
 type sendAttempt struct {
-	Digest        string `json:"digest"`
-	State         string `json:"state"`
-	Context       string `json:"context,omitempty"`
-	OptionsDigest string `json:"optionsDigest,omitempty"`
-	Steered       bool   `json:"steered"`
-	TurnID        string `json:"turnId,omitempty"`
+	Digest        string       `json:"digest"`
+	State         string       `json:"state"`
+	Context       string       `json:"context,omitempty"`
+	OptionsDigest string       `json:"optionsDigest,omitempty"`
+	Options       *TurnOptions `json:"options,omitempty"`
+	Steered       bool         `json:"steered"`
+	TurnID        string       `json:"turnId,omitempty"`
 }
 
 type UnknownSendOutcomeError struct {
@@ -2156,6 +2157,12 @@ func (c *Client) loadQueueLedgerLocked() error {
 					errors.New("queue attempt ledger contains an invalid send attempt"),
 				)
 			}
+			if attempt.Options != nil {
+				stored, optionsErr := normalizeTurnOptions(*attempt.Options)
+				if optionsErr != nil || stored.Digest != effectiveOptionsDigest {
+					return c.failQueueLedgerLocked(errors.New("queue attempt ledger contains invalid send options"))
+				}
+			}
 			if attempt.OptionsDigest == zeroTurnOptionsDigest() {
 				// A pre-release options-aware client could have written the
 				// canonical zero digest. Normalize it only in memory so the
@@ -2366,13 +2373,18 @@ func (c *Client) recordSendAttempt(
 	threadID, clientID, text, context string, steered bool,
 ) error {
 	return c.recordSendAttemptWithOptions(
-		threadID, clientID, text, context, steered, zeroTurnOptionsDigest(),
+		threadID, clientID, text, context, steered, TurnOptions{},
 	)
 }
 
 func (c *Client) recordSendAttemptWithOptions(
-	threadID, clientID, text, context string, steered bool, optionsDigest string,
+	threadID, clientID, text, context string, steered bool, options TurnOptions,
 ) error {
+	normalized, err := normalizeTurnOptions(options)
+	if err != nil {
+		return err
+	}
+	optionsDigest := normalized.Digest
 	return queueLedgerAction(c, func() error {
 		digest := queueTextDigest(text)
 		if existing, ok := c.sendAttempts[threadID][clientID]; ok {
@@ -2385,10 +2397,15 @@ func (c *Client) recordSendAttemptWithOptions(
 		if c.sendAttempts[threadID] == nil {
 			c.sendAttempts[threadID] = make(map[string]sendAttempt)
 		}
-		c.sendAttempts[threadID][clientID] = sendAttempt{
+		attempt := sendAttempt{
 			Digest: digest, State: "prepared", Context: context,
 			OptionsDigest: persistedTurnOptionsDigest(optionsDigest), Steered: steered,
 		}
+		if optionsDigest != zeroTurnOptionsDigest() {
+			copied := cloneTurnOptions(options)
+			attempt.Options = &copied
+		}
+		c.sendAttempts[threadID][clientID] = attempt
 		if err := c.writeQueueLedgerLocked(); err != nil {
 			delete(c.sendAttempts[threadID], clientID)
 			if len(c.sendAttempts[threadID]) == 0 {
@@ -2398,6 +2415,49 @@ func (c *Client) recordSendAttemptWithOptions(
 		}
 		return nil
 	})
+}
+
+func cloneTurnOptions(options TurnOptions) TurnOptions {
+	copy := options
+	if options.AdditionalContext != nil {
+		copy.AdditionalContext = make(map[string]AdditionalContextEntry, len(options.AdditionalContext))
+		for source, entry := range options.AdditionalContext {
+			copy.AdditionalContext[source] = entry
+		}
+	}
+	if options.ThreadPolicy.MCPServer != nil {
+		server := *options.ThreadPolicy.MCPServer
+		server.Args = slices.Clone(server.Args)
+		copy.ThreadPolicy.MCPServer = &server
+	}
+	return copy
+}
+
+// OriginalSendOptions retrieves the exact options reserved by a prior send.
+// An application can use them to retry the same message after its defaults
+// change, without submitting a turn under a different model or policy.
+func (c *Client) OriginalSendOptions(threadID, text, clientID, actionContext string) (TurnOptions, bool, error) {
+	type result struct {
+		options TurnOptions
+		found   bool
+	}
+	value, err := queueLedgerTransaction(c, func() (result, error) {
+		attempt, found := c.sendAttempts[threadID][clientID]
+		if !found {
+			return result{}, nil
+		}
+		if attempt.Digest != queueTextDigest(text) || attempt.Context != actionContext {
+			return result{}, errors.New("message identity was reused for another action")
+		}
+		if attempt.Options == nil {
+			if effectiveTurnOptionsDigest(attempt.OptionsDigest) != zeroTurnOptionsDigest() {
+				return result{}, errors.New("original message options are unavailable")
+			}
+			return result{found: true}, nil
+		}
+		return result{options: cloneTurnOptions(*attempt.Options), found: true}, nil
+	})
+	return value.options, value.found, err
 }
 
 func (c *Client) markSendSubmitting(threadID, clientID string) error {
@@ -4189,6 +4249,16 @@ func (c *Client) queueDeletionWasStarted(
 }
 
 func (c *Client) StartQueue(ctx context.Context, threadID, queuedSubmissionID string) error {
+	return c.StartQueueWithPolicy(ctx, threadID, queuedSubmissionID, ThreadPolicy{})
+}
+
+// StartQueueWithPolicy rebinds an application-owned member policy immediately
+// before starting a queued turn. App Server does not retain MCP configuration
+// across resumes, so queued member work needs the same policy as direct sends.
+func (c *Client) StartQueueWithPolicy(ctx context.Context, threadID, queuedSubmissionID string, policy ThreadPolicy) error {
+	if err := validateThreadPolicy(policy); err != nil {
+		return err
+	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -4203,7 +4273,7 @@ func (c *Client) StartQueue(ctx context.Context, threadID, queuedSubmissionID st
 		return errors.New("only the first queued message can be started")
 	}
 	target := &entries[0]
-	if err := c.resumeThread(ctx, threadID); err != nil {
+	if err := c.resumeThreadWithPolicy(ctx, threadID, policy, policy != (ThreadPolicy{})); err != nil {
 		return err
 	}
 	if _, found, err := c.startedByClientID(
@@ -4401,7 +4471,7 @@ func (c *Client) SendWithOptions(
 	input := []map[string]any{{"type": "text", "text": text}}
 	if !attempted {
 		if err := c.recordSendAttemptWithOptions(
-			threadID, clientUserMessageID, text, actionContext, steered, normalizedOptions.Digest,
+			threadID, clientUserMessageID, text, actionContext, steered, options,
 		); err != nil {
 			return SendReceipt{}, fmt.Errorf("record message attempt before submission: %w", err)
 		}
@@ -4505,15 +4575,11 @@ func (c *Client) PrepareSend(
 func (c *Client) PrepareSendWithOptions(
 	threadID, text, clientUserMessageID, context string, steered bool, options TurnOptions,
 ) error {
-	normalizedOptions, err := normalizeTurnOptions(options)
-	if err != nil {
-		return err
-	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
 	return c.recordSendAttemptWithOptions(
-		threadID, clientUserMessageID, text, context, steered, normalizedOptions.Digest,
+		threadID, clientUserMessageID, text, context, steered, options,
 	)
 }
 
@@ -4549,7 +4615,7 @@ func (c *Client) SendAttemptedWithOptions(
 		return found, err
 	}
 	if err := c.recordSendAttemptWithOptions(
-		threadID, clientUserMessageID, text, context, receipt.Steered, normalizedOptions.Digest,
+		threadID, clientUserMessageID, text, context, receipt.Steered, options,
 	); err != nil {
 		return false, err
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -285,12 +286,8 @@ func TestSendWithOptionsBindsRetryIdentity(t *testing.T) {
 	defer client.Close()
 	first := testTurnOptions()
 	first.AdditionalContext["application:second"] = AdditionalContextEntry{Kind: "application", Value: "second"}
-	normalized, err := normalizeTurnOptions(first)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := client.recordSendAttemptWithOptions(
-		"thread-1", "message-1", "message", "action", false, normalized.Digest,
+		"thread-1", "message-1", "message", "action", false, first,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -321,6 +318,43 @@ func TestSendWithOptionsBindsRetryIdentity(t *testing.T) {
 		context.Background(), "thread-1", "message", "message-1", "action", changed,
 	); err == nil || !strings.Contains(err.Error(), "another action") {
 		t.Fatalf("changed options retry error = %v", err)
+	}
+}
+
+func TestOriginalSendOptionsSurviveSettingChangesAndReconnect(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "absent-socket")
+	client := newTestClient(socket)
+	options := testTurnOptions()
+	options.ThreadPolicy = ThreadPolicy{DeveloperInstructions: "member policy", Sandbox: "read-only"}
+	want := cloneTurnOptions(options)
+	if err := client.recordSendAttemptWithOptions(
+		"thread-1", "message-1", "message", "", false, options,
+	); err != nil {
+		t.Fatal(err)
+	}
+	options.Model = "changed-model"
+	options.AdditionalContext["application:plan"] = AdditionalContextEntry{Kind: "application", Value: "changed"}
+	if err := client.markSendSubmitting("thread-1", "message-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.markSendAccepted("thread-1", "message-1", SendReceipt{TurnID: "turn-1", ClientUserMessageID: "message-1"}); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+	client = newTestClient(socket)
+	defer client.Close()
+	got, found, err := client.OriginalSendOptions("thread-1", "message", "message-1", "")
+	if err != nil || !found || !reflect.DeepEqual(got, want) {
+		t.Fatalf("original options = %#v, found %t, error %v", got, found, err)
+	}
+	if _, err := client.SendAttemptedWithOptions(context.Background(), "thread-1", "message", "message-1", "", got); err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := client.SendWithOptions(context.Background(), "thread-1", "message", "message-1", "", got); err != nil || receipt.TurnID != "turn-1" {
+		t.Fatalf("original-options retry = %#v, %v", receipt, err)
+	}
+	if _, _, err := client.OriginalSendOptions("thread-1", "different message", "message-1", ""); err == nil {
+		t.Fatal("original options were returned for a different message")
 	}
 }
 
@@ -484,19 +518,15 @@ func TestSendWithOptionsRetainsUnknownOutcome(t *testing.T) {
 	client := newTestClient(socket)
 	defer client.Close()
 	options := testTurnOptions()
-	normalized, err := normalizeTurnOptions(options)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := client.recordSendAttemptWithOptions(
-		"thread-1", "message-1", "message", "action", false, normalized.Digest,
+		"thread-1", "message-1", "message", "action", false, options,
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.markSendSubmitting("thread-1", "message-1"); err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.SendWithOptions(
+	_, err := client.SendWithOptions(
 		context.Background(), "thread-1", "message", "message-1", "action", options,
 	)
 	var unknown *UnknownSendOutcomeError

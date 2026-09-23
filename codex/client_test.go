@@ -1445,7 +1445,8 @@ func TestQueueUsesFIFOAppServerContracts(t *testing.T) {
 					}}, "nextCursor": nil},
 				})
 			case 7:
-				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" {
+				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" ||
+					!strings.Contains(stringValue(params["developerInstructions"]), "member queue policy") {
 					return fmt.Errorf("invalid queue resume: %#v", request)
 				}
 				err = writeObject(connection, map[string]any{
@@ -1490,7 +1491,7 @@ func TestQueueUsesFIFOAppServerContracts(t *testing.T) {
 	if err := client.DeleteQueueEntry(ctx, "thread-1", "queued-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.StartQueue(ctx, "thread-1", "queued-2"); err != nil {
+	if err := client.StartQueueWithPolicy(ctx, "thread-1", "queued-2", ThreadPolicy{DeveloperInstructions: "member queue policy"}); err != nil {
 		t.Fatal(err)
 	}
 }
