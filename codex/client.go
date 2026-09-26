@@ -27,7 +27,7 @@ import (
 
 const (
 	readLimit          = 64 * 1024 * 1024
-	queueLedgerMaxSize = 1024 * 1024
+	queueLedgerMaxSize = 16 * 1024 * 1024
 	recentTurnLimit    = 20
 
 	turnOptionMaxScalarBytes                 = 4 * 1024
@@ -36,6 +36,8 @@ const (
 	turnOptionMaxAdditionalContextValueBytes = 64 * 1024
 	turnOptionMaxAdditionalContextBytes      = 256 * 1024
 )
+
+var errQueueLedgerTooLarge = fmt.Errorf("queue attempt ledger exceeds %d bytes", queueLedgerMaxSize)
 
 var threadMCPNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
@@ -2097,7 +2099,7 @@ func (c *Client) loadQueueLedgerLocked() error {
 		)
 	}
 	if info.Size() > queueLedgerMaxSize {
-		return c.failQueueLedgerLocked(errors.New("queue attempt ledger exceeds 1 MiB"))
+		return c.failQueueLedgerLocked(errQueueLedgerTooLarge)
 	}
 	file, err := os.Open(c.queueLedgerPath)
 	if err != nil {
@@ -2259,7 +2261,7 @@ func (c *Client) writeQueueLedgerLocked() error {
 	}
 	encoded = append(encoded, '\n')
 	if len(encoded) > queueLedgerMaxSize {
-		return errors.New("queue attempt ledger would exceed 1 MiB")
+		return errQueueLedgerTooLarge
 	}
 	temporary, err := os.CreateTemp(directory, ".submission-attempts-*")
 	if err != nil {
@@ -2875,6 +2877,79 @@ func (c *Client) ClearConversationAttempts(threadID, directory string) error {
 			}
 			if operationPending {
 				c.operations[directory] = operationValue
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+// CompactAcceptedSendOptions discards original options for accepted sends in
+// an application-owned context. Their digests and receipts still bind retries
+// to the exact message and options. Callers must supply those options on retry;
+// OriginalSendOptions cannot recover nonzero options after compaction.
+func (c *Client) CompactAcceptedSendOptions(contextPrefix string) error {
+	if contextPrefix == "" {
+		return errors.New("send option compaction requires a context prefix")
+	}
+	return queueLedgerAction(c, func() error {
+		type savedOption struct {
+			threadID, clientID string
+			options            *TurnOptions
+		}
+		var changed []savedOption
+		for threadID, attempts := range c.sendAttempts {
+			for clientID, attempt := range attempts {
+				if attempt.State != "accepted" || attempt.Options == nil ||
+					!strings.HasPrefix(attempt.Context, contextPrefix) {
+					continue
+				}
+				changed = append(changed, savedOption{threadID, clientID, attempt.Options})
+				attempt.Options = nil
+				attempts[clientID] = attempt
+			}
+		}
+		if len(changed) == 0 {
+			return nil
+		}
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			for _, saved := range changed {
+				attempt := c.sendAttempts[saved.threadID][saved.clientID]
+				attempt.Options = saved.options
+				c.sendAttempts[saved.threadID][saved.clientID] = attempt
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+// ClearRetiredThreadAttempts removes only one proven-retired thread's durable
+// submission state. It deliberately preserves directory retirement markers,
+// including the root session's marker during member cleanup.
+func (c *Client) ClearRetiredThreadAttempts(threadID string) error {
+	if strings.TrimSpace(threadID) == "" {
+		return errors.New("thread attempt cleanup requires a thread id")
+	}
+	return queueLedgerAction(c, func() error {
+		queued, hasQueued := c.queueAttempts[threadID]
+		sent, hasSent := c.sendAttempts[threadID]
+		deletions, hasDeletions := c.queueDeletions[threadID]
+		if !hasQueued && !hasSent && !hasDeletions {
+			return nil
+		}
+		delete(c.queueAttempts, threadID)
+		delete(c.sendAttempts, threadID)
+		delete(c.queueDeletions, threadID)
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			if hasQueued {
+				c.queueAttempts[threadID] = queued
+			}
+			if hasSent {
+				c.sendAttempts[threadID] = sent
+			}
+			if hasDeletions {
+				c.queueDeletions[threadID] = deletions
 			}
 			return err
 		}

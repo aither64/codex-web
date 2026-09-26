@@ -21,6 +21,14 @@ writable persistent state independently of a connect-only or ephemeral socket
 directory. Leave it empty to retain the compatibility path beside the socket;
 all cooperating processes must select the same path.
 
+The schema-3 ledger has a 16 MiB limit, including its trailing newline. Reads
+and writes reject larger files before changing durable state. Transactions use
+an interprocess lock, write a mode-0600 temporary file, sync it, and atomically
+replace the ledger. An older client with a 1 MiB reader limit cannot open a
+larger ledger even though the schema is unchanged. Stop older writers before
+allowing the ledger to grow; recovery after growth needs this version or a
+newer compatible reader. Do not truncate the ledger to roll back.
+
 `ThreadSettings.Policy` supplies a persistent thread's role instructions and
 `read-only` or `workspace-write` sandbox for explicit start, resume and fork
 operations. The client appends role instructions to its common
@@ -74,6 +82,26 @@ use the original options. An omitted stored digest is the canonical zero
 options identity; zero-option activity never writes `optionsDigest`, retaining
 schema-3 reader and rollback compatibility. Existing methods remain exact
 zero-option wrappers.
+
+`Client.CompactAcceptedSendOptions(contextPrefix)` removes stored original
+`TurnOptions` only from accepted send attempts whose application-owned action
+context starts with that nonempty prefix. It keeps each message digest, action
+context, options digest, accepted turn ID and steering flag, so a retry with the
+same text, context and options returns the same receipt; changed values still
+fail. Prepared and submitting attempts and other contexts retain their options.
+Compaction is idempotent. Choose a prefix reserved for application sends, such
+as `team:`, and call it before reserving more of those sends. After compaction,
+`OriginalSendOptions` cannot recover nonzero options for those accepted sends;
+the application must retain and supply the exact options for retries. Browser
+send contexts should not be selected because browser recovery may need those
+stored options.
+
+`Client.ClearRetiredThreadAttempts(threadID)` removes queue, send and deletion
+attempts for one thread after the application has proved that thread is retired.
+It does not verify retirement itself and never removes directory operation
+markers, including a root thread's retirement marker. Repeating the cleanup is
+safe. Active threads must keep their attempts so uncertain submissions can be
+recovered.
 
 `EnsureInitialMessageWithOptions` does not itself durably bind options before
 an initial `turn/start`. A recovering application must prepublish and retain
