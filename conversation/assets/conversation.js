@@ -378,6 +378,7 @@ export function createTranscriptHistory() {
     const incoming = pairs(page.entries);
     const changed = changes(incoming);
     if (!initialized || page.legacy) {
+      if (initialized) repairVersion++;
       rows = incoming;
       olderCursor = page.olderCursor || null;
       hasOlder = Boolean(page.hasOlder);
@@ -424,6 +425,7 @@ export function createTranscriptHistory() {
       const current = new Map(rows.map((row, index) => [row.key, index]));
       const firstOverlap = incoming.find((row) => current.has(row.key));
       if (!page.hasOlder) {
+        repairVersion++;
         rows = incoming;
         olderCursor = null; hasOlder = false; gapStart = -1; gapCursor = null;
         repairTarget = ""; repairCursor = null; cursorReset = false;
