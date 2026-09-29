@@ -175,6 +175,13 @@ type Transcript struct {
 	Entries           []TranscriptEntry `json:"entries"`
 }
 
+type TranscriptPage struct {
+	Transcript
+	OlderCursor     *string `json:"olderCursor"`
+	HasOlder        bool    `json:"hasOlder"`
+	MetadataPending bool    `json:"metadataPending"`
+}
+
 type TranscriptEntry struct {
 	DisplayText             *string             `json:"displayText,omitempty"`
 	Attachments             []Attachment        `json:"attachments,omitempty"`
@@ -703,6 +710,15 @@ type Client struct {
 	turnHistoryMu     sync.Mutex
 	turnHistory       map[string]*threadHistoryCache
 	idleTurnHistory   []string
+	pageMu            sync.Mutex
+	pageCursors       map[string]pageContinuation
+	pageMetadata      map[string]*pageMetadataCache
+	pageContext       context.Context
+	pageCancel        context.CancelFunc
+	pageClock         func() time.Time
+	pageRebuildCount  uint64
+	pageRebuildBytes  uint64
+	pageRebuildTime   time.Duration
 
 	ensureMu     sync.Mutex
 	connectionMu sync.Mutex
@@ -819,9 +835,12 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 	if options.ObserverOnly {
 		observer = newObserverState()
 	}
+	pageContext, pageCancel := context.WithCancel(context.Background())
 	return &Client{
-		observer: observer,
-		socket:   socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
+		observer:    observer,
+		pageContext: pageContext, pageCancel: pageCancel,
+		pageCursors: make(map[string]pageContinuation), pageMetadata: make(map[string]*pageMetadataCache),
+		socket: socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
 		requests: make(map[string]PendingRequest), notices: make(map[string][]Prompt),
 		subscribers: make(map[chan struct{}]string), watched: make(map[string]int),
 		watchedGeneration: make(map[string]uint64), watchLocks: make(map[string]*sync.Mutex),
@@ -898,6 +917,11 @@ func (c *Client) Ensure(ctx context.Context) error {
 }
 
 func (c *Client) Close() {
+	c.pageCancel()
+	c.pageMu.Lock()
+	clear(c.pageCursors)
+	clear(c.pageMetadata)
+	c.pageMu.Unlock()
 	c.connectionMu.Lock()
 	c.closed = true
 	if c.observer != nil {

@@ -31,6 +31,112 @@ type fakeClient struct {
 	startedQueueID string
 }
 
+type fakePageClient struct {
+	*fakeClient
+	calls  int
+	cursor string
+	page   codex.TranscriptPage
+	err    error
+}
+
+func (client *fakePageClient) ReadThreadPage(_ context.Context, thread, cursor string) (codex.TranscriptPage, error) {
+	client.calls++
+	client.cursor = cursor
+	if client.err != nil {
+		return codex.TranscriptPage{}, client.err
+	}
+	client.page.ThreadID = thread
+	return client.page, nil
+}
+
+func TestThreadPageAuthorizationAndCursorValidation(t *testing.T) {
+	for _, test := range []struct {
+		name, query    string
+		read, optional bool
+		status, calls  int
+	}{
+		{"newest", "", true, true, http.StatusOK, 1},
+		{"older", "?cursor=" + strings.Repeat("A", 32), true, true, http.StatusOK, 1},
+		{"denied", "", false, true, http.StatusForbidden, 0},
+		{"old client", "", true, false, http.StatusNotImplemented, 0},
+		{"malformed", "?cursor=bad", true, true, http.StatusBadRequest, 0},
+		{"oversized", "?cursor=" + strings.Repeat("A", 100000), true, true, http.StatusBadRequest, 0},
+		{"duplicate", "?cursor=" + strings.Repeat("A", 32) + "&cursor=" + strings.Repeat("B", 32), true, true, http.StatusBadRequest, 0},
+		{"extra", "?other=x", true, true, http.StatusBadRequest, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reader := &fakePageClient{fakeClient: &fakeClient{}, page: codex.TranscriptPage{Transcript: codex.Transcript{Entries: []codex.TranscriptEntry{{Kind: "agentMessage", Text: "hello"}}}}}
+			var client Client = reader
+			if !test.optional {
+				client = reader.fakeClient
+			}
+			handler, err := NewHandler(Options{AllowedOrigins: []string{"https://workspace.example.test"}, Logger: log.New(&bytes.Buffer{}, "", 0), Resolver: ResolverFunc(func(_ context.Context, request ResolveRequest) (Target, error) {
+				if request.Operation != "thread/page" || request.Mutation {
+					t.Fatalf("resolver request = %#v", request)
+				}
+				return Target{Client: client, ThreadID: "trusted", Directory: "/workspace", Capabilities: Capabilities{Read: test.read}, TransformTranscript: func(transcript *codex.Transcript) { transcript.Entries[0].Summary = "decorated" }}, nil
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/codex/conversations/opaque/thread/page"+test.query, nil)
+			request.Header.Set("Origin", "https://workspace.example.test")
+			handler.ServeHTTP(response, request)
+			if response.Code != test.status || reader.calls != test.calls || reader.verifiedThread != "trusted" || reader.verifiedCwd != "/workspace" {
+				t.Fatalf("status=%d, calls=%d, verify=%q/%q, body=%s", response.Code, reader.calls, reader.verifiedThread, reader.verifiedCwd, response.Body.String())
+			}
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatal("page response is cacheable")
+			}
+			if test.status == http.StatusOK {
+				var page codex.TranscriptPage
+				if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+					t.Fatal(err)
+				}
+				if page.ThreadID != "trusted" || page.Entries[0].Summary != "decorated" {
+					t.Fatalf("page = %#v", page)
+				}
+			}
+		})
+	}
+}
+
+func TestThreadPageCursorErrorsAreDistinct(t *testing.T) {
+	for _, code := range []string{"transcript_cursor_expired", "transcript_reset_required"} {
+		t.Run(code, func(t *testing.T) {
+			reader := &fakePageClient{fakeClient: &fakeClient{}, err: &codex.TranscriptCursorError{Code: code}}
+			handler, err := NewHandler(Options{AllowedOrigins: []string{"https://workspace.example.test"}, Logger: log.New(&bytes.Buffer{}, "", 0), Resolver: ResolverFunc(func(context.Context, ResolveRequest) (Target, error) {
+				return Target{Client: reader, ThreadID: "trusted", Directory: "/workspace", Capabilities: Capabilities{Read: true}}, nil
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/codex/conversations/opaque/thread/page", nil))
+			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), code) {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestThreadPageFailureDoesNotLogCursorOrRolloutPath(t *testing.T) {
+	reader := &fakePageClient{fakeClient: &fakeClient{}, err: errors.New("secret-cursor /tmp/private-rollout.jsonl")}
+	var logOutput bytes.Buffer
+	handler, err := NewHandler(Options{AllowedOrigins: []string{"https://workspace.example.test"}, Logger: log.New(&logOutput, "", 0), Resolver: ResolverFunc(func(context.Context, ResolveRequest) (Target, error) {
+		return Target{Client: reader, ThreadID: "trusted", Directory: "/workspace", Capabilities: Capabilities{Read: true}}, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/codex/conversations/opaque/thread/page?cursor="+strings.Repeat("A", 32), nil))
+	if response.Code != http.StatusServiceUnavailable || strings.Contains(logOutput.String(), "secret-cursor") || strings.Contains(logOutput.String(), "private-rollout") || strings.Contains(logOutput.String(), strings.Repeat("A", 32)) {
+		t.Fatalf("response=%d log=%q", response.Code, logOutput.String())
+	}
+}
+
 type sharedOpaqueIDCase struct {
 	Name        string `json:"name"`
 	Value       string `json:"value"`

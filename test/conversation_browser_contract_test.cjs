@@ -91,6 +91,8 @@ class MemoryStorage {
   };
   const client = createConversationClient({id: "opaque", basePath: "/shared", fetch: fetchRequest});
   await client.thread();
+  await client.threadPage();
+  await client.threadPage({cursor: "A/B?=+"});
   await client.pending();
   await client.queue();
   await client.models();
@@ -107,6 +109,8 @@ class MemoryStorage {
   await client.snooze("request-2");
   assert.deepEqual(requests.map(({path}) => path), [
     "/shared/conversations/opaque/thread",
+    "/shared/conversations/opaque/thread/page",
+    "/shared/conversations/opaque/thread/page?cursor=A%2FB%3F%3D%2B",
     "/shared/conversations/opaque/pending",
     "/shared/conversations/opaque/queue",
     "/shared/conversations/opaque/models",
@@ -133,7 +137,7 @@ class MemoryStorage {
       error.status === 503 && error.code === "prompt_transport" && error.notSent === notSent);
   }
 
-  assert.equal(JSON.parse(requests[5].options.body).retry, true);
+  assert.equal(JSON.parse(requests[7].options.body).retry, true);
   const compatibilityClient = createConversationClient({
     id: "opaque", basePath: "/shared", conversationPath: "/api/sessions/opaque",
     fetch: fetchRequest,

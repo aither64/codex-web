@@ -61,6 +61,12 @@ def require_declared_property(file_name, definition, property_name, label):
         )
 
 
+def require_root_property(file_name, property_name, label):
+    schema = json.loads((SCHEMA_DIR / file_name).read_text())
+    if property_name not in schema.get("properties", {}):
+        raise SystemExit(f"{label} requires declared {property_name} in {file_name}")
+
+
 def request(method, params):
     return {"id": 1, "method": method, "params": params}
 
@@ -185,6 +191,7 @@ client_requests = [
     ),
     request("thread/name/set", {"threadId": "thread-1", "name": "example"}),
     request("thread/read", {"threadId": "thread-1"}),
+    request("thread/read", {"threadId": "thread-1", "includeTurns": False}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
@@ -205,6 +212,14 @@ client_requests = [
     ),
     request(
         "thread/turns/list",
+        {"threadId": "thread-1", "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"},
+    ),
+    request(
+        "thread/turns/list",
+        {"threadId": "thread-1", "limit": 100, "sortDirection": "desc", "itemsView": "notLoaded", "cursor": "older-page"},
+    ),
+    request(
+        "thread/turns/list",
         {"threadId": "thread-1", "limit": 1, "sortDirection": "asc", "itemsView": "full"},
     ),
     request(
@@ -214,6 +229,10 @@ client_requests = [
     request(
         "thread/items/list",
         {"threadId": "thread-1", "limit": 100, "sortDirection": "desc"},
+    ),
+    request(
+        "thread/items/list",
+        {"threadId": "thread-1", "turnId": "turn-1", "limit": 100, "sortDirection": "desc", "cursor": "older-items"},
     ),
     request("thread/unsubscribe", {"threadId": "thread-1"}),
     request("thread/archive", {"threadId": "thread-1"}),
@@ -264,7 +283,7 @@ client_source += "\n" + "\n".join(
 )
 client_requests.append(request("thread/read", {"threadId": "thread-1", "excludeTurns": True}))
 call_pattern = re.compile(
-    r'\b(?:Request|requestConnected|requestConnectedGeneration|requestOn)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
+    r'\b(?:Request|requestConnected|requestConnectedGeneration|requestOn|request)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
     re.DOTALL,
 )
 implemented_calls = Counter(call_pattern.findall(client_source))
@@ -609,6 +628,26 @@ validate(
     {"data": [{"turnId": "turn-1", "item": command_item}, {"turnId": "turn-1", "item": file_item}]},
     "thread/items/list result",
 )
+page_turn = {**transcript_turn, "items": [], "itemsView": "notLoaded", "status": "failed", "error": {"message": "fixture failure"}}
+validate("v2/ThreadTurnsListResponse.json", {"data": [page_turn], "nextCursor": "older-turns"}, "paged turn metadata")
+validate("v2/ThreadItemsListResponse.json", {
+    "data": [{"turnId": "turn-1", "item": command_item}], "nextCursor": "older-items",
+}, "turn-filtered item page")
+for name, fields in {
+    "ThreadReadParams.json": ["threadId", "includeTurns"],
+    "ThreadTurnsListParams.json": ["threadId", "limit", "sortDirection", "itemsView", "cursor"],
+    "ThreadItemsListParams.json": ["threadId", "turnId", "limit", "sortDirection", "cursor"],
+    "ThreadTurnsListResponse.json": ["data", "nextCursor"],
+    "ThreadItemsListResponse.json": ["data", "nextCursor"],
+}.items():
+    for field in fields:
+        require_root_property("v2/" + name, field, "paged transcript protocol")
+for name, definition, fields in (
+    ("ThreadTurnsListResponse.json", "Turn", ["id", "status", "error", "startedAt", "completedAt"]),
+    ("ThreadItemsListResponse.json", "ThreadItemEntry", ["turnId", "item"]),
+):
+    for field in fields:
+        require_declared_property("v2/" + name, definition, field, "paged transcript response")
 validate("v2/ThreadUnsubscribeResponse.json", {"status": "unsubscribed"}, "thread/unsubscribe result")
 validate("v2/ThreadSetNameResponse.json", {}, "thread/name/set result")
 validate(

@@ -233,6 +233,7 @@ export function createConversationClient(options) {
   const read = (operation, options = {}) => request(operation, {signal: options.signal});
   const client = {
     thread: (options) => read("thread", options),
+    threadPage: ({cursor, signal} = {}) => read(cursor ? `thread/page?cursor=${encodeURIComponent(cursor)}` : "thread/page", {signal}),
     activity: (options) => read("activity", options),
     pending: async (options) => (await read("pending", options)) || [],
     models: async (options) => (await read("models", options)) || [],

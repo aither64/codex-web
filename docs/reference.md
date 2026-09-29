@@ -186,6 +186,59 @@ when another is added. Ordinary `ReadThread` calls load only the recent 20
 turns. Activity history reads accept up to 100,000 turns; this limit does not
 remove stored summaries.
 
+`Client.ReadThreadPage(ctx, threadID, cursor)` reads a newest page when `cursor`
+is empty, or continues toward older history with the returned `olderCursor`.
+Each call consumes at most 100 source items and turn failure rows. Hidden
+reasoning items consume a slot, so a page can contain fewer than 100 visible
+entries. Entries are chronological within each page. `hasOlder` reports whether
+another page is available, including after an empty page caused by itemless
+turns. Keep following `olderCursor` to reach older history. Page entries use the
+same item normalization, client message identity and digest as `ReadThread`.
+The current thread status, settings and `latestTurnId` accompany older pages.
+
+Paging reads turn metadata and turn-filtered item lists. It does not request
+full turns or synchronously decode the rollout tail. A page initially uses live
+item times or approximate turn times while a bounded background scan fills the
+timestamp and collaboration-mode cache. `metadataPending` asks callers to
+refresh the page after enrichment. An unknown collaboration mode is omitted;
+callers must wait for a known mode before offering mode-dependent plan actions.
+The persisted timing cache is disposable, and older items outside the 64 MiB
+rollout suffix can retain approximate times. Appending to a rollout parses new
+complete records. Replacement, truncation, a same-size edit detected through
+mtime, or a change in the previous 4 KiB tail immediately clears the cached
+mode and exact times. An
+incomplete final record is retried after later growth.
+
+The rollout metadata cache expires 60 seconds after its last full suffix scan
+began. Cache hits and incremental appends do not extend that age. On expiry, a
+page withholds rollout-derived mode and exact times, sets `metadataPending`,
+and queues one background rebuild from empty metadata, even when the file has
+not changed. Validated settings notifications remain an independent mode
+source. A failed or delayed rebuild leaves rollout mode unknown and times
+approximate until a later retry succeeds. An earlier in-place edit followed by
+an append can escape the small tail probe until expiry; this display cache is
+not used as authority for thread mutations. The cache records full rebuild
+count, bytes read and elapsed scan time for performance diagnostics. Each
+rebuild may read up to the existing 64 MiB rollout suffix.
+
+`GET /codex/conversations/{id}/thread/page` exposes this method when the
+resolved client implements the optional `TranscriptPageReader`. An omitted
+`cursor` requests the newest page. The handler verifies the trusted thread and
+read capability on every request, then applies the ordinary transcript
+transform and attachment observation. It rejects other query parameters,
+duplicate cursors and malformed tokens with HTTP 400 and
+`transcript_cursor_invalid`. Expired or evicted cursors return HTTP 409 and
+`transcript_cursor_expired`; a changed thread, connection or rollout returns
+HTTP 409 and `transcript_reset_required`. A continuation also resets when its
+newest turn was active and then changes status, so a fresh page can include its
+final error. Cursors are opaque, local to the
+client instance, idle-expiring after 30 minutes and held in a bounded cache
+of 256 continuations and 8 MiB. A cursor can be retried without consuming it.
+After read authorization, clients without paging return HTTP 501 and
+`transcript_paging_unavailable`. The existing `/thread` response remains the
+recent 20 full turns. `createConversationClient().threadPage({cursor, signal})`
+calls the page route; `mountConversation()` still uses `/thread`.
+
 To record time without a browser, create a separate client with
 `ClientOptions{ObserverOnly: true, ActivityRecorder: recorder}`. Construct the
 recorder with `NewActivityRecorder(path)` using a private directory scoped

@@ -32,6 +32,7 @@ var browserAttemptPattern = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
 )
 var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var pageCursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32}$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
 //go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js
@@ -79,6 +80,10 @@ type Client interface {
 // implementing Client. The resolver selects its trusted authority separately.
 type ActivityProvider interface {
 	ReadActivity(context.Context, string) (codex.ActivitySnapshot, error)
+}
+
+type TranscriptPageReader interface {
+	ReadThreadPage(context.Context, string, string) (codex.TranscriptPage, error)
 }
 
 // PromptResponder adds request-bound responses without changing the legacy
@@ -342,6 +347,68 @@ func (handler *Handler) serveOperation(
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	ctx := request.Context()
 	switch operation {
+	case "thread/page":
+		if request.Method != http.MethodGet || !target.Capabilities.Read {
+			handler.rejectOperation(response, request)
+			return
+		}
+		if len(request.URL.RawQuery) > 256 {
+			writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid page cursor", "code": "transcript_cursor_invalid"})
+			return
+		}
+		query, err := url.ParseQuery(request.URL.RawQuery)
+		if err != nil || len(query) > 1 || len(query["cursor"]) > 1 ||
+			(len(query) == 1 && len(query["cursor"]) != 1) ||
+			(len(query["cursor"]) == 1 && !pageCursorPattern.MatchString(query["cursor"][0])) {
+			writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid page cursor", "code": "transcript_cursor_invalid"})
+			return
+		}
+		reader, ok := target.Client.(TranscriptPageReader)
+		if !ok {
+			writeJSON(response, http.StatusNotImplemented, map[string]string{"error": "conversation paging is unavailable", "code": "transcript_paging_unavailable"})
+			return
+		}
+		cursor := ""
+		if len(query["cursor"]) == 1 {
+			cursor = query["cursor"][0]
+		}
+		page, err := reader.ReadThreadPage(ctx, target.ThreadID, cursor)
+		if err != nil {
+			var cursorErr *codex.TranscriptCursorError
+			if errors.As(err, &cursorErr) {
+				status := http.StatusConflict
+				message := "conversation history changed; reload recent messages"
+				switch cursorErr.Code {
+				case "transcript_cursor_invalid":
+					status = http.StatusBadRequest
+					message = "invalid page cursor"
+				case "transcript_cursor_expired":
+					message = "conversation history page expired; reload recent messages"
+				case "transcript_reset_required":
+				default:
+					handler.serverError(response, request, errors.New("page reader returned invalid cursor error"))
+					return
+				}
+				writeJSON(response, status, map[string]string{"error": message, "code": cursorErr.Code})
+				return
+			}
+			handler.serverError(response, request, errors.New("read transcript page failed"))
+			return
+		}
+		if page.ThreadID != target.ThreadID || len(page.Entries) > 100 {
+			handler.serverError(response, request, errors.New("page reader returned invalid transcript"))
+			return
+		}
+		if target.TransformTranscript != nil {
+			target.TransformTranscript(&page.Transcript)
+		}
+		if target.Attachments != nil {
+			if err := target.Attachments.ObserveTranscript(ctx, &page.Transcript); err != nil {
+				uploadError(response, err)
+				return
+			}
+		}
+		writeJSON(response, http.StatusOK, page)
 	case "activity":
 		if request.Method != http.MethodGet || !target.Capabilities.Read {
 			handler.rejectOperation(response, request)
