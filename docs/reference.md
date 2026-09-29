@@ -237,7 +237,29 @@ of 256 continuations and 8 MiB. A cursor can be retried without consuming it.
 After read authorization, clients without paging return HTTP 501 and
 `transcript_paging_unavailable`. The existing `/thread` response remains the
 recent 20 full turns. `createConversationClient().threadPage({cursor, signal})`
-calls the page route; `mountConversation()` still uses `/thread`.
+calls the page route. `mountConversation()` loads the newest page first and offers
+**Load older** while a continuation exists. It keeps loaded entries when newer
+pages arrive, repairs gaps after missed events, and keeps the visible scroll
+position when older entries are added. A missing page route or an explicit
+`transcript_paging_unavailable` response falls back to an authorized `/thread`
+read; the interface then says that older history is unavailable. Other HTTP,
+timeout, cursor and malformed-response errors do not trigger that fallback.
+
+Custom interfaces can use `readTranscriptPage(client, {signal, cursor, legacy,
+expectedThreadId})` for the same page validation and fallback policy, and
+`createTranscriptHistory()` to merge newest, older and repair pages. The history
+model exposes retained `rows` and `entries`, `olderCursor`, `hasOlder`, `gap`
+and `repairCursor`; call `applyNewest`, `applyOlder` or `applyRepair` for each
+validated page. `transcriptEntryKey(entry, index, entries)` supplies the stable
+key used for item and turn-error rows. The model retains loaded entries in
+server order and never treats absence from a newest page as proof of deletion.
+After a 409 cursor error, discard traversal tokens while keeping loaded rows
+visible. Build an authoritative range from the fresh newest page and its
+continuations. Once that range reaches the oldest retained entry or the end of
+history, replace the covered rows together; this also removes entries deleted
+from the new lineage. The expected thread identity also applies to authorized
+legacy `/thread` reads. Capture `repairVersion` with a historical cursor and
+discard its response or error if that version changes before it settles.
 
 To record time without a browser, create a separate client with
 `ClientOptions{ObserverOnly: true, ActivityRecorder: recorder}`. Construct the
@@ -324,6 +346,11 @@ same target can pass the same application-owned `durableNamespace`. A send
 receipt is cleared only after the matching message is visible in the transcript
 and acknowledged by the server. Pass an explicit `capabilities` object when
 mounting a restricted interface.
+Pending requests and queue reconciliation load separately from the transcript.
+Their failures leave the last known controls visible with a retry action. A
+pending send is acknowledged only after a matching message is observed in the
+retained transcript, including an older page; a partial newest page cannot
+prove that the message is absent.
 
 `formatTranscriptTimestamp(entry)` supplies the mounted interface's local clock
 label, full timestamp tooltip and local calendar date for custom renderers.

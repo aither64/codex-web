@@ -277,6 +277,264 @@ export function createConversationClient(options) {
   return client;
 }
 
+export function transcriptEntryKey(entry, index = 0, entries = []) {
+  const turnID = entry?.turnId || "";
+  const itemID = entry?.itemId || "";
+  if (turnID && itemID) return JSON.stringify([turnID, itemID]);
+  if (turnID && entry?.kind === "error") return JSON.stringify([turnID, "turn-error"]);
+  let occurrence = 0;
+  for (let priorIndex = 0; priorIndex < index; priorIndex += 1) {
+    const prior = entries[priorIndex];
+    if (!prior?.itemId && (prior?.turnId || "") === turnID &&
+        (prior?.kind || "") === (entry?.kind || "")) occurrence += 1;
+  }
+  return JSON.stringify([turnID, itemID, entry?.kind || "", occurrence]);
+}
+
+export async function readTranscriptPage(client, {signal, cursor, legacy = false, expectedThreadId} = {}) {
+  const readLegacy = async () => {
+    const thread = await client.thread({signal});
+    if (!thread?.threadId || typeof thread.status !== "string" || !thread.status ||
+        (expectedThreadId && thread.threadId !== expectedThreadId) ||
+        !Array.isArray(thread.entries)) throw new Error("Invalid conversation response");
+    return {...thread, legacy: true, hasOlder: false, olderCursor: null};
+  };
+  if (legacy || typeof client.threadPage !== "function") {
+    if (cursor) throw new Error("Older history is unavailable on this server");
+    return readLegacy();
+  }
+  let page;
+  try {
+    page = await client.threadPage({cursor, signal});
+  } catch (error) {
+    if (cursor || (error.status !== 404 &&
+        !(error.status === 501 && error.code === "transcript_paging_unavailable"))) throw error;
+    return readLegacy();
+  }
+  if (!page?.threadId || typeof page.status !== "string" || !page.status ||
+      (expectedThreadId && page.threadId !== expectedThreadId) ||
+      !Array.isArray(page.entries) || page.entries.length > 100 || typeof page.hasOlder !== "boolean" ||
+      (page.hasOlder && (typeof page.olderCursor !== "string" || !page.olderCursor || page.olderCursor === cursor))) {
+    throw new Error("Invalid conversation page");
+  }
+  return {...page, legacy: false};
+}
+
+export function createTranscriptHistory() {
+  let threadId = "", rows = [], initialized = false, legacy = false;
+  let olderCursor = null, hasOlder = false, gapCursor = null, gapStart = -1;
+  let repairCursor = null, repairTarget = "", lastActiveRepair = -Infinity, cursorReset = false;
+  let resetRecovery = null, repairVersion = 0;
+  const pairs = (entries) => {
+    const seen = new Set();
+    return entries.map((entry, index) => {
+      const key = transcriptEntryKey(entry, index, entries);
+      if (seen.has(key)) throw new Error("Conversation page repeated an entry");
+      seen.add(key);
+      return {key, entry};
+    });
+  };
+  const distinct = (...groups) => {
+    const seen = new Set();
+    return groups.flat().filter((row) => {
+      if (seen.has(row.key)) return false;
+      seen.add(row.key);
+      return true;
+    });
+  };
+  const changes = (incoming, before = rows) => {
+    const previous = new Map(before.map((row) => [row.key, row.entry]));
+    return new Set(incoming.filter((row) => !previous.has(row.key) ||
+      JSON.stringify(previous.get(row.key)) !== JSON.stringify(row.entry)).map((row) => row.key));
+  };
+  const updateRows = (incoming) => {
+    const updates = new Map(incoming.map((row) => [row.key, row]));
+    rows = rows.map((row) => updates.get(row.key) || row);
+  };
+  const clear = (nextThread = "") => {
+    threadId = nextThread; rows = []; initialized = false; legacy = false;
+    olderCursor = null; hasOlder = false; gapCursor = null; gapStart = -1;
+    repairCursor = null; repairTarget = ""; cursorReset = false; resetRecovery = null;
+    repairVersion++;
+    lastActiveRepair = -Infinity;
+  };
+  const displayResetRows = () => {
+    const updates = new Map(resetRecovery.freshRows.map((row) => [row.key, row]));
+    return distinct(resetRecovery.baseRows, resetRecovery.freshRows)
+      .map((row) => updates.get(row.key) || row);
+  };
+  const completeReset = (page) => {
+    rows = resetRecovery.freshRows;
+    resetRecovery = null;
+    repairVersion++;
+    olderCursor = page.hasOlder ? page.olderCursor : null;
+    hasOlder = Boolean(page.hasOlder);
+    gapStart = -1; gapCursor = null; repairTarget = ""; repairCursor = null;
+  };
+  const applyNewest = (page, now = Date.now()) => {
+    if (!page?.threadId || !Array.isArray(page.entries)) throw new Error("Invalid conversation page");
+    const reset = threadId !== page.threadId;
+    if (reset) clear(page.threadId);
+    const incoming = pairs(page.entries);
+    const changed = changes(incoming);
+    if (!initialized || page.legacy) {
+      rows = incoming;
+      olderCursor = page.olderCursor || null;
+      hasOlder = Boolean(page.hasOlder);
+      gapStart = -1; gapCursor = null; repairCursor = null; repairTarget = "";
+      cursorReset = false; resetRecovery = null;
+    } else if (cursorReset || resetRecovery) {
+      const before = rows;
+      if (cursorReset) {
+        resetRecovery = {boundaryKey: rows[0]?.key || "", baseRows: rows,
+          freshRows: [], cursor: null, newestKeys: new Set()};
+        cursorReset = false;
+        repairVersion++;
+      }
+      const recovery = resetRecovery;
+      if (!page.hasOlder) {
+        recovery.freshRows = incoming;
+        completeReset(page);
+      } else {
+        const current = new Map(recovery.freshRows.map((row, index) => [row.key, index]));
+        const overlap = incoming.find((row) => current.has(row.key));
+        if (recovery.freshRows.length && !overlap) {
+          recovery.freshRows = incoming;
+          recovery.cursor = page.olderCursor;
+          recovery.newestKeys = new Set();
+          repairVersion++;
+        } else if (overlap) {
+          recovery.freshRows = distinct(recovery.freshRows.slice(0, current.get(overlap.key)), incoming);
+        } else {
+          recovery.freshRows = incoming;
+          recovery.cursor = page.olderCursor;
+        }
+        incoming.forEach((row) => recovery.newestKeys.add(row.key));
+        if (!recovery.boundaryKey || recovery.freshRows.some((row) => row.key === recovery.boundaryKey)) {
+          completeReset(page);
+        } else {
+          rows = displayResetRows();
+          olderCursor = null; hasOlder = false;
+        }
+      }
+      updateRows(incoming);
+      legacy = false;
+      return {changed: changes(rows, before), reset};
+    } else {
+      const current = new Map(rows.map((row, index) => [row.key, index]));
+      const firstOverlap = incoming.find((row) => current.has(row.key));
+      if (!page.hasOlder) {
+        rows = incoming;
+        olderCursor = null; hasOlder = false; gapStart = -1; gapCursor = null;
+        repairTarget = ""; repairCursor = null; cursorReset = false;
+      } else if (firstOverlap) {
+        const index = current.get(firstOverlap.key);
+        rows = distinct(rows.slice(0, index), incoming);
+        if (gapStart >= 0 && index < gapStart) {
+          gapStart = -1; gapCursor = null;
+        } else if (gapStart >= 0) {
+          gapCursor = page.olderCursor || null;
+        }
+      } else if (incoming.length) {
+        if (gapStart < 0) gapStart = rows.length;
+        rows = distinct(rows, incoming);
+        gapCursor = page.olderCursor;
+      } else if (page.hasOlder && rows.length) {
+        if (gapStart < 0) gapStart = rows.length;
+        gapCursor = page.olderCursor || null;
+      }
+    }
+    updateRows(incoming);
+    legacy = Boolean(page.legacy);
+    if (!initialized) {
+      olderCursor = page.olderCursor || null;
+      hasOlder = Boolean(page.hasOlder);
+    }
+    initialized = true;
+    if (!legacy && gapStart < 0 && page.olderCursor && now - lastActiveRepair >= 30_000) {
+      const newest = new Set(incoming.map((row) => row.key));
+      const active = rows.find((row) => row.entry.turnStatus &&
+        !["completed", "failed", "interrupted", "error"].includes(row.entry.turnStatus) && !newest.has(row.key));
+      if (active) {
+        repairTarget = active.key;
+        repairCursor = page.olderCursor;
+        lastActiveRepair = now;
+      }
+    }
+    return {changed, reset};
+  };
+  const applyOlder = (page) => {
+    if (page.threadId !== threadId || !Array.isArray(page.entries)) throw new Error("Conversation history changed");
+    const incoming = pairs(page.entries);
+    const changed = changes(incoming);
+    rows = distinct(incoming, rows);
+    updateRows(incoming);
+    olderCursor = page.olderCursor || null;
+    hasOlder = Boolean(page.hasOlder);
+    return {changed};
+  };
+  const applyRepair = (page) => {
+    if (page.threadId !== threadId || !Array.isArray(page.entries)) throw new Error("Conversation history changed");
+    const incoming = pairs(page.entries);
+    if (resetRecovery) {
+      const before = rows, recovery = resetRecovery;
+      const current = new Map(recovery.freshRows.map((row) => [row.key, row]));
+      const authoritative = incoming.map((row) => recovery.newestKeys.has(row.key) ? current.get(row.key) || row : row);
+      recovery.freshRows = distinct(authoritative, recovery.freshRows);
+      if (!page.hasOlder || (recovery.boundaryKey &&
+          recovery.freshRows.some((row) => row.key === recovery.boundaryKey))) {
+        completeReset(page);
+      } else {
+        recovery.cursor = page.olderCursor;
+        rows = displayResetRows();
+      }
+      return {changed: changes(rows, before)};
+    }
+    const changed = changes(incoming);
+    if (gapStart >= 0) {
+      const old = new Map(rows.slice(0, gapStart).map((row, index) => [row.key, index]));
+      const overlap = incoming.find((row) => old.has(row.key));
+      if (overlap) {
+        rows = distinct(rows.slice(0, old.get(overlap.key)), incoming, rows.slice(old.get(overlap.key)));
+        gapStart = -1; gapCursor = null;
+      } else if (page.hasOlder) {
+        rows = distinct(rows.slice(0, gapStart), incoming, rows.slice(gapStart));
+        gapStart += incoming.filter((row) => !old.has(row.key)).length;
+        gapCursor = page.olderCursor;
+      } else {
+        rows = distinct(incoming, rows.slice(gapStart));
+        gapStart = -1; gapCursor = null; olderCursor = null; hasOlder = false;
+      }
+    } else if (repairTarget) {
+      const updates = new Map(incoming.map((row) => [row.key, row]));
+      rows = rows.map((row) => updates.get(row.key) || row);
+      if (updates.has(repairTarget) || !page.hasOlder) {
+        repairTarget = ""; repairCursor = null;
+      } else repairCursor = page.olderCursor;
+    }
+    updateRows(incoming);
+    return {changed};
+  };
+  return {
+    applyNewest, applyOlder, applyRepair, clear,
+    invalidateCursor() {
+      cursorReset = true; olderCursor = null; hasOlder = false;
+      gapStart = -1; gapCursor = null; repairCursor = null; repairTarget = "";
+      resetRecovery = null; repairVersion++;
+    },
+    get threadId() { return threadId; },
+    get entries() { return rows.map((row) => row.entry); },
+    get rows() { return rows; },
+    get initialized() { return initialized; },
+    get legacy() { return legacy; },
+    get olderCursor() { return olderCursor; },
+    get hasOlder() { return hasOlder; },
+    get gap() { return Boolean(resetRecovery) || gapStart >= 0 || Boolean(repairTarget) || cursorReset; },
+    get repairCursor() { return resetRecovery?.cursor || (gapStart >= 0 ? gapCursor : repairCursor); },
+    get repairVersion() { return repairVersion; },
+  };
+}
+
 function absoluteSameOriginPath(value, name) {
   if (typeof value !== "string" || !value.startsWith("/") ||
       /[\u0000-\u001f\u007f]/.test(value) || value.includes("?") || value.includes("#") ||
@@ -604,8 +862,23 @@ export function mountConversation(root, options) {
   const status = createElement("span", {class: "codex-conversation-status"}, labels.reconnecting);
   const connectionStatus = createElement("div", {class: "codex-connection-status"});
   const transcript = createElement("ol", {class: "codex-conversation-transcript"});
+  const historyControls = createElement("div", {class: "codex-history-controls"});
+  const loadOlder = createElement("button", {type: "button"}, "Load older");
+  const retryHistory = createElement("button", {type: "button"}, "Retry history");
+  const historyStatus = createElement("span", {role: "status"});
+  historyControls.append(loadOlder, historyStatus, retryHistory);
   const prompts = createElement("section", {class: "codex-conversation-prompts"});
+  const pendingStatus = createElement("div", {class: "codex-lane-status", role: "status"});
+  const pendingStatusLabel = createElement("span", {}, "Loading requests…");
+  const retryPending = createElement("button", {type: "button"}, "Retry requests");
+  pendingStatus.append(pendingStatusLabel, retryPending);
+  retryPending.hidden = true;
   const queue = createElement("section", {class: "codex-conversation-queue"});
+  const queueStatus = createElement("div", {class: "codex-lane-status", role: "status"});
+  const queueStatusLabel = createElement("span", {}, "Checking queued messages…");
+  const retryQueue = createElement("button", {type: "button"}, "Retry queue");
+  queueStatus.append(queueStatusLabel, retryQueue);
+  retryQueue.hidden = true;
   const textarea = createElement("textarea", {"aria-label": "Message", rows: "5", required: "required"});
   const pending = sender?.pending() || sender?.pendingQueue();
   if (pending) textarea.value = pending.message;
@@ -622,13 +895,15 @@ export function mountConversation(root, options) {
   const model = createElement("select", {"aria-label": "Model"});
   const effort = createElement("select", {"aria-label": "Reasoning effort"});
   const mode = createElement("select", {"aria-label": "Collaboration mode"});
+  mode.disabled = true;
+  const modeStatus = createElement("span", {role: "status"}, "Checking mode…");
   const saveSettings = createElement("button", {type: "submit"}, "Save settings");
-  settingsForm.append(model, effort, mode, saveSettings);
+  settingsForm.append(model, effort, mode, modeStatus, saveSettings);
   const children = [status, connectionStatus];
   if (capabilities.settings) children.push(settingsForm);
-  children.push(transcript);
-  if (capabilities.pending) children.push(prompts);
-  if (capabilities.queueRead) children.push(queue);
+  children.push(historyControls, transcript);
+  if (capabilities.pending) children.push(pendingStatus, prompts);
+  if (capabilities.queueRead) children.push(queueStatus, queue);
   if (capabilities.send || capabilities.queue || capabilities.interrupt) children.push(form);
   root.replaceChildren(...children);
   let uploads = null;
@@ -662,7 +937,10 @@ export function mountConversation(root, options) {
       model.value = currentThread.model;
     }
     populateEfforts(currentThread.reasoningEffort || "");
-    mode.value = currentThread.collaborationMode || mode.value;
+    mode.value = currentThread.collaborationMode || "";
+    mode.disabled = !currentThread.collaborationMode;
+    modeStatus.hidden = !mode.disabled;
+    modeStatus.textContent = currentThread.metadataPending ? "Checking mode…" : "Mode unavailable";
   };
   const loadSettings = async () => {
     const [models, modes] = await Promise.all([client.models(), client.modes()]);
@@ -681,9 +959,13 @@ export function mountConversation(root, options) {
       if (entry.attachments?.length) item.append(renderAttachments(entry.attachments));
       if (capabilities.queue) {
         const start = createElement("button", {type: "button"}, "Start");
-        start.addEventListener("click", () => void client.startQueue(entry.id).then(refresh));
+        start.addEventListener("click", () => void client.startQueue(entry.id).then(() => {
+          void refresh(); void refreshQueue(true);
+        }).catch(error => { queueStatusLabel.textContent = error.message; queueStatus.hidden = false; }));
         const remove = createElement("button", {type: "button"}, "Remove");
-        remove.addEventListener("click", () => void client.deleteQueued(entry.id).then(refresh));
+        remove.addEventListener("click", () => void client.deleteQueued(entry.id).then(() => {
+          void refreshQueue(true);
+        }).catch(error => { queueStatusLabel.textContent = error.message; queueStatus.hidden = false; }));
         item.append(start, remove);
       }
       queue.append(item);
@@ -715,7 +997,9 @@ export function mountConversation(root, options) {
         const submit = createElement("button", {type: "button"}, "Submit answers");
         submit.addEventListener("click", () => {
           try {
-            void client.respond(entry.id, {token: entry.token, answers: JSON.parse(answer.value)}).then(refresh).catch(error => { status.textContent = error.message; });
+            void client.respond(entry.id, {token: entry.token, answers: JSON.parse(answer.value)}).then(() => {
+              void refresh(); void refreshPending(true);
+            }).catch(error => { status.textContent = error.message; });
           } catch (error) {
             status.textContent = error.message;
           }
@@ -723,13 +1007,17 @@ export function mountConversation(root, options) {
         item.append(answer, submit);
         if (Number(entry.autoResolutionAtMs) > 0) {
           const snooze = createElement("button", {type: "button"}, "Snooze");
-          snooze.addEventListener("click", () => void client.snooze(entry.id, entry.token).then(refresh).catch(error => { status.textContent = error.message; }));
+          snooze.addEventListener("click", () => void client.snooze(entry.id, entry.token).then(() => {
+            void refreshPending(true);
+          }).catch(error => { status.textContent = error.message; }));
           item.append(snooze);
         }
       } else {
         for (const decision of entry.availableDecisions || ["accept", "decline"]) {
           const button = createElement("button", {type: "button"}, decision);
-          button.addEventListener("click", () => void client.respond(entry.id, {token: entry.token, decision}).then(refresh).catch(error => { status.textContent = error.message; }));
+          button.addEventListener("click", () => void client.respond(entry.id, {token: entry.token, decision}).then(() => {
+            void refresh(); void refreshPending(true);
+          }).catch(error => { status.textContent = error.message; }));
           item.append(button);
         }
       }
@@ -737,73 +1025,263 @@ export function mountConversation(root, options) {
     }
   };
 
-  const renderThread = async (thread, isCurrent = () => true) => {
-    if (capabilities.send) {
-      const attempt = sender.pending();
-      const draft = textarea.value;
-      if (await sender.acknowledge(thread.entries || []) &&
-          draft.trim() === attempt?.message && textarea.value === draft) {
-        textarea.value = "";
-      }
-    }
-    if (!isCurrent()) return;
-    currentThread = thread;
-    applyThreadSettings();
-    const entries = thread.entries || [];
-    const elements = [];
-    let previousDate = "";
-    for (const entry of entries) {
-      const timestamp = formatTranscriptTimestamp(entry);
+  const history = createTranscriptHistory();
+  let legacy = false, historyRead = null, historyError = "", historyRetryTimer = null;
+  let metadataRetryTimer = null, metadataRetryDelay = 2000;
+  let pendingRead = null, queueRead = null, pendingScope = null, queueScope = null;
+  let pendingRetryTimer = null, queueRetryTimer = null;
+  let pendingRetryDelay = 2000, queueRetryDelay = 2000, pendingLastRead = 0;
+  let lastSyncStatus = "", lastThreadStatus = "", destroyed = false, paused = false;
+  let generation = 0, sync = null;
+  let entryNodes = new Map();
+  const renderHistoryControls = () => {
+    const older = history.hasOlder && !history.gap && !legacy;
+    loadOlder.hidden = !older;
+    loadOlder.disabled = Boolean(historyRead);
+    retryHistory.hidden = !history.gap && !historyError;
+    retryHistory.disabled = Boolean(historyRead);
+    historyStatus.textContent = historyRead ? "Loading history…" : historyError ||
+      (history.gap ? "Checking earlier messages…" :
+        legacy ? "Older history is unavailable on this server." : "");
+    historyControls.hidden = !older && !historyStatus.textContent && retryHistory.hidden;
+  };
+  const laneRead = (timeout) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("Conversation request timed out")), timeout);
+    return {signal: AbortSignal.any([abort.signal, controller.signal]), finish: () => clearTimeout(timer),
+      cancel: () => controller.abort()};
+  };
+  const entryElement = (entry) => {
+    const timestamp = formatTranscriptTimestamp(entry);
+    const item = createElement("li", {class: "codex-entry codex-entry-" + (entry.kind || "unknown")});
+    const heading = entry.kind === "userMessage" ? "You" : entry.kind === "agentMessage" ? "Codex" : entry.kind;
+    const header = createElement("div", {class: "codex-entry-header"});
+    header.append(createElement("strong", {}, heading || "Activity"));
+    item.append(header);
+    item.append(createTranscriptActivity(entry) || createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? ""));
+    if (entry.attachments?.length) item.append(renderAttachments(entry.attachments, {onRemove: removeAttachment}));
+    const footer = createElement("div", {class: "codex-entry-footer"});
+    const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
+    if (timestamp.dateTime) timeAttributes.datetime = timestamp.dateTime;
+    footer.append(createTranscriptCopyButton(entry),
+      createElement(timestamp.dateTime ? "time" : "span", timeAttributes, timestamp.text));
+    item.append(footer);
+    return item;
+  };
+  const patchEntries = (changed, prepend) => {
+    const previousTop = transcript.scrollTop || 0, previousHeight = transcript.scrollHeight || 0;
+    const follow = !prepend && ((transcript.scrollHeight || 0) -
+      (transcript.clientHeight || 0) - previousTop <= 48);
+    const bounds = transcript.getBoundingClientRect?.();
+    const anchor = bounds && [...transcript.children].find(node =>
+      node.getBoundingClientRect?.().bottom > bounds.top);
+    const anchorKey = anchor && [...entryNodes].find(([, node]) => node === anchor)?.[0];
+    const anchorTop = anchor?.getBoundingClientRect?.().top;
+    const nextNodes = new Map(), desired = [];
+    let previousDate = "", dateOccurrence = 0;
+    for (const row of history.rows) {
+      const timestamp = formatTranscriptTimestamp(row.entry);
       if (timestamp.dateKey && timestamp.dateKey !== previousDate) {
-        const separator = createElement("li", {class: "codex-conversation-date"});
-        separator.append(createElement("time", {datetime: timestamp.dateKey}, timestamp.dateLabel));
-        elements.push(separator);
+        const dateKey = "date:" + timestamp.dateKey + ":" + dateOccurrence++;
+        let separator = entryNodes.get(dateKey);
+        if (!separator) {
+          separator = createElement("li", {class: "codex-conversation-date"});
+          separator.append(createElement("time", {datetime: timestamp.dateKey}, timestamp.dateLabel));
+        }
+        nextNodes.set(dateKey, separator); desired.push(separator);
         previousDate = timestamp.dateKey;
       }
-      const item = createElement("li", {class: `codex-entry codex-entry-${entry.kind || "unknown"}`});
-      const heading = entry.kind === "userMessage" ? "You" : entry.kind === "agentMessage" ? "Codex" : entry.kind;
-      const header = createElement("div", {class: "codex-entry-header"});
-      header.append(createElement("strong", {}, heading || "Activity"));
-      item.append(header);
-      item.append(createTranscriptActivity(entry) || createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? ""));
-      if (entry.attachments?.length) item.append(renderAttachments(entry.attachments, {onRemove: removeAttachment}));
-      const footer = createElement("div", {class: "codex-entry-footer"});
-      const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
-      if (timestamp.dateTime) timeAttributes.datetime = timestamp.dateTime;
-      footer.append(
-        createTranscriptCopyButton(entry),
-        createElement(timestamp.dateTime ? "time" : "span", timeAttributes, timestamp.text),
-      );
-      item.append(footer);
-      elements.push(item);
+      let item = entryNodes.get(row.key);
+      if (!item || changed.has(row.key)) {
+        const replacement = entryElement(row.entry);
+        const oldDetails = item?.querySelectorAll?.("details") || [];
+        const newDetails = replacement.querySelectorAll?.("details") || [];
+        for (let index = 0; index < Math.min(oldDetails.length, newDetails.length); index += 1) {
+          newDetails[index].open = oldDetails[index].open;
+        }
+        item = replacement;
+      }
+      nextNodes.set(row.key, item); desired.push(item);
     }
-    const previousTop = transcript.scrollTop;
-    transcript.replaceChildren(...elements);
-    transcript.scrollTop = previousTop;
-    const active = thread.status === "active";
-    status.textContent = active ? "Working" : labels.idle;
-    if (capabilities.interrupt) interrupt.disabled = !active;
-    if (capabilities.queue) queueButton.hidden = !active;
+    if (typeof transcript.insertBefore === "function") {
+      desired.forEach((node, index) => {
+        if (transcript.childNodes[index] !== node) transcript.insertBefore(node, transcript.childNodes[index] || null);
+      });
+      const retained = new Set(desired);
+      for (const node of [...transcript.childNodes]) if (!retained.has(node)) node.remove();
+    } else transcript.replaceChildren(...desired);
+    entryNodes = nextNodes;
+    const currentAnchor = nextNodes.get(anchorKey);
+    if (follow) transcript.scrollTop = transcript.scrollHeight;
+    else if (currentAnchor?.getBoundingClientRect && Number.isFinite(anchorTop)) {
+      transcript.scrollTop = previousTop + currentAnchor.getBoundingClientRect().top - anchorTop;
+    } else if (prepend) transcript.scrollTop = previousTop + Math.max(0, (transcript.scrollHeight || 0) - previousHeight);
+    else transcript.scrollTop = previousTop;
   };
+  const acknowledgeRetained = (threadId) => {
+    if (!sender || !capabilities.send) return;
+    const attempt = sender.pending(), draft = textarea.value;
+    void sender.acknowledge(history.entries).then(acknowledged => {
+      if (acknowledged && currentThread?.threadId === threadId &&
+          draft.trim() === attempt?.message && textarea.value === draft) textarea.value = "";
+    }).catch(error => { status.textContent = error.message; });
+  };
+  const renderThread = (page, isCurrent = () => true, kind = "newest") => {
+    if (!isCurrent()) return;
+    const update = kind === "older" ? history.applyOlder(page) :
+      kind === "repair" ? history.applyRepair(page) : history.applyNewest(page);
+    if (update.reset) { generation++; entryNodes.clear(); }
+    patchEntries(update.changed, kind !== "newest");
+    if (kind === "newest") {
+      if (historyRead) page.entries.forEach((entry, index) => {
+        historyRead.newerKeys.add(transcriptEntryKey(entry, index, page.entries));
+      });
+      currentThread = page;
+      legacy = Boolean(page.legacy);
+      historyError = "";
+      applyThreadSettings();
+      const active = page.status === "active";
+      status.textContent = active ? "Working" : labels.idle;
+      if (capabilities.interrupt) interrupt.disabled = !active;
+      if (capabilities.queue) queueButton.hidden = !active;
+      if (lastThreadStatus !== page.status) void refreshQueue(true);
+      lastThreadStatus = page.status;
+      if (metadataRetryTimer !== null) clearTimeout(metadataRetryTimer);
+      metadataRetryTimer = null;
+      if (page.metadataPending && !destroyed && !paused) {
+        metadataRetryTimer = setTimeout(() => { metadataRetryTimer = null; sync?.scheduleRefresh(0); }, metadataRetryDelay);
+        metadataRetryDelay = Math.min(30_000, metadataRetryDelay * 2);
+      } else metadataRetryDelay = 2000;
+      if (Date.now() - pendingLastRead >= 5000) void refreshPending();
+    }
+    acknowledgeRetained(page.threadId);
+    renderHistoryControls();
+    scheduleHistoryRepair();
+  };
+  const refreshPending = (force = false) => {
+    if (!capabilities.pending || destroyed || paused || globalThis.document?.hidden || pendingRead) return pendingRead || Promise.resolve();
+    if (pendingRetryTimer !== null && !force) return Promise.resolve();
+    if (pendingRetryTimer !== null) clearTimeout(pendingRetryTimer);
+    pendingRetryTimer = null;
+    const read = laneRead(12_000), threadId = currentThread?.threadId;
+    pendingScope = read;
+    pendingRead = client.pending({signal: read.signal}).then(entries => {
+      if (destroyed || (threadId && currentThread?.threadId !== threadId)) return;
+      if (!Array.isArray(entries)) throw new Error("Invalid pending requests");
+      renderPrompts(entries);
+      pendingStatus.hidden = true;
+      pendingLastRead = Date.now();
+      pendingRetryDelay = 2000;
+    }).catch(() => {
+      if (destroyed || paused || globalThis.document?.hidden) return;
+      pendingStatusLabel.textContent = "Requests could not be refreshed. The last result may be out of date.";
+      retryPending.hidden = false; pendingStatus.hidden = false;
+      pendingRetryTimer = setTimeout(() => { pendingRetryTimer = null; void refreshPending(); }, pendingRetryDelay);
+      pendingRetryDelay = Math.min(30_000, pendingRetryDelay * 2);
+    }).finally(() => { read.finish(); pendingScope = null; pendingRead = null; });
+    return pendingRead;
+  };
+  const refreshQueue = (force = false) => {
+    if (!capabilities.queueRead || destroyed || paused || globalThis.document?.hidden || queueRead) return queueRead || Promise.resolve();
+    if (queueRetryTimer !== null && !force) return Promise.resolve();
+    if (queueRetryTimer !== null) clearTimeout(queueRetryTimer);
+    queueRetryTimer = null;
+    const read = laneRead(12_000), threadId = currentThread?.threadId;
+    queueScope = read;
+    queueRead = Promise.resolve().then(async () => {
+      if (capabilities.queue && typeof client.reconcileQueue === "function") await client.reconcileQueue({signal: read.signal});
+      return client.queue({signal: read.signal});
+    }).then(entries => {
+      if (destroyed || (threadId && currentThread?.threadId !== threadId)) return;
+      if (!Array.isArray(entries)) throw new Error("Invalid queue");
+      renderQueue(entries);
+      queueStatus.hidden = true;
+      queueRetryDelay = 2000;
+    }).catch(() => {
+      if (destroyed || paused || globalThis.document?.hidden) return;
+      queueStatusLabel.textContent = "Queued messages could not be refreshed. The last result may be out of date.";
+      retryQueue.hidden = false; queueStatus.hidden = false;
+      queueRetryTimer = setTimeout(() => { queueRetryTimer = null; void refreshQueue(); }, queueRetryDelay);
+      queueRetryDelay = Math.min(30_000, queueRetryDelay * 2);
+    }).finally(() => { read.finish(); queueScope = null; queueRead = null; });
+    return queueRead;
+  };
+  const runHistoryRead = async (kind) => {
+    if (destroyed || paused || historyRead || legacy || globalThis.document?.hidden) return;
+    const cursor = kind === "older" ? history.olderCursor : history.repairCursor;
+    if (!cursor) return;
+    const threadId = history.threadId, readGeneration = generation;
+    const readVersion = history.repairVersion;
+    const read = laneRead(35_000);
+    historyRead = {...read, newerKeys: new Set()}; historyError = ""; renderHistoryControls();
+    try {
+      const page = await readTranscriptPage(client, {cursor, signal: read.signal, expectedThreadId: threadId});
+      if (destroyed || paused || readGeneration !== generation || history.threadId !== threadId ||
+          readVersion !== history.repairVersion) return;
+      const current = new Map(history.rows.map(row => [row.key, row.entry]));
+      const entries = page.entries.map((entry, index) => {
+        const key = transcriptEntryKey(entry, index, page.entries);
+        return historyRead.newerKeys.has(key) ? current.get(key) || entry : entry;
+      });
+      renderThread({...page, entries}, () => true, kind);
+    } catch (error) {
+      if (destroyed || paused || readGeneration !== generation || history.threadId !== threadId ||
+          readVersion !== history.repairVersion) return;
+      if (error.code === "transcript_cursor_expired" || error.code === "transcript_reset_required") {
+        history.invalidateCursor();
+        historyError = "History changed. Reconnecting…";
+        sync?.scheduleRefresh(0);
+      } else if (error.status === 404 ||
+          (error.status === 501 && error.code === "transcript_paging_unavailable")) {
+        historyError = "Checking history on this server…";
+        sync?.scheduleRefresh(0);
+      } else historyError = "Earlier messages could not be loaded. Retry.";
+    } finally {
+      read.finish(); historyRead = null; renderHistoryControls();
+      if (!historyError) scheduleHistoryRepair();
+    }
+  };
+  const scheduleHistoryRepair = () => {
+    if (!history.gap || !history.repairCursor || historyRetryTimer !== null ||
+        historyRead || historyError || legacy || destroyed || paused || globalThis.document?.hidden) return;
+    historyRetryTimer = setTimeout(() => { historyRetryTimer = null; void runHistoryRead("repair"); }, 40);
+  };
+  loadOlder.addEventListener("click", () => { void runHistoryRead("older"); });
+  retryHistory.addEventListener("click", () => {
+    historyError = "";
+    if (history.repairCursor) scheduleHistoryRepair(); else sync?.scheduleRefresh(0);
+    renderHistoryControls();
+  });
+  retryPending.addEventListener("click", () => { void refreshPending(true); });
+  retryQueue.addEventListener("click", () => { void refreshQueue(true); });
+  const suspendLanes = () => {
+    paused = true;
+    historyRead?.cancel(); pendingScope?.cancel(); queueScope?.cancel();
+    for (const timer of [historyRetryTimer, metadataRetryTimer, pendingRetryTimer, queueRetryTimer]) clearTimeout(timer);
+    historyRetryTimer = metadataRetryTimer = pendingRetryTimer = queueRetryTimer = null;
+  };
+  const onVisibility = () => {
+    if (globalThis.document?.hidden) suspendLanes();
+    else { paused = false; void refreshPending(true); void refreshQueue(true); scheduleHistoryRepair(); }
+  };
+  const onPageshow = () => { paused = false; onVisibility(); };
+  globalThis.document?.addEventListener?.("visibilitychange", onVisibility);
+  globalThis.addEventListener?.("pagehide", suspendLanes);
+  globalThis.addEventListener?.("pageshow", onPageshow);
+  renderHistoryControls();
 
-  const sync = createConversationSync({
+  sync = createConversationSync({
     EventSource: EventSourceClass, eventStream: capabilities.eventStream,
     eventsPath: capabilities.eventStream ? client.eventsPath() : null,
-    read: async (signal) => {
-      if (capabilities.queue && options.uploadBasePath) await client.reconcileQueue({signal});
-      return Promise.all([
-        client.thread({signal}),
-        capabilities.pending ? client.pending({signal}) : Promise.resolve([]),
-        capabilities.queueRead ? client.queue({signal}) : Promise.resolve([]),
-      ]);
+    read: signal => readTranscriptPage(client, {signal, legacy}),
+    apply: (page, {isCurrent}) => renderThread(page, isCurrent),
+    onStateChange: state => {
+      renderConnectionStatus(connectionStatus, state, () => sync.retry());
+      if (state.status === "connected" && lastSyncStatus !== "connected") {
+        void refreshPending(true); void refreshQueue(true);
+      }
+      lastSyncStatus = state.status;
     },
-    apply: async ([thread, pendingEntries, queuedEntries], {isCurrent}) => {
-      await renderThread(thread, isCurrent);
-      if (!isCurrent()) return;
-      if (capabilities.pending) renderPrompts(pendingEntries);
-      if (capabilities.queueRead) renderQueue(queuedEntries);
-    },
-    onStateChange: state => renderConnectionStatus(connectionStatus, state, () => sync.retry()),
   });
   const refresh = () => sync.refresh();
 
@@ -829,7 +1307,7 @@ export function mountConversation(root, options) {
     event.preventDefault();
     saveSettings.disabled = true;
     try {
-      await client.settings(model.value, effort.value, mode.value);
+      await client.settings(model.value, effort.value, currentThread?.collaborationMode ? mode.value : undefined);
       await refresh();
     } catch (error) {
       status.textContent = error.message;
@@ -846,6 +1324,7 @@ export function mountConversation(root, options) {
       await sender.queue(message, uploads?.ids() || []);
       uploads?.clear();
       textarea.value = "";
+      void refreshQueue(true);
       await refresh();
     } catch (error) {
       status.textContent = error.message;
@@ -855,14 +1334,20 @@ export function mountConversation(root, options) {
     status.textContent = error.message;
   }));
 
-  void Promise.all([
-    capabilities.settings ? loadSettings() : Promise.resolve(),
-    refresh(),
-  ]).catch((error) => {
-    status.textContent = error.message;
-  });
+  if (capabilities.settings) void loadSettings().catch(error => { status.textContent = error.message; });
+  void refresh();
+  void refreshPending();
+  void refreshQueue();
+  const pendingInterval = setInterval(() => { void refreshPending(); }, 15_000);
+  const queueInterval = setInterval(() => { void refreshQueue(); }, 30_000);
 
   return () => {
+    destroyed = true;
+    clearInterval(pendingInterval); clearInterval(queueInterval);
+    suspendLanes();
+    globalThis.document?.removeEventListener?.("visibilitychange", onVisibility);
+    globalThis.removeEventListener?.("pagehide", suspendLanes);
+    globalThis.removeEventListener?.("pageshow", onPageshow);
     uploads?.destroy();
     abort.abort();
     sync.destroy();

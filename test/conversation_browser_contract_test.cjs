@@ -639,6 +639,7 @@ class MemoryStorage {
     async thread() {
       mountedCalls.push("thread");
       return {
+        threadId: "thread-1",
         entries: [
           {kind: "userMessage", text: "First", timestamp: "2026-09-10T12:00:00Z"},
           {kind: "agentMessage", text: "Second", timestamp: "2026-09-11T12:00:00Z", timestampApproximate: true},
@@ -696,12 +697,50 @@ class MemoryStorage {
   assert.equal(root.descendants().filter((element) => element.attributes.class === "codex-conversation-date").length, 2);
   unmount();
 
+  let releaseQueue, releasePending;
+  const pageCalls = [];
+  const pagedClient = {
+    async thread() { throw new Error("unexpected legacy read"); },
+    async threadPage({cursor} = {}) {
+      pageCalls.push(cursor || "newest");
+      return {threadId: "paged-thread", status: "idle", hasOlder: !cursor,
+        olderCursor: cursor ? null : "older-1", entries: cursor ? [
+          {turnId: "turn-1", itemId: "item-1", kind: "agentMessage", text: "Older"},
+        ] : [
+          {turnId: "turn-1", itemId: "item-2", kind: "agentMessage", text: "Recent"},
+        ]};
+    },
+    pending: () => new Promise(resolve => { releasePending = resolve; }),
+    queue: () => new Promise(resolve => { releaseQueue = resolve; }),
+  };
+  const pagedRoot = new FakeElement("main");
+  const unmountPaged = mountConversation(pagedRoot, {
+    id: "paged", client: pagedClient,
+    capabilities: {send: false, queue: false, interrupt: false, settings: false,
+      respond: false, eventStream: false},
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const pagedEntries = () => pagedRoot.descendants().filter(element =>
+    element.attributes.class?.startsWith("codex-entry "));
+  assert.equal(pagedEntries().length, 1, "pending and queue reads cannot block the recent page");
+  const recentNode = pagedEntries()[0];
+  const olderButton = pagedRoot.descendants().find(element => element.textContent === "Load older");
+  assert.equal(olderButton.hidden, false);
+  olderButton.listeners.get("click")();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(pageCalls, ["newest", "older-1"]);
+  assert.equal(pagedEntries().length, 2);
+  assert.equal(pagedEntries()[1], recentNode, "unchanged entries keep their DOM nodes");
+  releasePending([]); releaseQueue([]);
+  await new Promise(resolve => setImmediate(resolve));
+  unmountPaged();
+
   const promptRoot = new FakeElement("main");
   const promptActions = [];
   const promptClient = {
     async respond(id, payload) { promptActions.push({id, ...payload}); },
     async snooze(id, token) { promptActions.push({id, token, snooze: true}); },
-    async thread() { return {entries: [], status: "idle"}; },
+    async thread() { return {threadId: "thread-1", entries: [], status: "idle"}; },
     async pending() {
       return [
         {id: "untimed", token: "offer-untimed", kind: "userInput", item: {}},
@@ -735,9 +774,10 @@ class MemoryStorage {
   const mountedCoupledStorage = new MemoryStorage();
   const mountedCoupledClient = createConversationClient({
     id: "opaque", conversationPath: "/api/mounted/opaque", fetch: async (path) => ({
-      ok: true,
-      status: 200,
-      json: async () => path.endsWith("/thread") ? {entries: [], status: "idle"} : {},
+      ok: !path.endsWith("/thread/page"),
+      status: path.endsWith("/thread/page") ? 501 : 200,
+      json: async () => path.endsWith("/thread/page") ? {code: "transcript_paging_unavailable"} :
+        path.endsWith("/thread") ? {threadId: "thread-1", entries: [], status: "idle"} : {},
     }),
   });
   await createDurableSender({
@@ -768,7 +808,7 @@ class MemoryStorage {
     const raceClient = {
       thread() {
         if (++readCount === 1) return new Promise(resolve => { firstRead = resolve; });
-        return Promise.resolve({status: "idle", entries: [{kind: "userMessage", text: "race message",
+        return Promise.resolve({threadId: "thread-1", status: "idle", entries: [{kind: "userMessage", text: "race message",
           clientUserMessageId: sentID, clientUserMessageDigest: "a".repeat(64)}]});
       },
       async message(message, id) { sentID = id; return {clientUserMessageId: id}; },
@@ -791,7 +831,7 @@ class MemoryStorage {
     textarea.value = "race message";
     const submitted = form.listeners.get("submit")({preventDefault() {}});
     await new Promise(resolve => setImmediate(resolve));
-    firstRead({status: "idle", entries: []});
+    firstRead({threadId: "thread-1", status: "idle", entries: []});
     await submitted;
     assert.equal(textarea.value, "race message");
     await acknowledgementStarted;
