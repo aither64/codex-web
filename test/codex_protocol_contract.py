@@ -298,6 +298,13 @@ if COVERAGE_ONLY:
 for message in client_requests:
     validate("ClientRequest.json", message, f"client request {message['method']}")
 
+require_root_property(
+    "v2/ThreadListParams.json", "useStateDbOnly", "database-only thread discovery"
+)
+for params in ({}, {"cwd": "/workspace/work/example", "limit": 100, "useStateDbOnly": True}):
+    validate("v2/ThreadListParams.json", params, "database-only thread list params")
+    validate("ClientRequest.json", request("thread/list", params), "database-only thread list request")
+
 for message in [
     request("thread/start", {
         "cwd": "/workspace/work/example",

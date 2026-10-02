@@ -679,6 +679,67 @@ func TestProjectIDStartsAndListsOnlyMatchingThreads(t *testing.T) {
 	}
 }
 
+func TestListThreadsStateDBOnly(t *testing.T) {
+	const projectID = "00000000-0000-7000-8000-000000000001"
+	archived := true
+	filtered := ThreadListOptions{
+		Cwd: "/workspace/work/example", ProjectID: projectID,
+		SourceKinds: []string{"vscode"}, Archived: &archived,
+		Limit: 100, SortDirection: "asc", Cursor: "next-page",
+	}
+	databaseOnly := filtered
+	databaseOnly.UseStateDBOnly = true
+	for _, test := range []struct {
+		name       string
+		options    ThreadListOptions
+		wantParams string
+	}{
+		{"default omits field", ThreadListOptions{}, `{}`},
+		{"false omits field", filtered, `{"archived":true,"cursor":"next-page","cwd":"/workspace/work/example","limit":100,"projectId":"00000000-0000-7000-8000-000000000001","sortDirection":"asc","sourceKinds":["vscode"]}`},
+		{"true preserves filters", databaseOnly, `{"archived":true,"cursor":"next-page","cwd":"/workspace/work/example","limit":100,"projectId":"00000000-0000-7000-8000-000000000001","sortDirection":"asc","sourceKinds":["vscode"],"useStateDbOnly":true}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				request, err := readObject(connection)
+				if err != nil {
+					return err
+				}
+				params, err := json.Marshal(request["params"])
+				if err != nil {
+					return err
+				}
+				if request["method"] != "thread/list" || string(params) != test.wantParams {
+					return fmt.Errorf("thread/list request = %#v", request)
+				}
+				return writeObject(connection, map[string]any{
+					"id": request["id"], "result": map[string]any{
+						"data": []any{map[string]any{
+							"id": "thread-1", "cwd": "/workspace/work/example", "projectId": projectID,
+						}},
+						"nextCursor": "older-page",
+					},
+				})
+			})
+			client := newTestClient(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			threads, cursor, err := client.ListThreads(ctx, test.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(threads) != 1 || threads[0].ID != "thread-1" || threads[0].Cwd != filtered.Cwd ||
+				threads[0].ProjectID == nil || *threads[0].ProjectID != projectID ||
+				cursor == nil || *cursor != "older-page" {
+				t.Fatalf("thread/list result = %#v, %v", threads, cursor)
+			}
+		})
+	}
+}
+
 func TestReadProjectClassifiesOnlyExactMissingIdentity(t *testing.T) {
 	const projectID = "dev-workspace-member:missing"
 	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {

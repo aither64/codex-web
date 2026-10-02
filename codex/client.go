@@ -501,6 +501,10 @@ type ThreadListOptions struct {
 	Limit         int
 	SortDirection string
 	Cursor        string
+
+	// UseStateDBOnly skips scanning JSONL rollouts to repair thread metadata.
+	// False omits the option, preserving the server's scan-and-repair behavior.
+	UseStateDBOnly bool
 }
 
 type CollaborationMode struct {
@@ -3247,6 +3251,9 @@ func (c *Client) ListThreads(
 	}
 	if options.Cursor != "" {
 		params["cursor"] = options.Cursor
+	}
+	if options.UseStateDBOnly {
+		params["useStateDbOnly"] = true
 	}
 	var page struct {
 		Data       *[]ThreadMetadata `json:"data"`

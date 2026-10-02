@@ -66,6 +66,13 @@ must reject an old policy that is no longer authorized.
 `ThreadListOptions.ProjectID` lists that project's threads and rejects results
 outside it. A project ID cannot be selected during resume or fork.
 
+`ThreadListOptions.UseStateDBOnly` asks `ListThreads` to read the Codex state
+database without scanning JSONL rollouts to repair thread metadata. It sends
+`useStateDbOnly: true` only when enabled; false omits the field and preserves
+the server's scan-and-repair behavior. Database-only results can omit threads
+or contain stale metadata, so callers that need complete discovery must keep
+their full-scan recovery path. The selected Codex build must support this field.
+
 `Client.SendWithOptions`, `PrepareSendWithOptions`,
 `SendAttemptedWithOptions`, `ReconcileSendWithOptions`,
 `DiscardPreparedSendWithOptions`, and `EnsureInitialMessageWithOptions` accept
