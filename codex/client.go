@@ -708,6 +708,7 @@ func ResolveForkThreadSettings(
 
 type Client struct {
 	socket            string
+	ephemeral         *ephemeralSink // private utility only; installed before Ensure
 	options           ClientOptions
 	activityNamespace string
 	observer          *observerState
@@ -886,6 +887,9 @@ func (c *Client) Ensure(ctx context.Context) error {
 		return fmt.Errorf("connect to Codex App Server at %s: %w", c.socket, err)
 	}
 	connection.SetReadLimit(readLimit)
+	if c.ephemeral != nil {
+		connection.SetReadLimit(ephemeralFrameLimit)
+	}
 	c.generation++
 	generation := c.generation
 	c.connection = connection
@@ -1087,13 +1091,24 @@ func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, gen
 
 func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 	for {
-		_, data, err := connection.Read(context.Background())
+		kind, data, err := connection.Read(context.Background())
 		if err != nil {
 			c.markDisconnected(connection, generation, err)
 			return
 		}
 		var message rpcMessage
-		if err := json.Unmarshal(data, &message); err != nil {
+		if c.ephemeral != nil {
+			if kind != websocket.MessageText {
+				c.ephemeral.fail(ErrEphemeralProtocol)
+				return
+			}
+			if !c.ephemeral.decode(data, &message) {
+				return
+			}
+		} else if err := json.Unmarshal(data, &message); err != nil {
+			continue
+		}
+		if c.ephemeral != nil && c.ephemeral.handle(c, connection, generation, message) {
 			continue
 		}
 		if c.options.ActivityRecorder != nil {
@@ -1158,12 +1173,20 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 		if !ok || call.generation != generation {
 			continue
 		}
+		var reply response
 		if message.Error != nil {
-			call.channel <- response{err: &rpcCallError{
-				code: message.Error.Code, message: message.Error.Message,
-			}}
+			reply = response{err: &rpcCallError{code: message.Error.Code, message: message.Error.Message}}
 		} else {
-			call.channel <- response{result: message.Result}
+			reply = response{result: message.Result}
+		}
+		if c.ephemeral == nil {
+			call.channel <- reply
+		} else {
+			select {
+			case call.channel <- reply:
+			default:
+				c.ephemeral.fail(ErrEphemeralProtocol)
+			}
 		}
 	}
 }
@@ -1352,6 +1375,9 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 	}
 	c.connection = nil
 	c.ready = 0
+	if c.ephemeral != nil {
+		c.ephemeral.fail(ErrEphemeralServer)
+	}
 	if c.observer != nil && c.observer.cancelConnection != nil {
 		c.observer.cancelConnection()
 		c.observer.clearQueue()

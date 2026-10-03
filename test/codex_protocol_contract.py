@@ -274,6 +274,33 @@ client_requests = [
     ),
     request("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
 ]
+# Each entry below corresponds to one additional literal utility call site.
+# The production helper embeds this same fixed policy artifact.
+utility_policy = json.loads((CLIENT_SOURCE.parent / "ephemeral_policy.json").read_text())
+utility_policy["mcp_servers"] = {"literal.name": {"enabled": False}}
+utility_cwd = "/private/cwd"
+utility_schema = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"], "additionalProperties": False}
+client_requests.extend([
+    request("config/read", {"cwd": utility_cwd, "includeLayers": False}),
+    request("configRequirements/read", None),
+    request("model/list", {"limit": 100, "includeHidden": True, "cursor": "utility-next"}),
+    request("thread/start", {
+        "ephemeral": True, "model": "gpt-5.5", "allowProviderModelFallback": False,
+        "cwd": utility_cwd, "baseInstructions": "Return the requested JSON.",
+        "developerInstructions": "", "approvalPolicy": "never", "sandbox": "read-only",
+        "environments": [], "runtimeWorkspaceRoots": [], "selectedCapabilityRoots": [],
+        "dynamicTools": [], "config": utility_policy,
+    }),
+    request("turn/start", {
+        "threadId": "utility-thread", "input": [{"type": "text", "text": "raw input"}],
+        "model": "gpt-5.5", "effort": "low", "outputSchema": utility_schema,
+        "cwd": utility_cwd, "approvalPolicy": "never",
+        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+        "environments": [], "runtimeWorkspaceRoots": [],
+    }),
+    request("turn/interrupt", {"threadId": "utility-thread", "turnId": "utility-turn"}),
+    request("thread/unsubscribe", {"threadId": "utility-thread"}),
+])
 client_source = CLIENT_SOURCE.read_text()
 # Public client behavior is split into small implementation files. Keep every
 # outgoing call in the schema corpus, including the optional activity reader.
@@ -815,7 +842,6 @@ for message in server_requests:
         f"server request {message['method']}",
     )
 
-print("Codex App Server protocol contract is compatible")
 
 # Typed activity and observer fields consumed from the selected Codex schema.
 activity_items = [
@@ -847,3 +873,82 @@ for definition, fields in {
 }.items():
     for field in fields:
         require_declared_property("v2/ThreadTurnsListResponse.json", definition, field, "activity turn metadata")
+
+# Utility-only consumed shapes. Optional phase/path/model properties are checked
+# at runtime; requiring their schema presence would invent a wire guarantee.
+utility_thread = {**thread, "id": "utility-thread", "cwd": utility_cwd, "ephemeral": True, "path": None}
+utility_start = {**common_start, "thread": utility_thread, "cwd": utility_cwd,
+                 "model": "gpt-5.5", "sandbox": {"type": "readOnly", "networkAccess": False}}
+validate("v2/ThreadStartResponse.json", utility_start, "ephemeral thread result")
+require_fields("v2/ThreadStartResponse.json", utility_start,
+               [("model",), ("cwd",), ("thread", "id"), ("thread", "cwd"), ("thread", "ephemeral")],
+               "ephemeral thread identity")
+require_declared_property("v2/ThreadStartResponse.json", "Thread", "path", "ephemeral absent rollout")
+final_item = {"id": "utility-answer", "type": "agentMessage", "phase": "final_answer", "text": '{"name":"fix runtime session names"}'}
+utility_turn = {"id": "utility-turn", "status": "completed", "items": [final_item]}
+validate("v2/TurnStartResponse.json", {"turn": utility_turn}, "ephemeral turn result")
+require_fields("v2/TurnStartResponse.json", {"turn": utility_turn},
+               [("turn", "id"), ("turn", "status"), ("turn", "items")], "ephemeral turn identity")
+completion = {"threadId": "utility-thread", "turnId": "utility-turn", "completedAtMs": 1, "item": final_item}
+validate("v2/ItemCompletedNotification.json", completion, "ephemeral completed final item")
+require_fields("v2/ItemCompletedNotification.json", completion,
+               [("threadId",), ("turnId",), ("item",), ("item", "id"), ("item", "text")], "ephemeral final item")
+# ThreadItem is a union; explicitly validate phase literals against its declared
+# MessagePhase definition. Missing phase is a protocol failure in the helper.
+phase_schema = json.loads((SCHEMA_DIR / "v2/ItemCompletedNotification.json").read_text())["definitions"]["MessagePhase"]
+if not Draft7Validator(phase_schema).is_valid("final_answer") or Draft7Validator(phase_schema).is_valid("unknown"):
+    raise SystemExit("ephemeral final phase convention differs")
+finished = {"threadId": "utility-thread", "turn": utility_turn}
+early_started = {"threadId": "utility-thread", "turn": {"id": "utility-turn", "status": "inProgress", "items": []}}
+validate("v2/TurnStartedNotification.json", early_started, "ephemeral early cleanup identity")
+require_fields("v2/TurnStartedNotification.json", early_started,
+               [("threadId",), ("turn", "id"), ("turn", "status"), ("turn", "items")], "ephemeral early cleanup identity")
+validate("ServerNotification.json", {"method": "turn/started", "params": early_started}, "ephemeral early cleanup notification")
+validate("v2/TurnCompletedNotification.json", finished, "ephemeral successful completion")
+require_fields("v2/TurnCompletedNotification.json", finished,
+               [("threadId",), ("turn", "id"), ("turn", "status"), ("turn", "items")], "ephemeral successful completion")
+utility_catalog = "/private/package/codex-models.json"
+validate("v2/ConfigReadResponse.json", {
+    "config": {"model_catalog_json": utility_catalog, "mcp_servers": {"literal.name": {"command": "synthetic"}}},
+    "origins": {"model_catalog_json": {"name": {"type": "sessionFlags"}, "version": "fixture"}},
+}, "ephemeral startup CLI catalog and MCP inventory")
+validate("v2/ConfigRequirementsReadResponse.json", {"requirements": None}, "ephemeral no managed requirements")
+validate("v2/ConfigRequirementsReadResponse.json", {"requirements": {"featureRequirements": {"shell_tool": True}}}, "ephemeral rejected managed requirement")
+validate("v2/ThreadUnsubscribeResponse.json", {"status": "unsubscribed"}, "ephemeral unsubscribe")
+require_fields("v2/ThreadUnsubscribeResponse.json", {"status": "unsubscribed"}, [("status",)], "ephemeral unsubscribe")
+# Server-request errors use the shared JSON-RPC error envelope, not an answer.
+validate("JSONRPCError.json", {"id": "question-1", "error": {"code": -32601, "message": "Questions are unavailable for ephemeral utility turns"}}, "ephemeral question rejection")
+
+# The tagged fixture discovers eligible synthetic hooks before its ordinary
+# control. This test-only request is excluded from production call-site counts.
+validate("ClientRequest.json", request("hooks/list", {"cwds": [utility_cwd]}), "fixture eligible hook discovery")
+hook = {"key": "fixture-hook", "currentHash": "fixture-hash", "source": "user",
+        "eventName": "sessionStart", "handlerType": "command", "command": "/private/hook.sh",
+        "sourcePath": "/private/hooks.json", "timeoutSec": 1, "displayOrder": 0,
+        "enabled": True, "isManaged": False, "trustStatus": "trusted"}
+hook_inventory = {"data": [{"cwd": utility_cwd, "hooks": [hook], "warnings": [], "errors": []}]}
+validate("v2/HooksListResponse.json", hook_inventory, "fixture synthetic hook eligibility")
+require_fields("v2/HooksListResponse.json", hook_inventory,
+               [("data",), ("data", 0, "hooks"), ("data", 0, "hooks", 0, "key"),
+                ("data", 0, "hooks", 0, "currentHash"), ("data", 0, "hooks", 0, "source")],
+               "fixture hook identity/trust")
+
+# Async questions carry agent-message metadata and no outer request ID. Ordinary
+# final messages may omit or null that metadata; the helper checks it at runtime.
+async_item = {**final_item, "delivery": "async", "questions": [{"title": "Synthetic question?", "options": ["Continue", "Stop"]}]}
+for method, timestamp, file_name in (
+    ("item/started", "startedAtMs", "v2/ItemStartedNotification.json"),
+    ("item/completed", "completedAtMs", "v2/ItemCompletedNotification.json"),
+):
+    params = {"threadId": "utility-thread", "turnId": "utility-turn", timestamp: 1, "item": async_item}
+    validate(file_name, params, "ephemeral rejected async question")
+    validate("ServerNotification.json", {"method": method, "params": params}, "ephemeral async notification without ID")
+    for item in (final_item, {**final_item, "delivery": None, "questions": None}):
+        validate(file_name, {**params, "item": item}, "ordinary final metadata absent/null")
+    definitions = json.loads((SCHEMA_DIR / file_name).read_text())["definitions"]
+    if definitions["AgentMessageDelivery"].get("enum") != ["async"]:
+        raise SystemExit("ephemeral async delivery convention differs")
+    if not Draft7Validator(definitions["AsyncUserInputQuestion"]).is_valid({"title": "Synthetic question?"}):
+        raise SystemExit("ephemeral async question convention differs")
+
+print("Codex App Server protocol contract is compatible")
