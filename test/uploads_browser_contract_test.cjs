@@ -156,7 +156,7 @@ async function uploadComposer(t, options = {}) {
     setItem: (key, value) => {if (failWrites) {if (typeof failWrites === 'number') failWrites -= 1; throw Error('Storage write failed');} values.set(key, value);},
   };
   const client = {
-    list: async () => ({limits, files: [...files.values()]}),
+    list: async () => ({limits: options.limits || limits, files: [...files.values()]}),
     create: async (file, clientId) => {
       calls.create.push({name: file.name, size: file.size, clientId});
       if (options.create) return options.create(file, clientId);
@@ -179,7 +179,7 @@ async function uploadComposer(t, options = {}) {
     await upload.initialized;
   };
   await mount();
-  const cards = () => root.children[2].children;
+  const cards = () => root.children.find((child) => child.className === 'codex-attachments').children;
   const card = (name) => cards().find((item) => item.children[0].textContent === name);
   const click = (name, label) => {
     const button = card(name)?.children.find((child) => child.textContent === label);
@@ -188,6 +188,9 @@ async function uploadComposer(t, options = {}) {
   };
   return {
     client, calls, files, changes, card, click, cards,
+    summary: () => root.children.find((child) => child.className === 'codex-upload-summary'),
+    notice: () => root.children.find((child) => child.className === 'codex-upload-notice'),
+    lock: (value) => upload.lock(value), clear: () => upload.clear(),
     saved: () => JSON.parse(values.get('draft')),
     ready: () => upload.ready(), count: () => upload.count(), ids: () => upload.ids(),
     failWrites: (value) => {failWrites = value;},
@@ -213,6 +216,98 @@ async function eventually(predicate) {
 }
 const zeroFile = (name = 'input.eml') => new File([], name);
 const savedDraft = (extra = {}) => ({clientId: id, name: 'input.eml', size: 0, state: 'uploading', ...extra});
+
+test('summary uses full sizes during transfer and waits for completion acknowledgement', async (t) => {
+  let finishChunk, finishComplete;
+  const composer = await uploadComposer(t, {limits: {...limits, fileBytes: 4096, promptBytes: 8192, chunkBytes: 2048}});
+  assert.equal(composer.summary().hidden, true);
+  composer.client.append = async (fileID, offset, checksum, chunk, progress) => {
+    progress(512);
+    await new Promise((resolve) => {finishChunk = resolve;});
+    const record = composer.files.get(fileID);
+    record.offset = offset + chunk.size; record.checksums.push(checksum);
+    return {...record};
+  };
+  composer.client.complete = async (fileID) => {
+    await new Promise((resolve) => {finishComplete = resolve;});
+    composer.files.get(fileID).state = 'ready';
+    return {...composer.files.get(fileID)};
+  };
+  composer.add(new File([new Uint8Array(2048)], 'large.txt'));
+  await eventually(() => finishChunk);
+  assert.equal(composer.summary().textContent, '1 file · 2 KiB total · 0 of 1 complete');
+  assert.equal(composer.card('large.txt').children[1].textContent, '2 KiB · 25%');
+  finishChunk(); await eventually(() => finishComplete);
+  assert.equal(composer.summary().textContent, '1 file · 2 KiB total · 0 of 1 complete');
+  assert.equal(composer.ready(), false);
+  finishComplete(); await eventually(() => composer.ready());
+  assert.equal(composer.summary().textContent, '1 file · 2 KiB total');
+  composer.client.complete = async (fileID) => {composer.files.get(fileID).state = 'ready'; return {...composer.files.get(fileID)};};
+  composer.add(zeroFile('empty.txt')); await eventually(() => composer.ready());
+  assert.equal(composer.summary().textContent, '2 files · 2 KiB total');
+  composer.lock(true); assert.equal(composer.summary().textContent, '2 files · 2 KiB total');
+  assert.equal(composer.card('large.txt').children.at(-1).disabled, true);
+  composer.lock(false); composer.clear();
+  assert.equal(composer.summary().hidden, true); assert.equal(composer.summary().textContent, '');
+  assert.deepEqual(composer.saved(), []); assert.equal(composer.files.size, 2);
+});
+
+test('zero-byte failure and retry retain the selection summary separately from errors', async (t) => {
+  const composer = await uploadComposer(t);
+  composer.client.complete = async () => {throw Error('Completion response lost');};
+  composer.add(zeroFile());
+  assert.equal(composer.summary().textContent, '1 file · 0 B total · 0 of 1 complete');
+  await eventually(() => composer.saved()[0]?.error === 'Completion response lost');
+  assert.equal(composer.summary().textContent, '1 file · 0 B total · 0 of 1 complete');
+  assert.equal(composer.ready(), false);
+  composer.client.complete = async (fileID) => {composer.files.get(fileID).state = 'ready'; return {...composer.files.get(fileID)};};
+  composer.click('input.eml', 'Retry'); await eventually(() => composer.ready());
+  assert.equal(composer.summary().textContent, '1 file · 0 B total');
+  composer.add(new File([new Uint8Array(101)], 'too-large.txt'));
+  assert.match(composer.notice().textContent, /exceeds/);
+  assert.equal(composer.summary().textContent, '1 file · 0 B total');
+  assert.equal(composer.count(), 1);
+});
+
+test('restored paused, missing and deleted selections keep their full totals until removed', async (t) => {
+  const records = [
+    savedDraft({id, name: 'ready.txt', size: 1024, state: 'ready'}),
+    savedDraft({clientId: crypto.randomUUID(), id: crypto.randomUUID(), name: 'paused.txt', size: 2048, offset: 512}),
+    savedDraft({clientId: crypto.randomUUID(), id: crypto.randomUUID(), name: 'missing.txt', size: 1024}),
+    savedDraft({clientId: crypto.randomUUID(), id: crypto.randomUUID(), name: 'deleted.txt', size: 0, state: 'deleted'}),
+  ];
+  const composer = await uploadComposer(t, {saved: records, files: [records[0], records[1], records[3]]});
+  assert.equal(composer.summary().textContent, '4 files · 4 KiB total · 1 of 4 complete');
+  await composer.reload();
+  assert.equal(composer.summary().textContent, '4 files · 4 KiB total · 1 of 4 complete');
+  composer.click('paused.txt', 'Remove'); await eventually(() => composer.count() === 3);
+  assert.equal(composer.summary().textContent, '3 files · 2 KiB total · 1 of 3 complete');
+  composer.click('missing.txt', 'Remove'); await eventually(() => composer.count() === 2);
+  composer.click('deleted.txt', 'Remove'); await eventually(() => composer.count() === 1);
+  assert.equal(composer.summary().textContent, '1 file · 1 KiB total');
+});
+
+test('ready files awaiting or failing removal remain complete until removal succeeds', async (t) => {
+  let finishRemoval;
+  const record = savedDraft({id, size: 1024, state: 'ready'});
+  const composer = await uploadComposer(t, {saved: [record], files: [record]});
+  composer.client.remove = () => new Promise((resolve, reject) => {finishRemoval = () => reject(Error('Busy file'));});
+  composer.click('input.eml', 'Remove'); await eventually(() => finishRemoval);
+  assert.equal(composer.summary().textContent, '1 file · 1 KiB total');
+  assert.equal(composer.ready(), false);
+  finishRemoval(); await eventually(() => composer.saved()[0]?.error === 'Busy file');
+  assert.equal(composer.summary().textContent, '1 file · 1 KiB total');
+  composer.client.remove = async (fileID) => composer.files.delete(fileID);
+  composer.click('input.eml', 'Remove'); await eventually(() => composer.count() === 0);
+  assert.equal(composer.summary().hidden, true);
+});
+
+test('generic attachment ID validation retains its 100-entry ceiling', async () => {
+  const {attachmentIDs} = await modules;
+  const ids = Array.from({length: 101}, () => crypto.randomUUID());
+  assert.deepEqual(attachmentIDs(ids.slice(0, 100)), ids.slice(0, 100));
+  assert.throws(() => attachmentIDs(ids), /Invalid attachment IDs/);
+});
 
 test('rejected files can be removed without another request, before and after reload', async (t) => {
   for (const reload of [false, true]) {

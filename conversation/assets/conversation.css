@@ -1,4 +1,4 @@
-@import url("./uploads.css");
+@import url("./uploads.css?v=3");
 .codex-connection-status { border: 1px solid #bf8700; padding: .75rem; margin: .5rem 0; }
 .codex-connection-status button { margin-left: .5rem; }
 .codex-history-controls { display: flex; align-items: center; gap: .65rem; margin: .5rem 0; font-size: .85rem; }

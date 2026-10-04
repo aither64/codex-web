@@ -477,8 +477,15 @@ prompt references as JSON, and derive storage paths from application-generated
 identities. Download responses use MIME filename encoding and attachment
 disposition. Upload creation accepts at most 4096 bytes of valid UTF-8 JSON;
 the store owns filename and file-size policy.
-`mountUploads(root, options)` renders draft cards and errors in `root`. Pass
-`options.controlsRoot` to put its + attachment menu beside your form actions;
+`mountUploads(root, options)` renders draft cards, a selection summary and errors
+in `root`. The summary shows the selected file count and full total size in
+binary units, plus the completed count while any file is unfinished. Completion
+requires server acknowledgement. Paused, failed, missing and deleted selections
+remain in the total until removed. A file awaiting removal stays selected; a
+failed removal does not undo its completed upload. The summary is separate from
+errors and does not change submission readiness. It disappears with an empty
+selection. Submitted files are cleared from the composer without deleting them.
+Pass `options.controlsRoot` to put its + attachment menu beside your form actions;
 omit it to keep everything in `root`. A separate empty card root is hidden.
 `destroy()` removes the component's controls and listeners while preserving
 adjacent host actions. The menu uses the browser's Popover API.

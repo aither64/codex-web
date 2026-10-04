@@ -236,12 +236,14 @@ export function mountUploads(root, options) {
   globalThis.addEventListener("scroll", positionMenu, true);
   const notice = document.createElement("p");
   notice.className = "codex-upload-notice"; notice.setAttribute("role", "status");
+  const summary = document.createElement("p");
+  summary.className = "codex-upload-summary";
   const list = document.createElement("div"); list.className = "codex-attachments";
   root.classList.add("codex-upload-composer");
   controls.append(button, picker, menu); controlsRoot.append(controls);
-  notice.hidden = true; list.hidden = true;
+  notice.hidden = true; summary.hidden = true; list.hidden = true;
   if (controlsRoot !== root) root.hidden = true;
-  root.append(notice, list);
+  root.append(notice, summary, list);
   const ready = () => Boolean(limits) && !persistenceError && entries.every((entry) => entry.state === "ready" && !entry.error && !entry.removing);
   const save = (next = entries) => {
     try {
@@ -279,6 +281,11 @@ export function mountUploads(root, options) {
     if (button.disabled) closeMenu();
     if (persistenceError) notice.textContent = persistenceError;
     notice.hidden = !notice.textContent; list.hidden = entries.length === 0;
+    summary.hidden = entries.length === 0;
+    const total = entries.reduce((sum, entry) => sum + entry.size, 0);
+    const complete = entries.filter((entry) => entry.state === "ready").length;
+    summary.textContent = entries.length === 0 ? "" :
+      `${entries.length} ${entries.length === 1 ? "file" : "files"} · ${fileSize(total)} total${complete < entries.length ? ` · ${complete} of ${entries.length} complete` : ""}`;
     if (controlsRoot !== root) root.hidden = notice.hidden && list.hidden;
     list.replaceChildren();
     for (const entry of entries) {
