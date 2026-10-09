@@ -915,7 +915,7 @@ export function mountConversation(root, options) {
     const uploadControls = document.createElement("span");
     actions.prepend(uploadControls);
     uploads = mountUploads(uploadRoot, {
-      basePath: options.uploadBasePath, dropTarget: form, controlsRoot: uploadControls,
+      basePath: options.uploadBasePath, dropTarget: form, controlsRoot: uploadControls, pasteTarget: textarea,
       storage: options.storage || globalThis.localStorage,
       storageKey: `codex-web:uploads:${options.uploadBasePath}`,
       onChange: ({ready, count}) => { textarea.required = !count; send.disabled = !ready; queueButton.disabled = !ready; },

@@ -175,7 +175,7 @@ async function uploadComposer(t, options = {}) {
   const {mountUploads} = await modules;
   const mount = async () => {
     root = new Element();
-    upload = mountUploads(root, {client, storage, storageKey: 'draft', onChange: (value) => changes.push(value)});
+    upload = mountUploads(root, {client, storage, pasteTarget: root, storageKey: 'draft', onChange: (value) => changes.push(value)});
     await upload.initialized;
   };
   await mount();
@@ -198,6 +198,14 @@ async function uploadComposer(t, options = {}) {
       const event = new Event('drop', {cancelable: true});
       Object.defineProperty(event, 'dataTransfer', {value: {types: ['Files'], files}});
       root.dispatchEvent(event);
+    },
+    destroy: () => upload.destroy(),
+    paste: (files, text = '', html = '') => {
+      const event = new Event('paste', {cancelable: true});
+      Object.defineProperty(event, 'clipboardData', {value: {files,
+        items: files.map(file => ({kind: 'file', getAsFile: () => file})),
+        getData: kind => kind === 'text/plain' ? text : kind === 'text/html' ? html : ''}});
+      root.dispatchEvent(event); return event;
     },
     reload: async () => {upload.destroy(); await mount();},
     choose: (name, file, label = 'Choose file to retry') => {
@@ -500,4 +508,39 @@ test('a lost deletion response blocks submission until the file is reconciled', 
   composer.client.remove = async () => {throw rejected(404);};
   composer.click('input.eml', 'Remove');
   await eventually(() => composer.count() === 0);
+});
+
+
+test('clipboard binaries use upload cards once and native text paste remains uncanceled', async t => {
+  const composer = await uploadComposer(t);
+  assert.equal(composer.paste([], 'ordinary text').defaultPrevented, false);
+  assert.equal(composer.count(), 0);
+  const file = new File([], 'screenshot.png', {type: 'image/png'});
+  assert.equal(composer.paste([file]).defaultPrevented, true);
+  await eventually(() => composer.ready());
+  assert.equal(composer.count(), 1);
+  assert.equal(composer.calls.create.length, 1);
+  assert.equal(composer.card('screenshot.png').children[0].textContent, 'screenshot.png');
+  assert.equal(composer.paste([zeroFile('mixed.pdf')], 'accompanying text').defaultPrevented, false);
+  assert.equal(composer.paste([zeroFile('html.pdf')], '', '<b>text</b>').defaultPrevented, false);
+  assert.equal(composer.count(), 3);
+  composer.lock(true);
+  assert.equal(composer.paste([zeroFile('locked.pdf')]).defaultPrevented, false);
+  assert.equal(composer.count(), 3);
+  composer.lock(false);
+  composer.paste([new File([new Uint8Array(101)], 'too-large.bin')]);
+  assert.equal(composer.count(), 3);
+  assert.match(composer.notice().textContent, /limit/);
+  await eventually(() => composer.ready());
+  const count = composer.calls.create.length;
+  composer.destroy();
+  composer.paste([zeroFile('after-destroy.pdf')]);
+  assert.equal(composer.calls.create.length, count);
+});
+
+test('clipboard file-list fallback preserves multiple file objects', async () => {
+  const {clipboardFiles} = await modules;
+  const files = [zeroFile('one.pdf'), zeroFile('two.zip')];
+  assert.deepEqual(clipboardFiles({items: [], files}), files);
+  assert.deepEqual(clipboardFiles({items: [{kind:'string'}], files: []}), []);
 });

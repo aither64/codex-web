@@ -1,3 +1,10 @@
+// Prefer file items so a clipboard exposing both collections attaches each file once.
+export function clipboardFiles(data) {
+  const items = Array.from(data?.items || []).filter(item => item.kind === "file")
+    .map(item => item.getAsFile()).filter(Boolean);
+  return items.length ? items : Array.from(data?.files || []);
+}
+
 const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function attachmentIDs(value = []) {
@@ -385,6 +392,15 @@ export function mountUploads(root, options) {
   const leave = () => dropTarget.classList.remove("codex-upload-drag");
   const drop = (event) => { if (!event.dataTransfer?.types?.includes("Files")) return; event.preventDefault(); leave(); add(event.dataTransfer.files); };
   dropTarget.addEventListener("dragover", drag); dropTarget.addEventListener("dragleave", leave); dropTarget.addEventListener("drop", drop);
+  const pasteTarget = options.pasteTarget;
+  const paste = event => {
+    const files = clipboardFiles(event.clipboardData);
+    if (!files.length || stopped || locked || !limits) return;
+    // Let the browser paste accompanying text, preserving selection and undo.
+    if (!event.clipboardData.getData("text/plain") && !event.clipboardData.getData("text/html")) event.preventDefault();
+    add(files);
+  };
+  pasteTarget?.addEventListener("paste", paste);
   const initialized = (async () => {
     try {
       const saved = JSON.parse(storage.getItem(key) || "[]");
@@ -415,6 +431,7 @@ export function mountUploads(root, options) {
       closeMenu(); stopped = true; controllers.forEach((controller) => controller.abort());
       globalThis.removeEventListener("resize", positionMenu); globalThis.removeEventListener("scroll", positionMenu, true);
       dropTarget.removeEventListener("dragover", drag); dropTarget.removeEventListener("dragleave", leave); dropTarget.removeEventListener("drop", drop);
+      pasteTarget?.removeEventListener("paste", paste);
       controls.remove(); root.replaceChildren(); root.hidden = initiallyHidden;
     },
   };

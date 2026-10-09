@@ -495,6 +495,12 @@ remain in the total until removed. A file awaiting removal stays selected; a
 failed removal does not undo its completed upload. The summary is separate from
 errors and does not change submission readiness. It disappears with an empty
 selection. Submitted files are cleared from the composer without deleting them.
+Pass `options.pasteTarget` to attach clipboard Files from a textarea's paste
+event. File items take precedence over the clipboard file list, so browsers that
+expose both attach each file once. Plain text and HTML retain native paste
+behavior, including mixed text/file pastes. Clipboard text, URLs and paths do
+not become files. Pasted files follow the same limits, upload retry and readiness
+checks as selected or dropped files.
 Pass `options.controlsRoot` to put its + attachment menu beside your form actions;
 omit it to keep everything in `root`. A separate empty card root is hidden.
 `destroy()` removes the component's controls and listeners while preserving
