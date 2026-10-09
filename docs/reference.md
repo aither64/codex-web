@@ -134,9 +134,19 @@ backed by `PromptResponder` must supply tokens; older browser requests receive
 snapshot and named `RateLimitsByLimitID` buckets, with nullable windows,
 durations and reset times. Match `WindowDurationMins` to identify a window;
 primary and secondary positions can represent different durations. `ResetsAt`
-is Unix time in seconds. The result omits account identity, plan and credit
-details. Applications authorize and expose this account-level read separately
-from the conversation handler.
+is Unix time in seconds. Optional `AccountID`, bucket `Credits` and account-level
+`ResetCredits` preserve unreported values. `AvailableCount` is authoritative;
+`Credits` may be null or contain only some reset details. Applications authorize
+and expose this account-level read separately from the conversation handler.
+
+`Client.ConsumeRateLimitResetCredit(ctx, idempotencyKey, creditID)` redeems one
+banked reset through `account/rateLimitResetCredit/consume`. Pass a nonempty,
+unique key for one confirmed user action and retain it across uncertain retries.
+An empty credit ID asks Codex to choose the next available reset. The method
+accepts the outcomes `reset`, `alreadyRedeemed`, `nothingToReset` and `noCredit`;
+unknown outcomes fail. Account reads never call this method. Embedding
+applications own confirmation, account binding, durable retry records and an
+explicit mutation route. The conversation `Client` interface is unchanged.
 
 `github.com/aither64/codex-web/conversation` exposes those operations through
 an `http.Handler`. The application supplies a resolver that maps its opaque

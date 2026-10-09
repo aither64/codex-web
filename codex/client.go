@@ -513,16 +513,44 @@ type CollaborationMode struct {
 }
 
 // AccountRateLimits contains the legacy allowance and any named allowance buckets.
-// Account identity, plan and credit details are intentionally not included.
+// Optional account and credit fields remain absent when the backend cannot report them.
 type AccountRateLimits struct {
 	RateLimits          RateLimitSnapshot            `json:"rateLimits"`
 	RateLimitsByLimitID map[string]RateLimitSnapshot `json:"rateLimitsByLimitId"`
+	AccountID           *string                      `json:"accountId,omitempty"`
+	ResetCredits        *RateLimitResetCredits       `json:"rateLimitResetCredits,omitempty"`
 }
 
 type RateLimitSnapshot struct {
 	LimitID   string           `json:"limitId"`
 	Primary   *RateLimitWindow `json:"primary"`
 	Secondary *RateLimitWindow `json:"secondary"`
+	Credits   *CreditsSnapshot `json:"credits,omitempty"`
+}
+
+type CreditsSnapshot struct {
+	HasCredits bool    `json:"hasCredits"`
+	Unlimited  bool    `json:"unlimited"`
+	Balance    *string `json:"balance"`
+}
+
+type RateLimitResetCredits struct {
+	AvailableCount int64                  `json:"availableCount"`
+	Credits        []RateLimitResetCredit `json:"credits"`
+}
+
+type RateLimitResetCredit struct {
+	ID          string  `json:"id"`
+	ResetType   string  `json:"resetType"`
+	Status      string  `json:"status"`
+	GrantedAt   int64   `json:"grantedAt"`
+	ExpiresAt   *int64  `json:"expiresAt"`
+	Title       *string `json:"title"`
+	Description *string `json:"description"`
+}
+
+type ResetCreditResult struct {
+	Outcome string `json:"outcome"`
 }
 
 // RateLimitWindow describes usage over a reported duration. Primary and
@@ -3359,6 +3387,29 @@ func (c *Client) ReadAccountRateLimits(ctx context.Context) (AccountRateLimits, 
 	var limits AccountRateLimits
 	err := c.Request(ctx, "account/rateLimits/read", nil, &limits)
 	return limits, err
+}
+
+// ConsumeRateLimitResetCredit redeems one reset. Reuse the key for every retry
+// of the same logical attempt; an empty creditID lets the backend select a credit.
+// Applications must authorize this account-level mutation independently.
+func (c *Client) ConsumeRateLimitResetCredit(ctx context.Context, key, creditID string) (ResetCreditResult, error) {
+	var result ResetCreditResult
+	if strings.TrimSpace(key) == "" {
+		return result, errors.New("reset idempotency key is required")
+	}
+	params := map[string]string{"idempotencyKey": key}
+	if creditID != "" {
+		params["creditId"] = creditID
+	}
+	err := c.Request(ctx, "account/rateLimitResetCredit/consume", params, &result)
+	if err == nil {
+		switch result.Outcome {
+		case "reset", "alreadyRedeemed", "nothingToReset", "noCredit":
+		default:
+			err = errors.New("unknown reset-credit outcome")
+		}
+	}
+	return result, err
 }
 
 func (c *Client) ListCollaborationModes(ctx context.Context) ([]CollaborationMode, error) {

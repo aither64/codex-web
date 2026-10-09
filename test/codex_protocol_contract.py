@@ -127,6 +127,7 @@ client_requests = [
     ),
     request("collaborationMode/list", {}),
     request("account/rateLimits/read", None),
+    request("account/rateLimitResetCredit/consume", {"idempotencyKey": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "creditId": "reset-credit-1"}),
     request(
         "thread/settings/update",
         {
@@ -363,7 +364,13 @@ rate_limits = {
         "model-specific": {"primary": {"usedPercent": 1}},
     },
 }
+rate_limits["accountId"] = "fixture-account"
+rate_limits["rateLimitResetCredits"] = {"availableCount": 3, "credits": [{"id": "reset-credit-1", "resetType": "codexRateLimits", "status": "available", "grantedAt": 1789730400, "expiresAt": None, "title": None, "description": None}]}
+rate_limits["rateLimitsByLimitId"]["codex"]["credits"] = {"hasCredits": True, "unlimited": False, "balance": "12.50"}
 validate("v2/GetAccountRateLimitsResponse.json", rate_limits, "account rate limits result")
+for outcome in ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"]:
+    validate("v2/ConsumeAccountRateLimitResetCreditResponse.json", {"outcome": outcome}, "reset-credit result")
+validate("v2/ConsumeAccountRateLimitResetCreditParams.json", {"idempotencyKey": "fixture-next"}, "next reset-credit request")
 validate(
     "v2/GetAccountRateLimitsResponse.json",
     {"rateLimits": {"primary": None, "secondary": None}, "rateLimitsByLimitId": None},

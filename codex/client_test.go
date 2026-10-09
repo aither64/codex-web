@@ -92,8 +92,8 @@ func TestReadAccountRateLimits(t *testing.T) {
 					t.Fatalf("other snapshot = %#v", other)
 				}
 				encoded, err := json.Marshal(limits)
-				if err != nil || strings.Contains(string(encoded), "accountId") ||
-					strings.Contains(string(encoded), "rateLimitResetCredits") {
+				if err != nil || limits.AccountID == nil || *limits.AccountID != "not-exposed" ||
+					limits.ResetCredits == nil || limits.ResetCredits.AvailableCount != 5 {
 					t.Fatalf("public result = %s, %v", encoded, err)
 				}
 			},
