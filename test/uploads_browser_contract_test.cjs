@@ -122,7 +122,7 @@ test('upload controls can share an action row without owning adjacent actions', 
 // Exercise the shipped component through picker/drop/click events and its durable
 // selection, rather than reproducing the upload state machine in the test.
 async function uploadComposer(t, options = {}) {
-  let root, upload;
+  let root, upload, storageKey = 'draft';
   t.after(() => upload?.destroy());
   class Element extends EventTarget {
     children = []; classList = {add() {}, remove() {}}; attributes = new Map(); style = {};
@@ -148,7 +148,7 @@ async function uploadComposer(t, options = {}) {
   const values = new Map([['draft', JSON.stringify(options.saved || [])]]);
   const files = new Map((options.files || []).map((file) => [file.id, {...file}]));
   const identities = new Map();
-  const calls = {create: [], remove: []};
+  const calls = {create: [], remove: [], append: []};
   const changes = [];
   let failWrites = false;
   const storage = {
@@ -158,7 +158,7 @@ async function uploadComposer(t, options = {}) {
   const client = {
     list: async () => ({limits: options.limits || limits, files: [...files.values()]}),
     create: async (file, clientId) => {
-      calls.create.push({name: file.name, size: file.size, clientId});
+      calls.create.push({name: file.name, size: file.size, clientId, type: file.file?.type, lastModified: file.file?.lastModified});
       if (options.create) return options.create(file, clientId);
       let record = identities.get(clientId);
       if (!record) {
@@ -168,6 +168,15 @@ async function uploadComposer(t, options = {}) {
       return {...record};
     },
     status: async (id) => ({...files.get(id)}),
+    append: async (id, offset, checksum, chunk) => {
+      const record = files.get(id);
+      assert.equal(offset, record.offset);
+      const bytes = Buffer.from(await chunk.arrayBuffer());
+      assert.equal(hash(bytes), checksum);
+      calls.append.push({id, bytes});
+      record.offset += chunk.size; record.checksums.push(checksum);
+      return {...record};
+    },
     complete: async (id) => {files.get(id).state = 'ready'; return {...files.get(id)};},
     remove: async (id) => {calls.remove.push(id); if (options.remove) return options.remove(id); files.delete(id);},
     ...options.client,
@@ -175,7 +184,7 @@ async function uploadComposer(t, options = {}) {
   const {mountUploads} = await modules;
   const mount = async () => {
     root = new Element();
-    upload = mountUploads(root, {client, storage, pasteTarget: root, storageKey: 'draft', onChange: (value) => changes.push(value)});
+    upload = mountUploads(root, {client, storage, pasteTarget: root, storageKey, onChange: (value) => changes.push(value)});
     await upload.initialized;
   };
   await mount();
@@ -187,17 +196,20 @@ async function uploadComposer(t, options = {}) {
     button.dispatchEvent(new Event('click'));
   };
   return {
-    client, calls, files, changes, card, click, cards,
+    client, calls, files, changes, card, click, cards, storage,
     summary: () => root.children.find((child) => child.className === 'codex-upload-summary'),
     notice: () => root.children.find((child) => child.className === 'codex-upload-notice'),
     lock: (value) => upload.lock(value), clear: () => upload.clear(),
-    saved: () => JSON.parse(values.get('draft')),
+    saved: () => JSON.parse(values.get(storageKey)),
     ready: () => upload.ready(), count: () => upload.count(), ids: () => upload.ids(),
     failWrites: (value) => {failWrites = value;},
     add: (...files) => {
       const event = new Event('drop', {cancelable: true});
       Object.defineProperty(event, 'dataTransfer', {value: {types: ['Files'], files}});
       root.dispatchEvent(event);
+    },
+    pick: (...files) => {
+      const picker = root.children[0].children[1]; picker.files = files; picker.dispatchEvent(new Event('change'));
     },
     destroy: () => upload.destroy(),
     paste: (files, text = '', html = '') => {
@@ -207,7 +219,7 @@ async function uploadComposer(t, options = {}) {
         getData: kind => kind === 'text/plain' ? text : kind === 'text/html' ? html : ''}});
       root.dispatchEvent(event); return event;
     },
-    reload: async () => {upload.destroy(); await mount();},
+    reload: async (key = storageKey) => {upload.destroy(); storageKey = key; await mount();},
     choose: (name, file, label = 'Choose file to retry') => {
       click(name, label);
       const picker = root.children[0].children[1]; picker.files = [file]; picker.dispatchEvent(new Event('change'));
@@ -520,7 +532,7 @@ test('clipboard binaries use upload cards once and native text paste remains unc
   await eventually(() => composer.ready());
   assert.equal(composer.count(), 1);
   assert.equal(composer.calls.create.length, 1);
-  assert.equal(composer.card('screenshot.png').children[0].textContent, 'screenshot.png');
+  assert.equal(composer.card('screenshot-1.png').children[0].textContent, 'screenshot-1.png');
   assert.equal(composer.paste([zeroFile('mixed.pdf')], 'accompanying text').defaultPrevented, false);
   assert.equal(composer.paste([zeroFile('html.pdf')], '', '<b>text</b>').defaultPrevented, false);
   assert.equal(composer.count(), 3);
@@ -543,4 +555,107 @@ test('clipboard file-list fallback preserves multiple file objects', async () =>
   const files = [zeroFile('one.pdf'), zeroFile('two.zip')];
   assert.deepEqual(clipboardFiles({items: [], files}), files);
   assert.deepEqual(clipboardFiles({items: [{kind:'string'}], files: []}), []);
+});
+
+test('repeated and batched clipboard names retain distinct bytes and file metadata', async t => {
+  const composer = await uploadComposer(t);
+  composer.paste([new File(['first'], 'image.png', {type: 'image/png', lastModified: 123})]);
+  composer.paste([new File(['second'], 'image.png'), new File(['third'], 'image.png')]);
+  await eventually(() => composer.ready());
+  assert.deepEqual(composer.saved().map(file => file.name), ['image-1.png', 'image-2.png', 'image-3.png']);
+  assert.deepEqual(composer.saved().map(file => file.sourceName), ['image.png', 'image.png', 'image.png']);
+  assert.equal(composer.calls.create[0].type, 'image/png');
+  assert.equal(composer.calls.create[0].lastModified, 123);
+  for (const [index, file] of composer.saved().entries()) {
+    const bytes = Buffer.concat(composer.calls.append.filter(chunk => chunk.id === file.id).map(chunk => chunk.bytes));
+    assert.equal(bytes.toString(), ['first', 'second', 'third'][index]);
+  }
+});
+
+test('clipboard counters survive submission, removal and reload but a new scope starts fresh', async t => {
+  const composer = await uploadComposer(t);
+  composer.paste([zeroFile('image.png')]);
+  await eventually(() => composer.ready());
+  composer.clear(); // Sending clears selection, preserving the server file.
+  await composer.reload();
+  composer.paste([zeroFile('image.png')]);
+  await eventually(() => composer.ready());
+  assert.equal(composer.saved()[0].name, 'image-2.png');
+  composer.click('image-2.png', 'Remove');
+  await eventually(() => composer.count() === 0);
+  composer.files.clear(); // Retained numbering also survives catalogue expiry.
+  await composer.reload();
+  composer.paste([zeroFile('image.png')]);
+  await eventually(() => composer.ready());
+  assert.equal(composer.saved()[0].name, 'image-3.png');
+  composer.files.clear();
+  await composer.reload('new-session');
+  composer.paste([zeroFile('image.png')]);
+  await eventually(() => composer.ready());
+  assert.equal(composer.saved()[0].name, 'image-1.png');
+});
+
+test('catalogue names seed numbering without browser counters and picker/drop names stay unchanged', async t => {
+  const composer = await uploadComposer(t, {files: [{id, name: 'image-9.png', size: 0, state: 'ready'}]});
+  composer.add(zeroFile('image-11.png'));
+  composer.pick(zeroFile('picked.png'));
+  await eventually(() => composer.ready());
+  composer.paste([zeroFile('image.png'), zeroFile('report.pdf'), zeroFile('report.pdf')]);
+  await eventually(() => composer.ready());
+  assert.deepEqual(composer.saved().map(file => file.name), ['image-11.png', 'picked.png', 'image-12.png', 'report-1.pdf', 'report-2.pdf']);
+  assert.equal(composer.saved()[0].sourceName, undefined);
+  assert.equal(composer.saved()[1].sourceName, undefined);
+  composer.clear();
+  composer.storage.setItem('draft.clipboard-numbers', '[]');
+  await composer.reload(); // Creation adoption / another browser only has catalogue names.
+  composer.paste([zeroFile('image.png')]);
+  await eventually(() => composer.ready());
+  assert.equal(composer.saved()[0].name, 'image-13.png');
+});
+
+test('numbered recovery accepts the original name without changing identity or skipping prefix checks', async t => {
+  const record = {id, clientId: id, name: 'image-4.png', sourceName: 'image.png', size: 8,
+    state: 'uploading', offset: 4, checksums: [hash('abcd')], creation: 'created'};
+  const composer = await uploadComposer(t, {saved: [record], files: [record]});
+  composer.choose('image-4.png', new File(['xxxxefgh'], 'image.png'), 'Choose file to resume');
+  await eventually(() => composer.saved()[0]?.error?.includes('differs'));
+  assert.equal(composer.calls.append.length, 0);
+  await composer.reload();
+  composer.choose('image-4.png', new File(['abcdefgh'], 'wrong.png'), 'Choose file to resume');
+  await eventually(() => composer.saved()[0]?.error?.includes('same file'));
+  await composer.reload();
+  composer.choose('image-4.png', new File(['abcdefgh'], 'image.png'), 'Choose file to resume');
+  await eventually(() => composer.ready());
+  assert.equal(composer.saved()[0].name, 'image-4.png');
+  assert.equal(composer.saved()[0].clientId, id);
+  assert.deepEqual(composer.ids(), [id]);
+  assert.equal(composer.calls.create.length, 0);
+  assert.equal(Buffer.concat(composer.calls.append.map(chunk => chunk.bytes)).toString(), 'efgh');
+});
+
+test('clipboard numbering handles Unicode, long stems, extensionless names and dotfiles', async t => {
+  const composer = await uploadComposer(t);
+  composer.paste(['český.png', 'archive.tar.gz', 'README', '.env', 'image-1.png', '😀'.repeat(70) + '.png']
+    .map(name => zeroFile(name)));
+  await eventually(() => composer.ready());
+  const names = composer.saved().map(file => file.name);
+  assert.deepEqual(names.slice(0, 5), ['český-1.png', 'archive.tar-1.gz', 'README-1', '.env-1', 'image-1-1.png']);
+  assert.equal(names[5], '😀'.repeat(62) + '-1.png');
+  assert.ok(Buffer.byteLength(names[5]) <= 255);
+});
+
+test('numbering storage failures prevent upload creation and submission', async t => {
+  const composer = await uploadComposer(t);
+  composer.failWrites(true);
+  composer.paste([zeroFile('image.png')]);
+  assert.equal(composer.ready(), false);
+  assert.equal(composer.calls.create.length, 0);
+  assert.match(composer.notice().textContent, /Storage write failed/);
+  composer.failWrites(false);
+  composer.click('image-1.png', 'Retry');
+  await eventually(() => composer.ready());
+  await composer.reload();
+  composer.paste([zeroFile('image.png')]);
+  await eventually(() => composer.ready());
+  assert.deepEqual(composer.saved().map(file => file.name), ['image-1.png', 'image-2.png']);
 });

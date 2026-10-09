@@ -5,6 +5,27 @@ export function clipboardFiles(data) {
   return items.length ? items : Array.from(data?.files || []);
 }
 
+function clipboardName(sourceName, number) {
+  const dot = sourceName.lastIndexOf(".");
+  const extension = dot > 0 ? sourceName.slice(dot) : "";
+  const originalStem = dot > 0 ? sourceName.slice(0, dot) : sourceName;
+  const suffix = `-${number}${extension}`;
+  const encoder = new TextEncoder();
+  const available = 255 - encoder.encode(suffix).length;
+  if (available < 1) throw new Error("Filename is too long to number; shorten it and paste the file again");
+  let stem = "", bytes = 0;
+  for (const character of originalStem || "file") {
+    bytes += encoder.encode(character).length;
+    if (bytes > available) break;
+    stem += character;
+  }
+  return stem + suffix;
+}
+
+function renamedFile(file, name) {
+  return new File([file], name, {type: file.type, lastModified: file.lastModified});
+}
+
 const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function attachmentIDs(value = []) {
@@ -175,6 +196,10 @@ export function renderAttachments(files, options = {}) {
 export function mountUploads(root, options) {
   const storage = options.storage || globalThis.localStorage;
   const key = options.storageKey;
+  const numberKey = `${key}.clipboard-numbers`;
+  let clipboardNumbers = new Map();
+  let numbersChanged = false;
+  const reservedNames = new Set();
   const client = options.client || createUploadClient(options.basePath);
   let entries = [];
   let limits;
@@ -254,6 +279,12 @@ export function mountUploads(root, options) {
   const ready = () => Boolean(limits) && !persistenceError && entries.every((entry) => entry.state === "ready" && !entry.error && !entry.removing);
   const save = (next = entries) => {
     try {
+      if (numbersChanged) {
+        const value = JSON.stringify([...clipboardNumbers]);
+        storage.setItem(numberKey, value);
+        if (storage.getItem(numberKey) !== value) throw new Error("Browser storage could not retain clipboard numbering");
+        numbersChanged = false;
+      }
       const value = JSON.stringify(next.map(({file, progress, running, removing, task, ...entry}) => entry));
       storage.setItem(key, value);
       if (storage.getItem(key) !== value) throw new Error("Browser storage could not retain the attachment draft");
@@ -368,22 +399,53 @@ export function mountUploads(root, options) {
     }
     render();
   };
-  const add = (files) => {
+  const numberedFile = (file) => {
+    let number = clipboardNumbers.get(file.name) || 0;
+    // Include submitted files and names created by another composer, even when
+    // this browser has no sequence yet. Comparing generated names also covers
+    // stems shortened to leave room for the numeric suffix.
+    for (const name of reservedNames) {
+      const match = name.match(/-([1-9][0-9]*)(?:\.[^.]*)?$/);
+      if (!match) continue;
+      const candidate = Number(match[1]);
+      if (Number.isSafeInteger(candidate) && candidate > number && clipboardName(file.name, candidate) === name) number = candidate;
+    }
+    let name;
+    do {
+      number += 1;
+      if (!Number.isSafeInteger(number)) throw new Error("Clipboard filename sequence is exhausted");
+      name = clipboardName(file.name, number);
+    } while (reservedNames.has(name));
+    clipboardNumbers.set(file.name, number); numbersChanged = true;
+    return renamedFile(file, name);
+  };
+  const add = (files, pasted = false) => {
     if (locked || !limits) return;
     notice.textContent = "";
     let total = entries.reduce((sum, entry) => sum + entry.size, 0);
-    for (const file of files) {
+    for (let file of files) {
       if (file.size > limits.fileBytes || entries.length >= limits.files || total + file.size > limits.promptBytes) {
         notice.textContent = `${file.name} exceeds the file or prompt upload limit.`; continue;
       }
-      entries.push({clientId: crypto.randomUUID(), name: file.name, size: file.size, state: "uploading", creation: "new", file});
+      const sourceName = file.name;
+      if (pasted) {
+        try { file = numberedFile(file); }
+        catch (error) { notice.textContent = error.message; continue; }
+      }
+      reservedNames.add(file.name);
+      entries.push({clientId: crypto.randomUUID(), name: file.name, size: file.size, state: "uploading", creation: "new", file,
+        ...(pasted ? {sourceName} : {})});
       total += file.size;
     }
     try { save(); pump(); } catch (error) { notice.textContent = error.message; render(); }
   };
   attach.addEventListener("click", () => { closeMenu(true); resumeEntry = null; picker.multiple = true; picker.click(); });
   picker.addEventListener("change", () => {
-    if (resumeEntry && entries.includes(resumeEntry) && picker.files[0]) { resumeEntry.file = picker.files[0]; resumeEntry.error = null; resumeEntry = null; pump(); }
+    if (resumeEntry && entries.includes(resumeEntry) && picker.files[0]) {
+      const file = picker.files[0];
+      resumeEntry.file = file.name === resumeEntry.sourceName ? renamedFile(file, resumeEntry.name) : file;
+      resumeEntry.error = null; resumeEntry = null; pump();
+    }
     else add(picker.files);
     picker.value = "";
   });
@@ -398,7 +460,7 @@ export function mountUploads(root, options) {
     if (!files.length || stopped || locked || !limits) return;
     // Let the browser paste accompanying text, preserving selection and undo.
     if (!event.clipboardData.getData("text/plain") && !event.clipboardData.getData("text/html")) event.preventDefault();
-    add(files);
+    add(files, true);
   };
   pasteTarget?.addEventListener("paste", paste);
   const initialized = (async () => {
@@ -406,7 +468,12 @@ export function mountUploads(root, options) {
       const saved = JSON.parse(storage.getItem(key) || "[]");
       if (!Array.isArray(saved) || saved.length > 100 || saved.some((entry) => !idPattern.test(entry.clientId))) throw new Error("Stored attachment draft is invalid");
       entries = saved;
+      const numbers = JSON.parse(storage.getItem(numberKey) || "[]");
+      if (!Array.isArray(numbers) || numbers.some(pair => !Array.isArray(pair) || pair.length !== 2 ||
+          typeof pair[0] !== "string" || !Number.isSafeInteger(pair[1]) || pair[1] < 1)) throw new Error("Stored clipboard numbering is invalid");
+      clipboardNumbers = new Map(numbers);
       const snapshot = await client.list(); limits = snapshot.limits;
+      for (const file of [...entries, ...snapshot.files]) reservedNames.add(file.name);
       const available = new Map(snapshot.files.map((file) => [file.id, file]));
       for (const entry of entries) {
         if (entry.id && available.has(entry.id)) {

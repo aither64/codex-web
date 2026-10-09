@@ -1,5 +1,5 @@
-import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=5";
-export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=5";
+import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=6";
+export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=6";
 import {createConversationSync, renderConnectionStatus} from "./sync.js?v=2";
 export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=2";
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";

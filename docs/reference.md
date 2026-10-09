@@ -518,6 +518,16 @@ expose both attach each file once. Plain text and HTML retain native paste
 behavior, including mixed text/file pastes. Clipboard text, URLs and paths do
 not become files. Pasted files follow the same limits, upload retry and readiness
 checks as selected or dropped files.
+Pasted names are numbered from one before the last extension, for example
+`image-1.png` and `image-2.png`. Extensionless names and dotfiles append the number.
+Each original name has its own sequence under `storageKey`; counters survive
+submission, removal and reload, and existing catalogue names seed the sequence.
+Generated stems are shortened at Unicode boundaries to fit 255 UTF-8 bytes.
+Selected and dropped names are preserved. Reselect the original file to resume
+a numbered upload; its assigned name and upload identity stay the same.
+The existing draft array retains optional `sourceName` metadata, and counters
+use a separate `.clipboard-numbers` key in the same storage. Older bundles can
+read these drafts, but require the file's assigned name when resuming a transfer.
 Pass `options.controlsRoot` to put its + attachment menu beside your form actions;
 omit it to keep everything in `root`. A separate empty card root is hidden.
 `destroy()` removes the component's controls and listeners while preserving
