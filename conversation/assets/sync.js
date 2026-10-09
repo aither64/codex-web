@@ -1,9 +1,12 @@
+import {refreshPolicy} from "./refresh.js?v=1";
+
 // Stream notifications are hints. A bounded snapshot read establishes freshness.
 // All timers and browser event sources can be supplied by an embedding/test host.
 export function createConversationSync(options) {
   if (typeof options?.read !== "function" || typeof options?.apply !== "function") {
     throw new TypeError("conversation read and apply callbacks are required");
   }
+  const policy = {...refreshPolicy, ...options.policy};
   const browser = options.window || globalThis;
   const page = options.document || globalThis.document;
   const EventSourceClass = options.EventSource === undefined ? globalThis.EventSource : options.EventSource;
@@ -34,9 +37,9 @@ export function createConversationSync(options) {
     } else if (recoverySince === null) {
       recoverySince = now();
     }
-    const showWarning = accessDenied || (recoverySince !== null && now() - recoverySince >= 10_000);
+    const showWarning = accessDenied || (recoverySince !== null && now() - recoverySince >= policy.warningMs);
     if (!showWarning && recoverySince !== null && warningTimer === null) {
-      warningTimer = later(() => { warningTimer = null; publish(); }, Math.max(0, 10_000 - (now() - recoverySince)));
+      warningTimer = later(() => { warningTimer = null; publish(); }, Math.max(0, policy.warningMs - (now() - recoverySince)));
     }
     const state = {status, showWarning, lastSuccessAt, error: readError?.message || "", httpStatus: readError?.status || null};
     const signature = JSON.stringify(state);
@@ -60,7 +63,7 @@ export function createConversationSync(options) {
   const clearRefresh = () => { clear(refreshTimer); refreshTimer = null; };
   const scheduleRetry = () => {
     if (destroyed || suspended || !live || retryTimer !== null) return;
-    const delay = Math.min(30_000, 1000 * 2 ** Math.min(retryAttempt++, 5));
+    const delay = Math.min(policy.retryMaxMs, 1000 * 2 ** Math.min(retryAttempt++, 5));
     retryTimer = later(() => {
       retryTimer = null;
       if (hidden()) return;
@@ -69,7 +72,7 @@ export function createConversationSync(options) {
     }, Math.round(delay * (0.8 + random() * 0.2)));
   };
 
-  function scheduleRefresh(delay = 200) {
+  function scheduleRefresh(delay = policy.eventDebounceMs) {
     if (destroyed || suspended) return;
     dirty = true;
     if (readError && retryTimer !== null) return;
@@ -96,7 +99,7 @@ export function createConversationSync(options) {
     signal.addEventListener("abort", onAbort, {once: true});
     const deadline = later(() => {
       cycle.abort.abort(new Error("Conversation refresh timed out"));
-    }, 35_000);
+    }, policy.transcriptDeadlineMs);
     cycle.promise = (async () => {
       try {
         const value = await Promise.race([Promise.resolve().then(() => options.read(signal)), aborted]);
@@ -159,7 +162,7 @@ export function createConversationSync(options) {
       if (!current()) return;
       try {
         const interval = JSON.parse(event.data).heartbeatIntervalMs;
-        if (Number.isSafeInteger(interval) && interval > 0) heartbeatDeadline = interval * 2 + 5000;
+        if (Number.isSafeInteger(interval) && interval > 0) heartbeatDeadline = interval * 2 + policy.heartbeatGraceMs;
       } catch (_) {}
       lastTraffic = now();
     });
@@ -182,10 +185,12 @@ export function createConversationSync(options) {
   }
 
   const recover = (force = true) => {
-    if (destroyed || suspended || hidden() || now() - lastRecovery < 250) return;
+    if (destroyed || suspended || hidden() || now() - lastRecovery < policy.resumeDebounceMs) return;
     lastRecovery = now(); lastWatch = now();
     clear(retryTimer); retryTimer = null;
-    const stale = now() - lastTraffic > (heartbeatDeadline ?? 45_000);
+    const stale = now() - lastTraffic > (heartbeatDeadline ?? policy.stalledMs);
+    if (!force && streamOpen && !stale && !needsSync && !dirty && !readError &&
+        lastSuccessAt !== null && now() - lastSuccessAt < policy.transcriptMs) return;
     if (force || !streamOpen || stale) {
       cancelRead();
       closeStream();
@@ -200,17 +205,17 @@ export function createConversationSync(options) {
     if (destroyed || suspended) return;
     const at = now();
     if (!hidden()) {
-      if (at - lastWatch > 45_000) recover();
-      else if (streaming && source && at - lastTraffic > (heartbeatDeadline ?? 45_000) && (heartbeatDeadline !== null || !streamOpen)) {
+      if (at - lastWatch > policy.stalledMs) recover();
+      else if (streaming && source && at - lastTraffic > (heartbeatDeadline ?? policy.stalledMs) && (heartbeatDeadline !== null || !streamOpen)) {
         closeStream(); streamFailed = true; needsSync = true;
         publish(); scheduleRetry(); scheduleRefresh(0);
       }
-      if (lastSuccessAt === null || at - lastSuccessAt >= 60_000) {
+      if (lastSuccessAt === null || at - lastSuccessAt >= policy.transcriptMs) {
         if (!active && retryTimer === null) scheduleRefresh(0);
       }
     }
     lastWatch = at;
-    watchTimer = later(watch, 5000);
+    watchTimer = later(watch, policy.watchMs);
   };
   const visibility = () => { if (!hidden()) recover(false); else publish(); };
   const focus = () => recover(false);
@@ -232,14 +237,14 @@ export function createConversationSync(options) {
     suspended = false;
     lastRecovery = -Infinity;
     recover();
-    if (live && watchTimer === null) watchTimer = later(watch, 5000);
+    if (live && watchTimer === null) watchTimer = later(watch, policy.watchMs);
   };
   const listeners = [[page, "visibilitychange", visibility], [browser, "focus", focus],
     [browser, "online", online], [browser, "offline", offline],
     [browser, "pagehide", pagehide], [browser, "pageshow", pageshow]];
   for (const [target, name, callback] of listeners) target?.addEventListener?.(name, callback);
   publish(); connect(); scheduleRefresh(0);
-  if (live) watchTimer = later(watch, 5000);
+  if (live) watchTimer = later(watch, policy.watchMs);
   return {
     refresh, scheduleRefresh, retry: recover,
     destroy() {

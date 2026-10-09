@@ -1,7 +1,9 @@
-import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=4";
-export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=4";
-import {createConversationSync, renderConnectionStatus} from "./sync.js?v=1";
-export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=1";
+import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=5";
+export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=5";
+import {createConversationSync, renderConnectionStatus} from "./sync.js?v=2";
+export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=2";
+import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
+export {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 
 const defaultLabels = {
   send: "Send",
@@ -320,7 +322,8 @@ export async function readTranscriptPage(client, {signal, cursor, legacy = false
   return {...page, legacy: false};
 }
 
-export function createTranscriptHistory() {
+export function createTranscriptHistory(options = {}) {
+  const policy = {...refreshPolicy, ...options.policy};
   let threadId = "", rows = [], initialized = false, legacy = false;
   let olderCursor = null, hasOlder = false, gapCursor = null, gapStart = -1;
   let repairCursor = null, repairTarget = "", lastActiveRepair = -Infinity, cursorReset = false;
@@ -453,7 +456,7 @@ export function createTranscriptHistory() {
       hasOlder = Boolean(page.hasOlder);
     }
     initialized = true;
-    if (!legacy && gapStart < 0 && page.olderCursor && now - lastActiveRepair >= 30_000) {
+    if (!legacy && gapStart < 0 && page.olderCursor && now - lastActiveRepair >= policy.historyRepairMs) {
       const newest = new Set(incoming.map((row) => row.key));
       const active = rows.find((row) => row.entry.turnStatus &&
         !["completed", "failed", "interrupted", "error"].includes(row.entry.turnStatus) && !newest.has(row.key));
@@ -893,16 +896,31 @@ export function mountConversation(root, options) {
   if (capabilities.interrupt) actions.append(interrupt);
   const form = createElement("form", {class: "codex-conversation-form"});
   form.append(textarea, actions);
-  const settingsForm = createElement("form", {class: "codex-conversation-settings"});
+  const policy = {...refreshPolicy, ...options?.refreshPolicy};
+  const settingsBar = createElement("div", {class: "codex-conversation-settings"});
+  const settingsSummary = createElement("span", {}, "Settings unavailable");
+  const editSettings = createElement("button", {type: "button"}, "Edit");
+  editSettings.disabled = true;
+  const settingsDialog = createElement("dialog", {class: "codex-settings-dialog", "aria-label": "Codex settings"});
+  const settingsForm = createElement("form");
+  const closeSettings = createElement("button", {type: "button", "aria-label": "Close settings"}, "Close");
+  const settingsError = createElement("p", {role: "status"});
+  let settingsSaving = false, confirmedModel = "", confirmedEffort = "", settingsGeneration = 0;
+  settingsBar.append(settingsSummary, editSettings);
   const model = createElement("select", {"aria-label": "Model"});
   const effort = createElement("select", {"aria-label": "Reasoning effort"});
   const mode = createElement("select", {"aria-label": "Collaboration mode"});
   mode.disabled = true;
   const modeStatus = createElement("span", {role: "status"}, "Checking mode…");
   const saveSettings = createElement("button", {type: "submit"}, "Save settings");
-  settingsForm.append(model, effort, mode, modeStatus, saveSettings);
+  const settingField = (title, select) => {
+    const label = createElement("label", {}, title); label.append(select); return label;
+  };
+  settingsForm.append(settingField("Model", model), settingField("Reasoning effort", effort),
+    settingField("Collaboration mode", mode), modeStatus, settingsError, saveSettings, closeSettings);
+  settingsDialog.append(settingsForm);
   const children = [status, connectionStatus];
-  if (capabilities.settings) children.push(settingsForm);
+  if (capabilities.settings) children.push(settingsBar, settingsDialog);
   children.push(historyControls, transcript);
   if (capabilities.pending) children.push(pendingStatus, prompts);
   if (capabilities.queueRead) children.push(queueStatus, queue);
@@ -934,24 +952,43 @@ export function mountConversation(root, options) {
     effort.value = selectedEffort || selected?.defaultReasoningEffort || "";
   };
   const applyThreadSettings = () => {
-    if (!capabilities.settings || !currentThread || modelCatalog.length === 0) return;
-    if (modelCatalog.some((entry) => entry.model === currentThread.model)) {
-      model.value = currentThread.model;
+    if (!capabilities.settings || !currentThread) return;
+    if ((currentThread.settingsGeneration ?? settingsGeneration) >= settingsGeneration &&
+        currentThread.model && currentThread.reasoningEffort) {
+      confirmedModel = currentThread.model; confirmedEffort = currentThread.reasoningEffort;
     }
-    populateEfforts(currentThread.reasoningEffort || "");
-    mode.value = currentThread.collaborationMode || "";
+    settingsSummary.textContent = [confirmedModel, confirmedEffort].filter(Boolean).join(" · ") || "Settings unavailable";
+    editSettings.disabled = currentThread.status !== "idle" || settingsSaving;
+    saveSettings.disabled = currentThread.status !== "idle" || settingsSaving || !modelCatalog.length;
     mode.disabled = !currentThread.collaborationMode;
     modeStatus.hidden = !mode.disabled;
     modeStatus.textContent = currentThread.metadataPending ? "Checking mode…" : "Mode unavailable";
+    if (settingsDialog.open || modelCatalog.length === 0) return;
+    if (modelCatalog.some((entry) => entry.model === confirmedModel)) {
+      model.value = confirmedModel;
+    }
+    populateEfforts(confirmedEffort);
+    mode.value = currentThread.collaborationMode || "";
   };
+  editSettings.addEventListener("click", () => {
+    if (editSettings.disabled) return;
+    applyThreadSettings(); settingsError.textContent = ""; settingsDialog.showModal();
+    if (!modelCatalog.length) void loadSettings().catch(error => {settingsError.textContent = error.message;});
+  });
+  closeSettings.addEventListener("click", () => { if (!settingsSaving) settingsDialog.close(); });
+  settingsDialog.addEventListener("cancel", event => { if (settingsSaving) event.preventDefault(); });
+  settingsDialog.addEventListener("close", applyThreadSettings);
   const loadSettings = async () => {
     const [models, modes] = await Promise.all([client.models(), client.modes()]);
     modelCatalog = models;
     model.replaceChildren(...models.map((entry) => createElement("option", {value: entry.model}, entry.displayName || entry.model)));
     mode.replaceChildren(...modes.map((entry) => createElement("option", {value: entry.mode}, entry.name || entry.mode)));
-    model.addEventListener("change", () => populateEfforts());
+    model.value = confirmedModel;
+    populateEfforts(confirmedEffort);
+    mode.value = currentThread?.collaborationMode || "";
     applyThreadSettings();
   };
+  model.addEventListener("change", () => populateEfforts());
 
   const renderQueue = (entries) => {
     queue.replaceChildren(createElement("h2", {}, "Queued messages"));
@@ -1027,24 +1064,37 @@ export function mountConversation(root, options) {
     }
   };
 
-  const history = createTranscriptHistory();
-  let legacy = false, historyRead = null, historyError = "", historyRetryTimer = null;
-  let metadataRetryTimer = null, metadataRetryDelay = 2000;
+  const history = createTranscriptHistory({policy});
+  let legacy = false, historyRead = null, historyError = "", historyRetryTimer = null, historyFailureKind = null;
+  let metadataRetryTimer = null, metadataRetryDelay = policy.retryInitialMs;
   let pendingRead = null, queueRead = null, pendingScope = null, queueScope = null;
   let pendingRetryTimer = null, queueRetryTimer = null;
-  let pendingRetryDelay = 2000, queueRetryDelay = 2000, pendingLastRead = 0;
+  let pendingRetryDelay = policy.retryInitialMs, queueRetryDelay = policy.retryInitialMs, pendingLastRead = 0;
   let lastSyncStatus = "", lastThreadStatus = "", destroyed = false, paused = false;
   let generation = 0, sync = null;
   let entryNodes = new Map();
+  let historyNoticeState = {loading: false, warning: false}, historyRetryDelay = policy.retryInitialMs;
+  const historyNotice = createRefreshNotice({policy, render: state => {historyNoticeState = state; renderHistoryControls();}});
+  const pendingNotice = createRefreshNotice({policy, render: state => {
+    pendingStatus.hidden = !state.loading && !state.warning;
+    if (state.loading) pendingStatusLabel.textContent = "Loading requests…";
+    retryPending.hidden = !state.warning;
+  }});
+  const queueNotice = createRefreshNotice({policy, render: state => {
+    queueStatus.hidden = !state.loading && !state.warning;
+    if (state.loading) queueStatusLabel.textContent = "Checking queued messages…";
+    retryQueue.hidden = !state.warning;
+  }});
+  pendingStatus.hidden = queueStatus.hidden = true;
   const renderHistoryControls = () => {
     const older = history.hasOlder && !history.gap && !legacy;
     loadOlder.hidden = !older;
     loadOlder.disabled = Boolean(historyRead);
-    retryHistory.hidden = !history.gap && !historyError;
+    retryHistory.hidden = !historyNoticeState.warning;
     retryHistory.disabled = Boolean(historyRead);
-    historyStatus.textContent = historyRead ? "Loading history…" : historyError ||
-      (history.gap ? "Checking earlier messages…" :
-        legacy ? "Older history is unavailable on this server." : "");
+    historyStatus.textContent = historyNoticeState.warning ? historyError :
+      historyNoticeState.loading ? "Loading earlier messages…" :
+        legacy ? "Older history is unavailable on this server." : "";
     historyControls.hidden = !older && !historyStatus.textContent && retryHistory.hidden;
   };
   const laneRead = (timeout) => {
@@ -1140,7 +1190,7 @@ export function mountConversation(root, options) {
       });
       currentThread = page;
       legacy = Boolean(page.legacy);
-      historyError = "";
+      if (!history.gap && !historyRead) {historyError = ""; historyFailureKind = null; historyNotice.success();}
       applyThreadSettings();
       const active = page.status === "active";
       status.textContent = active ? "Working" : labels.idle;
@@ -1152,44 +1202,46 @@ export function mountConversation(root, options) {
       metadataRetryTimer = null;
       if (page.metadataPending && !destroyed && !paused) {
         metadataRetryTimer = setTimeout(() => { metadataRetryTimer = null; sync?.scheduleRefresh(0); }, metadataRetryDelay);
-        metadataRetryDelay = Math.min(30_000, metadataRetryDelay * 2);
-      } else metadataRetryDelay = 2000;
-      if (Date.now() - pendingLastRead >= 5000) void refreshPending();
+        metadataRetryDelay = Math.min(policy.retryMaxMs, metadataRetryDelay * 2);
+      } else metadataRetryDelay = policy.retryInitialMs;
+      if (Date.now() - pendingLastRead >= policy.pendingMs) void refreshPending();
     }
     acknowledgeRetained(page.threadId);
     renderHistoryControls();
     scheduleHistoryRepair();
   };
-  const refreshPending = (force = false) => {
+  const refreshPending = (force = false, manual = false) => {
     if (!capabilities.pending || destroyed || paused || globalThis.document?.hidden || pendingRead) return pendingRead || Promise.resolve();
     if (pendingRetryTimer !== null && !force) return Promise.resolve();
     if (pendingRetryTimer !== null) clearTimeout(pendingRetryTimer);
     pendingRetryTimer = null;
-    const read = laneRead(12_000), threadId = currentThread?.threadId;
+    const read = laneRead(policy.pendingDeadlineMs), threadId = currentThread?.threadId;
     pendingScope = read;
+    pendingNotice.begin({manual});
     pendingRead = client.pending({signal: read.signal}).then(entries => {
       if (destroyed || (threadId && currentThread?.threadId !== threadId)) return;
       if (!Array.isArray(entries)) throw new Error("Invalid pending requests");
       renderPrompts(entries);
-      pendingStatus.hidden = true;
+      pendingNotice.success();
       pendingLastRead = Date.now();
-      pendingRetryDelay = 2000;
-    }).catch(() => {
+      pendingRetryDelay = policy.retryInitialMs;
+    }).catch(error => {
       if (destroyed || paused || globalThis.document?.hidden) return;
       pendingStatusLabel.textContent = "Requests could not be refreshed. The last result may be out of date.";
-      retryPending.hidden = false; pendingStatus.hidden = false;
+      pendingNotice.failure(error);
       pendingRetryTimer = setTimeout(() => { pendingRetryTimer = null; void refreshPending(); }, pendingRetryDelay);
-      pendingRetryDelay = Math.min(30_000, pendingRetryDelay * 2);
+      pendingRetryDelay = Math.min(policy.retryMaxMs, pendingRetryDelay * 2);
     }).finally(() => { read.finish(); pendingScope = null; pendingRead = null; });
     return pendingRead;
   };
-  const refreshQueue = (force = false) => {
+  const refreshQueue = (force = false, manual = false) => {
     if (!capabilities.queueRead || destroyed || paused || globalThis.document?.hidden || queueRead) return queueRead || Promise.resolve();
     if (queueRetryTimer !== null && !force) return Promise.resolve();
     if (queueRetryTimer !== null) clearTimeout(queueRetryTimer);
     queueRetryTimer = null;
-    const read = laneRead(12_000), threadId = currentThread?.threadId;
+    const read = laneRead(policy.queueDeadlineMs), threadId = currentThread?.threadId;
     queueScope = read;
+    queueNotice.begin({manual});
     queueRead = Promise.resolve().then(async () => {
       if (capabilities.queue && typeof client.reconcileQueue === "function") await client.reconcileQueue({signal: read.signal});
       return client.queue({signal: read.signal});
@@ -1197,25 +1249,25 @@ export function mountConversation(root, options) {
       if (destroyed || (threadId && currentThread?.threadId !== threadId)) return;
       if (!Array.isArray(entries)) throw new Error("Invalid queue");
       renderQueue(entries);
-      queueStatus.hidden = true;
-      queueRetryDelay = 2000;
-    }).catch(() => {
+      queueNotice.success();
+      queueRetryDelay = policy.retryInitialMs;
+    }).catch(error => {
       if (destroyed || paused || globalThis.document?.hidden) return;
       queueStatusLabel.textContent = "Queued messages could not be refreshed. The last result may be out of date.";
-      retryQueue.hidden = false; queueStatus.hidden = false;
+      queueNotice.failure(error);
       queueRetryTimer = setTimeout(() => { queueRetryTimer = null; void refreshQueue(); }, queueRetryDelay);
-      queueRetryDelay = Math.min(30_000, queueRetryDelay * 2);
+      queueRetryDelay = Math.min(policy.retryMaxMs, queueRetryDelay * 2);
     }).finally(() => { read.finish(); queueScope = null; queueRead = null; });
     return queueRead;
   };
-  const runHistoryRead = async (kind) => {
+  const runHistoryRead = async (kind, manual = kind === "older") => {
     if (destroyed || paused || historyRead || legacy || globalThis.document?.hidden) return;
     const cursor = kind === "older" ? history.olderCursor : history.repairCursor;
     if (!cursor) return;
     const threadId = history.threadId, readGeneration = generation;
     const readVersion = history.repairVersion;
-    const read = laneRead(35_000);
-    historyRead = {...read, newerKeys: new Set()}; historyError = ""; renderHistoryControls();
+    const read = laneRead(policy.transcriptDeadlineMs);
+    historyRead = {...read, kind, newerKeys: new Set()}; historyError = ""; historyFailureKind = null; historyNotice.begin({manual}); renderHistoryControls();
     try {
       const page = await readTranscriptPage(client, {cursor, signal: read.signal, expectedThreadId: threadId});
       if (destroyed || paused || readGeneration !== generation || history.threadId !== threadId ||
@@ -1226,6 +1278,7 @@ export function mountConversation(root, options) {
         return historyRead.newerKeys.has(key) ? current.get(key) || entry : entry;
       });
       renderThread({...page, entries}, () => true, kind);
+      historyRetryDelay = policy.retryInitialMs; historyNotice.success();
     } catch (error) {
       if (destroyed || paused || readGeneration !== generation || history.threadId !== threadId ||
           readVersion !== history.repairVersion) return;
@@ -1237,25 +1290,36 @@ export function mountConversation(root, options) {
           (error.status === 501 && error.code === "transcript_paging_unavailable")) {
         historyError = "Checking history on this server…";
         sync?.scheduleRefresh(0);
-      } else historyError = "Earlier messages could not be loaded. Retry.";
+      } else {
+        historyError = "Earlier messages could not be loaded. Retry.";
+        historyFailureKind = kind;
+        historyNotice.failure(error);
+        if (kind === "repair" && error.status !== 401 && error.status !== 403) {
+          historyRetryTimer = setTimeout(() => {historyRetryTimer = null; void runHistoryRead("repair");}, historyRetryDelay);
+          historyRetryDelay = Math.min(policy.retryMaxMs, historyRetryDelay * 2);
+        }
+      }
     } finally {
-      read.finish(); historyRead = null; renderHistoryControls();
+      read.finish(); historyRead = null; historyNotice.cancel(); renderHistoryControls();
       if (!historyError) scheduleHistoryRepair();
     }
   };
-  const scheduleHistoryRepair = () => {
+  const scheduleHistoryRepair = (delay = policy.historyPageMs) => {
     if (!history.gap || !history.repairCursor || historyRetryTimer !== null ||
-        historyRead || historyError || legacy || destroyed || paused || globalThis.document?.hidden) return;
-    historyRetryTimer = setTimeout(() => { historyRetryTimer = null; void runHistoryRead("repair"); }, 40);
+        historyRead || historyError && historyFailureKind !== "repair" || legacy || destroyed || paused || globalThis.document?.hidden) return;
+    historyRetryTimer = setTimeout(() => { historyRetryTimer = null; void runHistoryRead("repair"); }, delay);
   };
   loadOlder.addEventListener("click", () => { void runHistoryRead("older"); });
   retryHistory.addEventListener("click", () => {
+    clearTimeout(historyRetryTimer); historyRetryTimer = null;
     historyError = "";
-    if (history.repairCursor) scheduleHistoryRepair(); else sync?.scheduleRefresh(0);
+    if (history.repairCursor) void runHistoryRead("repair", true);
+    else if (history.olderCursor) void runHistoryRead("older");
+    else sync?.scheduleRefresh(0);
     renderHistoryControls();
   });
-  retryPending.addEventListener("click", () => { void refreshPending(true); });
-  retryQueue.addEventListener("click", () => { void refreshQueue(true); });
+  retryPending.addEventListener("click", () => { void refreshPending(true, true); });
+  retryQueue.addEventListener("click", () => { void refreshQueue(true, true); });
   const suspendLanes = () => {
     paused = true;
     historyRead?.cancel(); pendingScope?.cancel(); queueScope?.cancel();
@@ -1264,7 +1328,7 @@ export function mountConversation(root, options) {
   };
   const onVisibility = () => {
     if (globalThis.document?.hidden) suspendLanes();
-    else { paused = false; void refreshPending(true); void refreshQueue(true); scheduleHistoryRepair(); }
+    else { paused = false; void refreshPending(true); void refreshQueue(true); scheduleHistoryRepair(historyFailureKind ? historyRetryDelay : policy.historyPageMs); }
   };
   const onPageshow = () => { paused = false; onVisibility(); };
   globalThis.document?.addEventListener?.("visibilitychange", onVisibility);
@@ -1273,9 +1337,12 @@ export function mountConversation(root, options) {
   renderHistoryControls();
 
   sync = createConversationSync({
-    EventSource: EventSourceClass, eventStream: capabilities.eventStream,
+    EventSource: EventSourceClass, eventStream: capabilities.eventStream, policy,
     eventsPath: capabilities.eventStream ? client.eventsPath() : null,
-    read: signal => readTranscriptPage(client, {signal, legacy}),
+    read: async signal => {
+      const readGeneration = settingsGeneration;
+      return {...await readTranscriptPage(client, {signal, legacy}), settingsGeneration: readGeneration};
+    },
     apply: (page, {isCurrent}) => renderThread(page, isCurrent),
     onStateChange: state => {
       renderConnectionStatus(connectionStatus, state, () => sync.retry());
@@ -1289,6 +1356,7 @@ export function mountConversation(root, options) {
 
   if (capabilities.send) form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (settingsSaving) return;
     send.disabled = true;
     send.textContent = labels.sending;
     try {
@@ -1307,18 +1375,37 @@ export function mountConversation(root, options) {
 
   if (capabilities.settings) settingsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    saveSettings.disabled = true;
+    if (settingsSaving || currentThread?.status !== "idle") return;
+    const selected = {model: model.value, reasoningEffort: effort.value};
+    if (!modelCatalog.some(entry => entry.model === selected.model &&
+        entry.supportedReasoningEfforts?.some(option => option.reasoningEffort === selected.reasoningEffort))) return;
+    settingsGeneration++;
+    settingsSaving = true; saveSettings.disabled = true; closeSettings.disabled = true;
+    model.disabled = effort.disabled = true;
+    settingsError.textContent = "Saving settings…";
     try {
-      await client.settings(model.value, effort.value, currentThread?.collaborationMode ? mode.value : undefined);
-      await refresh();
+      const saved = await client.settings(selected.model, selected.reasoningEffort, currentThread?.collaborationMode ? mode.value : undefined);
+      if (saved.model !== selected.model || saved.reasoningEffort !== selected.reasoningEffort) throw new Error("The settings update could not be confirmed.");
+      confirmedModel = saved.model; confirmedEffort = saved.reasoningEffort;
+      settingsGeneration++;
+      settingsDialog.close(); await refresh();
     } catch (error) {
-      status.textContent = error.message;
+      try {
+        const observed = await client.thread();
+        if (observed.model === selected.model && observed.reasoningEffort === selected.reasoningEffort) {
+          confirmedModel = observed.model; confirmedEffort = observed.reasoningEffort;
+          settingsGeneration++;
+          settingsDialog.close(); void refresh();
+        } else settingsError.textContent = error.message;
+      } catch (_) { settingsError.textContent = error.message; }
     } finally {
-      saveSettings.disabled = false;
+      settingsSaving = false; closeSettings.disabled = false; model.disabled = effort.disabled = false;
+      applyThreadSettings();
     }
   });
 
   if (capabilities.queue) queueButton.addEventListener("click", async () => {
+    if (settingsSaving) return;
     const message = textarea.value.trim();
     if (!message && !uploads?.count()) return;
     try {
@@ -1336,12 +1423,12 @@ export function mountConversation(root, options) {
     status.textContent = error.message;
   }));
 
-  if (capabilities.settings) void loadSettings().catch(error => { status.textContent = error.message; });
+  if (capabilities.settings) void loadSettings().catch(() => {});
   void refresh();
   void refreshPending();
   void refreshQueue();
-  const pendingInterval = setInterval(() => { void refreshPending(); }, 15_000);
-  const queueInterval = setInterval(() => { void refreshQueue(); }, 30_000);
+  const pendingInterval = setInterval(() => { void refreshPending(); }, policy.pendingMs);
+  const queueInterval = setInterval(() => { void refreshQueue(); }, policy.queueMs);
 
   return () => {
     destroyed = true;
@@ -1351,6 +1438,7 @@ export function mountConversation(root, options) {
     globalThis.removeEventListener?.("pagehide", suspendLanes);
     globalThis.removeEventListener?.("pageshow", onPageshow);
     uploads?.destroy();
+    historyNotice.destroy(); pendingNotice.destroy(); queueNotice.destroy();
     abort.abort();
     sync.destroy();
     root.replaceChildren();

@@ -262,6 +262,23 @@ position when older entries are added. A missing page route or an explicit
 read; the interface then says that older history is unavailable. Other HTTP,
 timeout, cursor and malformed-response errors do not trigger that fallback.
 
+The composer shows the last confirmed model and reasoning effort with **Edit**.
+The dialog saves both values together while the thread is idle. Closing it or
+pressing Escape discards edits. Background reads preserve edits while the dialog
+is open, and reads started before a successful save cannot replace the saved
+pair. An uncertain save rereads the thread without sending a compensating write.
+
+`refreshPolicy` in `conversation/assets/refresh.js` owns resource freshness,
+deadlines, retry backoff and notice delays. `createRefreshNotice()` retains the
+last successful value during background reads. Initial loading appears after
+750 ms, manual loading after 250 ms, and refresh failures after 30 continuous
+visible seconds. Hidden tabs and page restoration restart that warning grace.
+Access failures and failed user actions appear immediately. Automatic history
+repair retries with capped backoff; manual older-page failures wait for Retry.
+Hosts can override individual policy values when mounting a conversation or
+creating a notice or sync controller. Domain controllers retain cursor,
+generation and mutation-recovery rules.
+
 Custom interfaces can use `readTranscriptPage(client, {signal, cursor, legacy,
 expectedThreadId})` for the same page validation and fallback policy, and
 `createTranscriptHistory()` to merge newest, older and repair pages. The history

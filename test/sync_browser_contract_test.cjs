@@ -260,19 +260,20 @@ test("brief focus refresh keeps the healthy stream and stays quiet", async t => 
   f.browser.hidden = true; f.emit("visibilitychange"); await f.clock.advance(1000);
   f.browser.hidden = false; f.emit("visibilitychange"); f.emit("focus");
   assert.equal(f.sources.length, 1);
+  assert.equal(f.reads.length, 1);
   assert.equal(f.state().showWarning, false);
   await f.clock.advance(0);
   assert.equal(f.state().status, "connected");
 });
 
-test("recovery gets ten visible seconds regardless of hidden time or repeated focus", async t => {
+test("recovery gets thirty visible seconds regardless of hidden time or repeated focus", async t => {
   const f = await fixture(t, {read: (_, n) => n === 1 ? "initial" : new Promise(() => {})});
   f.open(); await f.clock.advance(0);
   f.browser.hidden = true; f.emit("visibilitychange"); await f.clock.advance(120_000);
   f.browser.hidden = false; f.emit("visibilitychange"); f.open(); await f.clock.advance(0);
   assert.equal(f.state().showWarning, false);
   await f.clock.advance(5000); f.emit("focus");
-  await f.clock.advance(4999); assert.equal(f.state().showWarning, false);
+  await f.clock.advance(24999); assert.equal(f.state().showWarning, false);
   await f.clock.advance(1); assert.equal(f.state().showWarning, true);
 });
 

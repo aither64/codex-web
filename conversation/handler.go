@@ -35,7 +35,7 @@ var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var pageCursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32}$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
-//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js
+//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js
 var assetFiles embed.FS
 
 // Capabilities grants an opaque conversation ID access to individual

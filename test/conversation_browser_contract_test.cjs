@@ -545,6 +545,8 @@ class MemoryStorage {
       }
     }
     addEventListener(name, listener) { this.listeners.set(name, listener); }
+    showModal() { this.open = true; }
+    close() { this.open = false; this.listeners.get("close")?.(); }
     descendants() { return [this, ...this.children.flatMap((child) => child.descendants())]; }
   }
   globalThis.Element = FakeElement;
@@ -697,6 +699,64 @@ class MemoryStorage {
   assert.equal(root.descendants().filter((element) => element.attributes.class === "codex-conversation-date").length, 2);
   unmount();
 
+  // A late catalog must initialize an already-open editor, and stale reads
+  // must not overwrite a settings acknowledgement.
+  let releaseCatalog, releaseSnapshot, releaseSave, settingsWrites = 0, snapshots = 0;
+  const settingsRoot = new FakeElement("main");
+  const settingsClient = {
+    eventsPath() {return "/settings-events";},
+    async thread() {
+      snapshots++;
+      const pair = {threadId: "thread-settings", status: "idle", entries: [], model: "model-a", reasoningEffort: "medium"};
+      if (snapshots > 1) return new Promise(resolve => {releaseSnapshot = () => resolve(pair);});
+      return pair;
+    },
+    models() { return new Promise(resolve => {releaseCatalog = () => resolve([
+      {model: "model-a", supportedReasoningEfforts: [{reasoningEffort: "medium"}]},
+      {model: "model-b", supportedReasoningEfforts: [{reasoningEffort: "xhigh"}]},
+    ]);}); },
+    async modes() { return [{mode: "default"}]; },
+    settings(model, reasoningEffort) {
+      settingsWrites++;
+      return new Promise(resolve => {releaseSave = () => resolve({model, reasoningEffort});});
+    },
+  };
+  let settingsEvents;
+  class SettingsEvents {
+    constructor() { settingsEvents = this; }
+    addEventListener() {}
+    close() {}
+  }
+  const disposeSettings = mountConversation(settingsRoot, {EventSource: SettingsEvents, refreshPolicy: {eventDebounceMs: 0}, id: "settings", client: settingsClient,
+    capabilities: {pending: false, queueRead: false, send: false, queue: false,
+      interrupt: false, respond: false, eventStream: true}});
+  await new Promise(resolve => setImmediate(resolve));
+  const settingsControl = label => settingsRoot.descendants().find(el => el.attributes["aria-label"] === label);
+  const editor = settingsControl("Codex settings");
+  const edit = settingsRoot.descendants().find(el => el.textContent === "Edit");
+  const settingsForm = editor.children[0];
+  edit.listeners.get("click")();
+  releaseCatalog(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settingsControl("Model").value, "model-a");
+  assert.equal(settingsControl("Reasoning effort").value, "medium");
+  settingsControl("Model").value = "model-b"; settingsControl("Model").listeners.get("change")();
+  settingsControl("Reasoning effort").value = "xhigh";
+  editor.close(); edit.listeners.get("click")();
+  assert.equal(settingsControl("Model").value, "model-a"); assert.equal(settingsWrites, 0);
+  settingsControl("Model").value = "model-b"; settingsControl("Model").listeners.get("change")();
+  settingsControl("Reasoning effort").value = "xhigh";
+  settingsEvents.onmessage(); await new Promise(resolve => setTimeout(resolve, 5));
+  const saving = settingsForm.listeners.get("submit")({preventDefault() {}});
+  let escapeCanceled = false;
+  editor.listeners.get("cancel")({preventDefault() {escapeCanceled = true;}});
+  assert.equal(escapeCanceled, true);
+  releaseSave(); await new Promise(resolve => setImmediate(resolve));
+  releaseSnapshot(); await saving;
+  const settingsSummary = settingsRoot.descendants().find(el => el.textContent === "model-b · xhigh");
+  assert(settingsSummary, "a stale snapshot must retain the acknowledged model pair");
+  assert.equal(editor.open, false); assert.equal(settingsWrites, 1);
+  disposeSettings();
+
   let releaseQueue, releasePending;
   const pageCalls = [];
   const pagedClient = {
@@ -734,6 +794,46 @@ class MemoryStorage {
   releasePending([]); releaseQueue([]);
   await new Promise(resolve => setImmediate(resolve));
   unmountPaged();
+
+  // A failed automatic repair must restart after hiding during its backoff.
+  const plainDocument = globalThis.document;
+  globalThis.document = Object.assign(new EventTarget(), plainDocument, {hidden:false});
+  let repairEvents, newestReads = 0, repairReads = 0;
+  class RepairEvents {
+    constructor() {repairEvents = this;}
+    addEventListener() {}
+    close() {}
+  }
+  const repairEntry = index => ({turnId:"repair-turn", itemId:`item-${index}`, kind:"agentMessage", text:`Entry ${index}`});
+  const repairClient = {
+    eventsPath:() => "/repair-events",
+    async threadPage({cursor} = {}) {
+      if (cursor) {
+        repairReads++;
+        if (repairReads === 1) throw Error("Temporary history failure");
+        return {threadId:"repair-thread", status:"idle", entries:[repairEntry(1), repairEntry(2)], hasOlder:false};
+      }
+      newestReads++;
+      return {threadId:"repair-thread", status:"idle", entries:[repairEntry(newestReads === 1 ? 1 : 3)],
+        hasOlder:true, olderCursor:"repair-cursor"};
+    },
+  };
+  const repairRoot = new FakeElement("main");
+  const disposeRepair = mountConversation(repairRoot, {id:"repair", client:repairClient, EventSource:RepairEvents,
+    refreshPolicy:{eventDebounceMs:0, historyPageMs:1, retryInitialMs:40, retryMaxMs:80},
+    capabilities:{pending:false, queueRead:false, settings:false, send:false, queue:false, interrupt:false, respond:false, eventStream:true}});
+  const until = async check => {
+    for (let count=0; count<100 && !check(); count++) await new Promise(resolve => setTimeout(resolve,5));
+    assert(check());
+  };
+  await until(() => newestReads === 1);
+  repairEvents.onmessage(); await until(() => repairReads === 1);
+  globalThis.document.hidden = true; globalThis.document.dispatchEvent(new Event("visibilitychange"));
+  await new Promise(resolve => setTimeout(resolve,100)); assert.equal(repairReads,1);
+  globalThis.document.hidden = false; globalThis.document.dispatchEvent(new Event("visibilitychange"));
+  await until(() => repairReads === 2);
+  assert.equal(repairRoot.descendants().filter(el => el.attributes.class?.startsWith("codex-entry ")).length,3);
+  disposeRepair(); globalThis.document = plainDocument;
 
   const promptRoot = new FakeElement("main");
   const promptActions = [];

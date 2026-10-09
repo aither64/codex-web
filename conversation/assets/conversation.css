@@ -6,6 +6,10 @@
 .codex-history-controls button[hidden], .codex-lane-status button[hidden] { display: none; }
 .codex-lane-status { margin: .4rem 0; color: #bf8700; font-size: .85rem; }
 .codex-lane-status button { margin-left: .5rem; }
+.codex-conversation-settings { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.codex-settings-dialog { max-width: min(32rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); overflow: auto; }
+.codex-settings-dialog form { display: grid; gap: .75rem; }
+.codex-settings-dialog p { overflow-wrap: anywhere; }
 .codex-conversation-transcript {
   display: grid;
   gap: 0.75rem;
