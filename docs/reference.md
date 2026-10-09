@@ -21,6 +21,52 @@ writable persistent state independently of a connect-only or ephemeral socket
 directory. Leave it empty to retain the compatibility path beside the socket;
 all cooperating processes must select the same path.
 
+`LegacySubmissionLedgerPath` optionally imports an existing ledger when the
+selected persistent path is absent. Import holds both ledger locks, validates
+the complete old state, and writes it atomically at the new path. The old file
+remains. The application must exclude old writers and prevent rollback to a
+client that uses the old path; the library cannot coordinate package selection.
+
+`HasActiveGoal` reads persisted goal state without loading the thread. A native
+server with goals explicitly disabled reports no active goal; transport errors,
+unknown states and mismatched thread IDs remain errors. `ActivateThread` and
+`ActivateThreadWithSettings` load the exact retained thread with its policy and
+optional model/effort while preserving its persisted working directory and
+environment. Loading may start native queued work or an active goal. The
+application owns the execution hold and must allow this only after user action.
+Use cold history/queue reads while held and withhold event subscriptions and
+settings updates, which can otherwise resume a thread.
+
+Set `ClientOptions.AllowImplicitResume` to check application execution permission
+before subscription loading and reconnect restoration, including watches that
+survived a disconnect. The callback reads application state and must not call
+the client recursively. A nil callback keeps normal subscription behavior.
+Explicit sends and activation remain the application's responsibility.
+
+`TransportError` distinguishes connection failures and request deadlines from
+RPC refusals and invalid responses. Applications may retry observations after a
+transport failure. A mutation still needs its durable outcome reconciliation.
+
+A cold Send can enter `Queue` before activation. Its `SendReceipt` can carry
+`queuedSubmissionId` instead of a turn ID. Subsequent `SendWithOptions` and
+`ReconcileSendWithOptions` calls recover that queue/history receipt without
+starting another turn or steering. Before cold enqueueing, reconcile any prior
+send with the same ID: a lost hot-send reply may already have an accepted
+receipt. `Queue` refuses to replace accepted or submitting send outcomes with
+new native input. Prepare nonempty send options with
+`PrepareSendWithOptions` before queueing so retries retain their exact identity.
+App Server queue entries carry text, not per-turn application context; callers
+must reject or separately handle context that cannot be represented there.
+
+`RequireSubmissionAttemptsKnown` proves exact message identities and text from
+the native queue or started history, without loading a thread. It accepts a
+prepared send delegated to that same durable queue identity while retaining its
+options and action context. `RequireSubmissionAttemptsResolved` still requires
+queued attempts to appear in started history, and accepts those delegated sends
+after execution. A prepared send with a queue attempt cannot be discarded as
+unsubmitted; successful queue deletion retires both records. Neither proof
+substitutes for the application's empty-queue and idle-thread archival checks.
+
 The schema-3 ledger has a 16 MiB limit, including its trailing newline. Reads
 and writes reject larger files before changing durable state. Transactions use
 an interprocess lock, write a mode-0600 temporary file, sync it, and atomically

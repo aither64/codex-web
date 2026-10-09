@@ -199,6 +199,12 @@ client_requests = [
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/loaded/list", {"limit": 100}),
+    request("thread/goal/get", {"threadId": "thread-1"}),
+    request("thread/resume", {
+        "threadId": "thread-1", "excludeTurns": True,
+        "model": "fixture-model", "reasoningEffort": "low",
+        "developerInstructions": lifecycle_developer_instructions,
+    }),
     request(
         "thread/turns/list",
         {"threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": "full"},

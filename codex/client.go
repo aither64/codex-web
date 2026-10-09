@@ -39,6 +39,14 @@ const (
 
 var errQueueLedgerTooLarge = fmt.Errorf("queue attempt ledger exceeds %d bytes", queueLedgerMaxSize)
 
+// TransportError identifies a connection failure or request deadline, separate
+// from an App Server RPC refusal or invalid response. Retrying an observation
+// is safe; mutations still require their durable outcome reconciliation.
+type TransportError struct{ Err error }
+
+func (e *TransportError) Error() string { return e.Err.Error() }
+func (e *TransportError) Unwrap() error { return e.Err }
+
 var threadMCPNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type rpcMessage struct {
@@ -201,6 +209,7 @@ type TranscriptEntry struct {
 }
 
 type SendReceipt struct {
+	QueuedSubmissionID  string `json:"queuedSubmissionId,omitempty"`
 	TurnID              string `json:"turnId"`
 	ClientUserMessageID string `json:"clientUserMessageId"`
 	Steered             bool   `json:"steered"`
@@ -811,6 +820,15 @@ type ClientOptions struct {
 	// SubmissionLedgerPath selects application-owned durable retry storage.
 	// Empty preserves the compatibility path next to the App Server socket.
 	SubmissionLedgerPath string
+	// LegacySubmissionLedgerPath imports an existing ledger once, under both
+	// ledger locks. The caller must exclude writers using the predecessor path
+	// after migration, including when rolling its application back.
+	LegacySubmissionLedgerPath string
+	// AllowImplicitResume gates subscription loading and watch restoration on
+	// every connection generation. It must use application-owned state without
+	// calling this client. Nil retains ordinary subscription behavior. Explicit
+	// activation and sends remain the caller's responsibility.
+	AllowImplicitResume func(threadID string) bool
 	// ObserverOnly prevents responses, unsupported-request rejections and
 	// thread-setting overrides. Use a dedicated client for passive monitoring.
 	ObserverOnly     bool
@@ -902,7 +920,7 @@ func (c *Client) Ensure(ctx context.Context) error {
 	}
 	if c.connection != nil {
 		c.connectionMu.Unlock()
-		return errors.New("Codex App Server connection is still initializing")
+		return &TransportError{Err: errors.New("Codex App Server connection is still initializing")}
 	}
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", c.socket)
@@ -912,7 +930,7 @@ func (c *Client) Ensure(ctx context.Context) error {
 	})
 	if err != nil {
 		c.connectionMu.Unlock()
-		return fmt.Errorf("connect to Codex App Server at %s: %w", c.socket, err)
+		return &TransportError{Err: fmt.Errorf("connect to Codex App Server at %s: %w", c.socket, err)}
 	}
 	connection.SetReadLimit(readLimit)
 	if c.ephemeral != nil {
@@ -944,7 +962,7 @@ func (c *Client) Ensure(ctx context.Context) error {
 	c.connectionMu.Lock()
 	if c.connection != connection || c.generation != generation {
 		c.connectionMu.Unlock()
-		return errors.New("Codex App Server connection changed during initialization")
+		return &TransportError{Err: errors.New("Codex App Server connection changed during initialization")}
 	}
 	c.ready = generation
 	c.connectionMu.Unlock()
@@ -1008,25 +1026,25 @@ func (c *Client) requestConnectedGeneration(ctx context.Context, expectedGenerat
 	}
 	c.connectionMu.Unlock()
 	if expectedGeneration != 0 && generation != expectedGeneration {
-		return errors.New("Codex App Server connection changed before request admission")
+		return &TransportError{Err: errors.New("Codex App Server connection changed before request admission")}
 	}
 	if connection == nil || ready != generation {
-		return errors.New("Codex App Server is disconnected or initializing")
+		return &TransportError{Err: errors.New("Codex App Server is disconnected or initializing")}
 	}
 	if c.observer != nil {
 		select {
 		case c.observer.slots <- struct{}{}:
 		case <-ctx.Done():
-			return ctx.Err()
+			return &TransportError{Err: ctx.Err()}
 		case <-disconnected.Done():
-			return errors.New("Codex App Server disconnected before request admission")
+			return &TransportError{Err: errors.New("Codex App Server disconnected before request admission")}
 		}
 		defer func() { <-c.observer.slots }()
 		if err := ctx.Err(); err != nil {
-			return err
+			return &TransportError{Err: err}
 		}
 		if disconnected.Err() != nil {
-			return errors.New("Codex App Server disconnected before request admission")
+			return &TransportError{Err: errors.New("Codex App Server disconnected before request admission")}
 		}
 		// Queue admission does not consume the observer's per-RPC timeout. The
 		// caller deadline still bounds the entire operation, including its queue.
@@ -1076,7 +1094,7 @@ func (c *Client) requestOn(
 		}
 		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return &TransportError{Err: ctx.Err()}
 	}
 }
 
@@ -1092,7 +1110,7 @@ func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, gen
 	c.connectionMu.Lock()
 	if connection == nil || c.connection != connection || c.generation != generation {
 		c.connectionMu.Unlock()
-		return errConnectionChanged
+		return &TransportError{Err: errConnectionChanged}
 	}
 	if offer != nil {
 		c.pendingMu.Lock()
@@ -1114,7 +1132,10 @@ func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, gen
 	if err != nil {
 		c.markDisconnected(connection, generation, err)
 	}
-	return err
+	if err != nil {
+		return &TransportError{Err: err}
+	}
+	return nil
 }
 
 func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
@@ -1417,7 +1438,7 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 			continue
 		}
 		select {
-		case call.channel <- response{err: fmt.Errorf("Codex App Server disconnected: %w", cause)}:
+		case call.channel <- response{err: &TransportError{Err: fmt.Errorf("Codex App Server disconnected: %w", cause)}}:
 		default:
 		}
 		delete(c.pending, id)
@@ -1555,8 +1576,11 @@ func (c *Client) resumeWatchedGeneration(ctx context.Context, threadID string, e
 		return nil
 	}
 	c.watchedMu.Unlock()
+	if allowed := c.options.AllowImplicitResume; allowed != nil && !allowed(threadID) {
+		return errors.New("conversation execution is held")
+	}
 	requestGeneration := uint64(0)
-	if c.observer != nil {
+	if c.observer != nil || c.options.AllowImplicitResume != nil {
 		requestGeneration = generation
 	}
 	var result map[string]any
@@ -2147,6 +2171,11 @@ func (c *Client) loadQueueLedgerLocked() error {
 		return errors.New("submission ledger transaction is already active")
 	}
 	lockPath := c.queueLedgerPath + ".lock"
+	if c.options.LegacySubmissionLedgerPath != "" {
+		if err := os.MkdirAll(filepath.Dir(c.queueLedgerPath), 0700); err != nil {
+			return err
+		}
+	}
 	lockFD, err := unix.Open(
 		lockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600,
 	)
@@ -2164,7 +2193,29 @@ func (c *Client) loadQueueLedgerLocked() error {
 		return fmt.Errorf("lock submission ledger: %w", err)
 	}
 	c.queueLedgerLock = lockFile
-	info, err := os.Lstat(c.queueLedgerPath)
+	readPath := c.queueLedgerPath
+	info, err := os.Lstat(readPath)
+	if errors.Is(err, os.ErrNotExist) && c.options.LegacySubmissionLedgerPath != "" {
+		legacy := c.options.LegacySubmissionLedgerPath
+		if legacy == c.queueLedgerPath {
+			return c.failQueueLedgerLocked(errors.New("legacy ledger must use a different path"))
+		}
+		if _, statErr := os.Lstat(legacy); statErr == nil {
+			fd, lockErr := unix.Open(legacy+".lock", unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+			if lockErr != nil {
+				return c.failQueueLedgerLocked(lockErr)
+			}
+			defer unix.Close(fd)
+			if lockErr := unix.Flock(fd, unix.LOCK_EX); lockErr != nil {
+				return c.failQueueLedgerLocked(lockErr)
+			}
+			defer unix.Flock(fd, unix.LOCK_UN)
+			readPath = legacy
+			info, err = os.Lstat(readPath)
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return c.failQueueLedgerLocked(statErr)
+		}
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		c.queueAttempts = make(map[string]map[string]string)
 		c.sendAttempts = make(map[string]map[string]sendAttempt)
@@ -2183,7 +2234,7 @@ func (c *Client) loadQueueLedgerLocked() error {
 	if info.Size() > queueLedgerMaxSize {
 		return c.failQueueLedgerLocked(errQueueLedgerTooLarge)
 	}
-	file, err := os.Open(c.queueLedgerPath)
+	file, err := os.Open(readPath)
 	if err != nil {
 		return c.failQueueLedgerLocked(fmt.Errorf("open queue attempt ledger: %w", err))
 	}
@@ -2282,6 +2333,11 @@ func (c *Client) loadQueueLedgerLocked() error {
 	c.sendAttempts = ledger.Sends
 	c.queueDeletions = ledger.Deletions
 	c.operations = ledger.Operations
+	if readPath != c.queueLedgerPath {
+		if err := c.writeQueueLedgerLocked(); err != nil {
+			return c.failQueueLedgerLocked(err)
+		}
+	}
 	return nil
 }
 
@@ -2411,6 +2467,12 @@ func (c *Client) recordQueueAttempt(threadID, clientID, text string) error {
 				return errors.New("queued message identity was reused with different text")
 			}
 			return nil
+		}
+		// Queueing must not turn an earlier send receipt (or unknown outcome)
+		// into another native submission after the caller reconciled it.
+		if send, ok := c.sendAttempts[threadID][clientID]; ok &&
+			(send.State != "prepared" || send.Steered || send.Digest != digest) {
+			return errors.New("earlier message attempt must be reconciled before queueing")
 		}
 		if attempts[threadID] == nil {
 			attempts[threadID] = make(map[string]string)
@@ -2775,6 +2837,8 @@ func (c *Client) clearQueueDeletionAndAttempt(
 	return queueLedgerAction(c, func() error {
 		deletion, deleting := c.queueDeletions[threadID][queuedSubmissionID]
 		digest, queued := c.queueAttempts[threadID][clientID]
+		send, prepared := c.sendAttempts[threadID][clientID]
+		prepared = prepared && send.State == "prepared" && !send.Steered && send.Digest == digest && queued
 		if deleting && deletion.ClientUserMessageID != clientID {
 			return errors.New("queued deletion is bound to another message")
 		}
@@ -2783,10 +2847,16 @@ func (c *Client) clearQueueDeletionAndAttempt(
 			delete(c.queueDeletions, threadID)
 		}
 		delete(c.queueAttempts[threadID], clientID)
+		if prepared {
+			delete(c.sendAttempts[threadID], clientID)
+		}
 		if len(c.queueAttempts[threadID]) == 0 {
 			delete(c.queueAttempts, threadID)
 		}
 		if err := c.writeQueueLedgerLocked(); err != nil {
+			if prepared {
+				c.sendAttempts[threadID][clientID] = send
+			}
 			if deleting {
 				if c.queueDeletions[threadID] == nil {
 					c.queueDeletions[threadID] = make(map[string]queueDeletionAttempt)
@@ -2806,6 +2876,17 @@ func (c *Client) clearQueueDeletionAndAttempt(
 }
 
 func (c *Client) RequireSubmissionAttemptsResolved(ctx context.Context, threadID string) error {
+	return c.requireSubmissionAttempts(ctx, threadID, false)
+}
+
+// RequireSubmissionAttemptsKnown accepts exact native queue receipts as known
+// work without loading the thread. Unlike Resolved, queued work may remain;
+// callers must apply their own idle/empty-queue gate before retirement.
+func (c *Client) RequireSubmissionAttemptsKnown(ctx context.Context, threadID string) error {
+	return c.requireSubmissionAttempts(ctx, threadID, true)
+}
+
+func (c *Client) requireSubmissionAttempts(ctx context.Context, threadID string, allowQueued bool) error {
 	deletionCount, err := queueLedgerTransaction(c, func() (int, error) { return len(c.queueDeletions[threadID]), nil })
 	if err != nil {
 		return err
@@ -2824,8 +2905,12 @@ func (c *Client) RequireSubmissionAttemptsResolved(ctx context.Context, threadID
 			attempts[clientID] = digest
 		}
 		unresolved := 0
-		for _, attempt := range c.sendAttempts[threadID] {
-			if attempt.State != "accepted" {
+		for clientID, attempt := range c.sendAttempts[threadID] {
+			// A prepared send may have been delegated to the native queue. Its
+			// exact queue identity is proved below, retaining options and context
+			// in the unchanged ledger without inventing a turn receipt.
+			if attempt.State != "accepted" &&
+				(attempt.State != "prepared" || attempt.Steered || attempts[clientID] != attempt.Digest) {
 				unresolved++
 			}
 		}
@@ -2848,6 +2933,22 @@ func (c *Client) RequireSubmissionAttemptsResolved(ctx context.Context, threadID
 	}
 
 	resolved := make(map[string]string)
+	if allowQueued {
+		entries, err := c.ListQueue(ctx, threadID)
+		if err != nil {
+			return fmt.Errorf("reconcile queued message attempts: %w", err)
+		}
+		for _, entry := range entries {
+			if _, tracked := queueAttempts[entry.ClientUserMessageID]; !tracked {
+				continue
+			}
+			digest := queueTextDigest(entry.Text)
+			if existing, ok := resolved[entry.ClientUserMessageID]; ok && existing != digest {
+				return errors.New("queued message identity was reused with different text")
+			}
+			resolved[entry.ClientUserMessageID] = digest
+		}
+	}
 	err = c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
 		if stringValue(entry.Item["type"]) != "userMessage" {
 			return false, nil
@@ -4005,6 +4106,74 @@ func (c *Client) resumeThread(ctx context.Context, threadID string) error {
 	return c.resumeThreadWithPolicy(ctx, threadID, ThreadPolicy{}, false)
 }
 
+// ActivateThread loads a retained conversation with the application's policy.
+// Loading can execute saved queues or active goals; callers must obtain explicit
+// user intent before calling this method for a cold conversation.
+func (c *Client) ActivateThread(ctx context.Context, threadID string, policy ThreadPolicy) error {
+	return c.ActivateThreadWithSettings(ctx, threadID, ThreadSettings{Policy: policy})
+}
+
+// ActivateThreadWithSettings applies settings as part of the explicit load,
+// without replacing the retained working directory or shell environment.
+func (c *Client) ActivateThreadWithSettings(ctx context.Context, threadID string, settings ThreadSettings) error {
+	policy := settings.Policy
+	if err := validateThreadPolicy(policy); err != nil {
+		return err
+	}
+	params := c.threadResumeParams(threadID)
+	config := map[string]any{}
+	c.settingsParams(settings, params, config)
+	if policy.MCPServer != nil {
+		applyThreadMCP(config, policy)
+	}
+	if len(config) != 0 {
+		params["config"] = config
+	}
+	var response struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+	}
+	if err := c.Request(ctx, "thread/resume", params, &response); err != nil {
+		return err
+	}
+	if response.Thread.ID != threadID {
+		return errors.New("thread/resume returned another thread")
+	}
+	return nil
+}
+
+// HasActiveGoal reads durable goal state without loading the conversation.
+func (c *Client) HasActiveGoal(ctx context.Context, threadID string) (bool, error) {
+	var result struct {
+		Goal *struct {
+			ThreadID string `json:"threadId"`
+			Status   string `json:"status"`
+		} `json:"goal"`
+	}
+	if err := c.Request(ctx, "thread/goal/get", map[string]any{"threadId": threadID}, &result); err != nil {
+		var call *rpcCallError
+		if errors.As(err, &call) && call.code == -32600 && call.message == "goals feature is disabled" {
+			return false, nil
+		}
+		return false, err
+	}
+	if result.Goal == nil {
+		return false, nil
+	}
+	if result.Goal.ThreadID != threadID {
+		return false, errors.New("thread/goal/get returned another thread")
+	}
+	switch result.Goal.Status {
+	case "active":
+		return true, nil
+	case "paused", "blocked", "usageLimited", "budgetLimited", "complete":
+		return false, nil
+	default:
+		return false, errors.New("thread/goal/get returned an unknown goal status")
+	}
+}
+
 func (c *Client) resumeThreadWithPolicy(ctx context.Context, threadID string, policy ThreadPolicy, explicit bool) error {
 	var response map[string]any
 	params := c.threadResumeParams(threadID)
@@ -4533,7 +4702,7 @@ func (c *Client) DiscardPreparedSendWithOptions(
 			effectiveTurnOptionsDigest(attempt.OptionsDigest) != normalizedOptions.Digest {
 			return false, errors.New("message identity was reused for another action")
 		}
-		if attempt.State != "prepared" {
+		if attempt.State != "prepared" || c.queueAttempts[threadID][clientID] != "" {
 			return false, nil
 		}
 		delete(c.sendAttempts[threadID], clientID)
@@ -4580,6 +4749,20 @@ func (c *Client) ReconcileSendWithOptions(
 	)
 	if err != nil {
 		return SendReceipt{}, false, err
+	}
+	queued, err := c.queueAttempt(threadID, clientUserMessageID, text)
+	if err != nil {
+		return SendReceipt{}, false, err
+	}
+	if queued {
+		entry, found, err := c.queuedOrStartedByClientID(ctx, threadID, clientUserMessageID, text)
+		if err != nil {
+			return SendReceipt{}, false, err
+		}
+		if !found {
+			return SendReceipt{}, false, &UnknownSendOutcomeError{Err: errors.New("earlier queued send outcome is unknown")}
+		}
+		return SendReceipt{ClientUserMessageID: clientUserMessageID, QueuedSubmissionID: entry.ID}, true, nil
 	}
 	return c.reconcileSend(ctx, threadID, text, clientUserMessageID, attempt)
 }
@@ -4645,6 +4828,20 @@ func (c *Client) SendWithOptions(
 	)
 	if err != nil {
 		return SendReceipt{}, err
+	}
+	queued, err := c.queueAttempt(threadID, clientUserMessageID, text)
+	if err != nil {
+		return SendReceipt{}, err
+	}
+	if queued {
+		entry, found, err := c.queuedOrStartedByClientID(ctx, threadID, clientUserMessageID, text)
+		if err != nil {
+			return SendReceipt{}, err
+		}
+		if !found {
+			return SendReceipt{}, &UnknownSendOutcomeError{Err: errors.New("earlier queued send outcome is unknown")}
+		}
+		return SendReceipt{ClientUserMessageID: clientUserMessageID, QueuedSubmissionID: entry.ID}, nil
 	}
 	if receipt, found, err := c.reconcileSend(ctx, threadID, text, clientUserMessageID, attempt); err != nil || found {
 		return receipt, err
