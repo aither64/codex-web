@@ -36,10 +36,11 @@ func (r *ActivityRecorder) seedCurrent(ctx context.Context, threadID string, tur
 }
 
 func (r *ActivityRecorder) snapshotContext(ctx context.Context, threadID string, turns []TurnMetadata, scope string, now int64, checkpointErr error) ActivitySnapshot {
-	result := ActivitySnapshot{ThreadID: threadID, CurrentState: "idle", ObservedAtMS: now, Scope: scope, TimingApproximate: true, CoverageComplete: true}
+	result := ActivitySnapshot{ThreadID: threadID, CurrentState: "idle", ObservedAtMS: now, Scope: scope, TimingApproximate: true, CoverageComplete: true, CountsComplete: scope != "unknown"}
 	if len(turns) > 0 {
 		latest := turns[len(turns)-1]
 		result.CurrentTurnID, result.Messages, result.ToolCalls = latest.ID, latest.Messages, latest.ToolCalls
+		result.LatestTurnStatus = latest.Status
 		result.StartedAtMS, result.CompletedAtMS = latest.StartedAtMS, latest.CompletedAtMS
 		if latest.Status == "inProgress" {
 			result.CurrentState = "unclassified"
@@ -72,11 +73,30 @@ func (r *ActivityRecorder) snapshotContext(ctx context.Context, threadID string,
 	}
 	if live != nil {
 		result.CurrentState, result.StateSinceMS, result.ObservedAtMS = live.State, live.SinceMS, live.ThroughMS
+		if live.State == "waiting" {
+			for _, wait := range live.ToolWaits {
+				if result.WaitReason == "" || wait.Reason == "subagents" {
+					result.WaitReason, result.WaitUntilMS = wait.Reason, wait.UntilMS
+				}
+			}
+			for _, request := range live.Requests {
+				if request.Blocking {
+					result.WaitReason, result.WaitUntilMS = request.Category, 0
+					if request.Category == "userInput" {
+						break
+					}
+				}
+			}
+		}
 	}
 	if scope == "unknown" {
 		result.CurrentState = "unclassified"
 	}
 	for index, turn := range turns {
+		result.SentMessages += turn.Messages
+		result.ReceivedMessages += turn.ReceivedMessages
+		result.TotalToolCalls += turn.ToolCalls
+		result.CountsComplete = result.CountsComplete && turn.CountsKnown
 		start, end := turn.StartedAtMS, turn.CompletedAtMS
 		if index > 0 {
 			previous := turns[index-1].CompletedAtMS
@@ -125,6 +145,10 @@ func (r *ActivityRecorder) snapshotContext(ctx context.Context, threadID string,
 	if result.CurrentState == "idle" && len(turns) > 0 && result.CompletedAtMS > 0 {
 		result.StateSinceMS = result.CompletedAtMS
 		result.OpenWaitingMS = max(int64(0), now-result.CompletedAtMS)
+	}
+	result.IdleMS = result.BetweenTurnsMS
+	if result.CurrentState == "idle" {
+		result.IdleMS += result.OpenWaitingMS
 	}
 	if result.UnclassifiedMS > 0 || scope == "unknown" {
 		result.CoverageComplete = false

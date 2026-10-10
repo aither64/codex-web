@@ -77,6 +77,18 @@ the upload assets below its base path. Import one of these browser APIs:
 - `createConversationSync()` for a custom synchronized interface.
 
 The handler's optional activity provider exposes timing to `client.activity()`.
+Snapshots include lifetime sent and received conversation-message counts and tool
+calls. Distinct item IDs count once; fork totals exclude inherited turns. Older
+turn pages are summarized and discarded after counting. `countsComplete` marks
+incomplete history. Working, waiting and idle durations are separate. Explicit
+sleep and collaboration waits expose `waitReason` and optional `waitUntilMs`;
+blocking questions and approvals take precedence. Turn lifecycle determines
+activity even when native thread status becomes idle during sleep. Unobserved
+turn time remains unclassified. On reconnect, ongoing team waits are restored
+from their native status. Sleep items have no lifecycle status in history; if
+the observer missed the turn start, ambiguous time stays unclassified until
+that turn ends. The additive checkpoint fields can be ignored by
+preceding versions; restoring older checkpoints does not invent wait coverage.
 Attachment support uses `NewUploadHandler` and application-owned storage and
 authorization.
 

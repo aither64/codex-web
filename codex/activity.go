@@ -18,6 +18,15 @@ type ActivitySnapshot struct {
 	CurrentTurnID     string `json:"currentTurnId,omitempty"`
 	Messages          int    `json:"messages"`
 	ToolCalls         int    `json:"toolCalls"`
+	SentMessages      int    `json:"sentMessages"`
+	ReceivedMessages  int    `json:"receivedMessages"`
+	TotalToolCalls    int    `json:"totalToolCalls"`
+	CountsComplete    bool   `json:"countsComplete"`
+	IdleMS            int64  `json:"idleMs"`
+	CreatedAtMS       int64  `json:"createdAtMs,omitempty"`
+	WaitReason        string `json:"waitReason,omitempty"`
+	WaitUntilMS       int64  `json:"waitUntilMs,omitempty"`
+	LatestTurnStatus  string `json:"latestTurnStatus,omitempty"`
 	StartedAtMS       int64  `json:"startedAtMs,omitempty"`
 	CompletedAtMS     int64  `json:"completedAtMs,omitempty"`
 	WorkingMS         int64  `json:"workingMs"`
@@ -61,20 +70,29 @@ type activityRequest struct {
 	OpenedAtMS int64  `json:"openedAtMs"`
 }
 
+// An automatic wait is a tool lifecycle interval, not a request to the user.
+type activityToolWait struct {
+	TurnID  string `json:"turnId"`
+	Reason  string `json:"reason"`
+	UntilMS int64  `json:"untilMs,omitempty"`
+}
+
 type activityObservation struct {
-	Connection    string                     `json:"connection"`
-	Connected     bool                       `json:"-"`
-	Ready         bool                       `json:"-"`
-	TurnID        string                     `json:"turnId,omitempty"`
-	Active        bool                       `json:"active"`
-	Flags         []string                   `json:"-"`
-	Requests      map[string]activityRequest `json:"requests,omitempty"`
-	State         string                     `json:"state"`
-	SinceMS       int64                      `json:"sinceMs"`
-	ThroughMS     int64                      `json:"throughMs"`
-	OpenWaitingMS int64                      `json:"openWaitingMs"`
-	Revision      uint64                     `json:"-"`
-	Overflow      bool                       `json:"overflow,omitempty"`
+	Connection        string                      `json:"connection"`
+	Connected         bool                        `json:"-"`
+	Ready             bool                        `json:"-"`
+	TurnStartObserved bool                        `json:"-"`
+	TurnID            string                      `json:"turnId,omitempty"`
+	Active            bool                        `json:"active"`
+	Flags             []string                    `json:"-"`
+	Requests          map[string]activityRequest  `json:"requests,omitempty"`
+	ToolWaits         map[string]activityToolWait `json:"toolWaits,omitempty"`
+	State             string                      `json:"state"`
+	SinceMS           int64                       `json:"sinceMs"`
+	ThroughMS         int64                       `json:"throughMs"`
+	OpenWaitingMS     int64                       `json:"openWaitingMs"`
+	Revision          uint64                      `json:"-"`
+	Overflow          bool                        `json:"overflow,omitempty"`
 }
 
 func activityState(observation *activityObservation) string {
@@ -90,6 +108,9 @@ func activityState(observation *activityObservation) string {
 		if request.Blocking {
 			return "waiting"
 		}
+	}
+	if observation.Active && len(observation.ToolWaits) > 0 {
+		return "waiting"
 	}
 	if !observation.Ready {
 		return "unclassified"
@@ -170,5 +191,20 @@ func (c *Client) ReadActivity(ctx context.Context, threadID string) (ActivitySna
 	c.options.ActivityRecorder.seedCurrent(ctx, threadID, turns)
 	c.options.ActivityRecorder.reconcile(threadID, c.activityConnection(generation), turns, status, now, revision)
 	checkpointErr := c.options.ActivityRecorder.flush(ctx, threadID)
-	return c.options.ActivityRecorder.snapshotContext(ctx, threadID, turns, scope, now, checkpointErr), nil
+	result := c.options.ActivityRecorder.snapshotContext(ctx, threadID, turns, scope, now, checkpointErr)
+	result.CreatedAtMS = integerValue(metadata.Thread["createdAt"]) * 1000
+	if scope != "unknown" && result.CreatedAtMS > 0 {
+		end := now
+		if len(turns) > 0 {
+			end = turns[0].StartedAtMS
+		}
+		if end >= result.CreatedAtMS {
+			result.IdleMS += end - result.CreatedAtMS
+			if len(turns) == 0 && result.CurrentState == "idle" {
+				result.StateSinceMS = result.CreatedAtMS
+				result.ObservedAtMS = now
+			}
+		}
+	}
+	return result, nil
 }

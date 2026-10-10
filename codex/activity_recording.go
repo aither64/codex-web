@@ -8,7 +8,7 @@ import (
 
 func (thread *activityThread) observation(connection string, now int64) *activityObservation {
 	if thread.live == nil || thread.live.Connection != connection {
-		thread.live = &activityObservation{Connection: connection, Requests: map[string]activityRequest{}, SinceMS: now, ThroughMS: now, State: "unclassified"}
+		thread.live = &activityObservation{Connection: connection, Requests: map[string]activityRequest{}, ToolWaits: map[string]activityToolWait{}, SinceMS: now, ThroughMS: now, State: "unclassified"}
 	}
 	return thread.live
 }
@@ -152,12 +152,15 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 		return
 	}
 	var params struct {
-		ThreadID   string          `json:"threadId"`
-		TurnID     string          `json:"turnId"`
-		IsBlocking *bool           `json:"isBlocking"`
-		RequestID  json.RawMessage `json:"requestId"`
-		Turn       map[string]any  `json:"turn"`
-		Status     struct {
+		ThreadID      string          `json:"threadId"`
+		TurnID        string          `json:"turnId"`
+		IsBlocking    *bool           `json:"isBlocking"`
+		RequestID     json.RawMessage `json:"requestId"`
+		Turn          map[string]any  `json:"turn"`
+		Item          map[string]any  `json:"item"`
+		StartedAtMS   int64           `json:"startedAtMs"`
+		CompletedAtMS int64           `json:"completedAtMs"`
+		Status        struct {
 			Type        string   `json:"type"`
 			ActiveFlags []string `json:"activeFlags"`
 		} `json:"status"`
@@ -166,7 +169,7 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 		return
 	}
 	switch message.Method {
-	case "serverRequest/resolved", "turn/started", "turn/completed", "thread/status/changed":
+	case "serverRequest/resolved", "turn/started", "turn/completed", "thread/status/changed", "item/started", "item/completed":
 	default:
 		if len(message.ID) == 0 {
 			return
@@ -187,6 +190,14 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 		return
 	}
 	live := thread.observation(connection, now)
+	if message.Method == "item/started" || message.Method == "item/completed" {
+		if params.TurnID != live.TurnID || !live.Active || stringValue(params.Item["id"]) == "" {
+			return
+		}
+		if params.Item["type"] != "sleep" && !(params.Item["type"] == "collabAgentToolCall" && params.Item["tool"] == "wait" && params.Item["senderThreadId"] == params.ThreadID) {
+			return
+		}
+	}
 	boundary := now
 	if message.Method == "turn/started" && live.Connected && live.Ready && live.State == "idle" {
 		startedAt := integerValue(params.Turn["startedAt"]) * 1000
@@ -201,6 +212,30 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 	}
 	thread.accrue(boundary)
 	switch message.Method {
+	case "item/started":
+		id := stringValue(params.Item["id"])
+		if live.ToolWaits == nil {
+			live.ToolWaits = map[string]activityToolWait{}
+		}
+		if len(live.ToolWaits) >= activityPendingLimit {
+			live.Overflow = true
+			break
+		}
+		wait := activityToolWait{TurnID: params.TurnID, Reason: "subagents"}
+		if params.Item["type"] == "sleep" {
+			wait.Reason = "sleep"
+			start := params.StartedAtMS
+			if start <= 0 || start > now {
+				start = now
+			}
+			duration := integerValue(params.Item["durationMs"])
+			if duration > 0 && duration <= 43200000 {
+				wait.UntilMS = start + duration
+			}
+		}
+		live.ToolWaits[id] = wait
+	case "item/completed":
+		delete(live.ToolWaits, stringValue(params.Item["id"]))
 	case "serverRequest/resolved":
 		resolved := live.Requests[string(params.RequestID)]
 		delete(live.Requests, string(params.RequestID))
@@ -218,6 +253,8 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 			live.Flags = slices.DeleteFunc(live.Flags, func(value string) bool { return value == flag })
 		}
 	case "turn/started":
+		live.TurnStartObserved = true
+		live.ToolWaits = map[string]activityToolWait{}
 		live.TurnID = stringValue(params.Turn["id"])
 		live.OpenWaitingMS = 0
 		live.Active, live.Ready = true, true
@@ -230,6 +267,7 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 		if live.TurnID == turnID {
 			live.Active = false
 			live.OpenWaitingMS = 0
+			live.ToolWaits = map[string]activityToolWait{}
 		}
 		for key, request := range live.Requests {
 			if request.TurnID == turnID {
@@ -243,9 +281,8 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 		}
 	case "thread/status/changed":
 		live.Flags = params.Status.ActiveFlags
-		if params.Status.Type != "active" {
-			live.Active = false
-		}
+		// Runtime idle during an interruptible sleep does not end its turn.
+		// Turn lifecycle and history establish that boundary.
 	default:
 		policy := requestPolicyFor(message.Method)
 		category, blocking := policy.category, policy.blocking
@@ -328,7 +365,27 @@ func (r *ActivityRecorder) reconcile(threadID, connection string, turns []TurnMe
 			live.TurnID, live.Active = latest.ID, latest.Status == "inProgress"
 		}
 		if previousTurn != live.TurnID {
+			live.TurnStartObserved = false
 			live.OpenWaitingMS = 0
+			live.ToolWaits = map[string]activityToolWait{}
+		}
+		if !live.Active {
+			live.ToolWaits = map[string]activityToolWait{}
+		}
+		if live.Active {
+			latest := turns[len(turns)-1]
+			// Sleep items have no lifecycle status in native history. If we
+			// missed the turn start, they cannot prove whether sleep has ended.
+			// Keep the remainder unclassified rather than invent working time.
+			live.Ready = !latest.HasSleep || live.TurnStartObserved
+			for id, wait := range live.ToolWaits {
+				if latest.CountsKnown && wait.Reason == "subagents" {
+					delete(live.ToolWaits, id)
+				}
+			}
+			for id, wait := range latest.AutomaticWaits {
+				live.ToolWaits[id] = wait
+			}
 		}
 		for id, record := range thread.hot.Turns {
 			if turn, exists := metadata[id]; exists {

@@ -10,14 +10,17 @@ import (
 // TurnMetadata uses server turn boundaries. Counts are distinct root-thread
 // items, independent of transcript presentation and lifecycle notifications.
 type TurnMetadata struct {
-	ID            string `json:"id"`
-	Status        string `json:"status"`
-	StartedAtMS   int64  `json:"startedAtMs,omitempty"`
-	CompletedAtMS int64  `json:"completedAtMs,omitempty"`
-	DurationMS    int64  `json:"durationMs,omitempty"`
-	Messages      int    `json:"messages"`
-	ToolCalls     int    `json:"toolCalls"`
-	CountsKnown   bool   `json:"countsKnown"`
+	ID               string                      `json:"id"`
+	Status           string                      `json:"status"`
+	StartedAtMS      int64                       `json:"startedAtMs,omitempty"`
+	CompletedAtMS    int64                       `json:"completedAtMs,omitempty"`
+	DurationMS       int64                       `json:"durationMs,omitempty"`
+	Messages         int                         `json:"messages"`
+	ReceivedMessages int                         `json:"receivedMessages"`
+	ToolCalls        int                         `json:"toolCalls"`
+	CountsKnown      bool                        `json:"countsKnown"`
+	HasSleep         bool                        `json:"-"`
+	AutomaticWaits   map[string]activityToolWait `json:"-"`
 }
 
 type cachedTurnHistory struct {
@@ -105,13 +108,24 @@ func turnMetadata(turn map[string]any, threadID string) TurnMetadata {
 		}
 		seen[id] = true
 		switch kind {
+		case "userMessage":
+			result.ReceivedMessages++
 		case "agentMessage", "plan":
 			result.Messages++
 		case "collabAgentToolCall":
 			if sender := stringValue(item["senderThreadId"]); sender == threadID {
 				result.ToolCalls++
+				if item["tool"] == "wait" && item["status"] == "inProgress" {
+					if result.AutomaticWaits == nil {
+						result.AutomaticWaits = map[string]activityToolWait{}
+					}
+					result.AutomaticWaits[id] = activityToolWait{TurnID: result.ID, Reason: "subagents"}
+				}
 			}
-		case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration", "sleep":
+		case "sleep":
+			result.HasSleep = true
+			result.ToolCalls++
+		case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration":
 			result.ToolCalls++
 		}
 	}
@@ -165,12 +179,15 @@ func (c *Client) readTurnHistory(ctx context.Context, threadID, firstView, rollo
 			return errors.New("thread history exceeds activity limit")
 		}
 		seenIDs[id] = true
+		if cursor != "" && firstView == "full" {
+			turn = map[string]any{"id": turn["id"], "status": turn["status"], "_activityMetadata": turnMetadata(turn, threadID)}
+		}
 		turns = append(turns, turn)
 		return nil
 	}
 	for {
 		view := firstView
-		if cursor != "" {
+		if cursor != "" && firstView != "full" {
 			view = "notLoaded"
 		}
 		params := map[string]any{"threadId": threadID, "limit": recentTurnLimit, "sortDirection": "desc", "itemsView": view}
@@ -213,7 +230,8 @@ func (c *Client) readTurnHistory(ctx context.Context, threadID, firstView, rollo
 				}
 				valid := true
 				for _, older := range cached.turns[index+1:] {
-					if !slices.Contains([]string{"completed", "failed", "interrupted"}, statusValue(older["status"])) {
+					if !slices.Contains([]string{"completed", "failed", "interrupted"}, statusValue(older["status"])) ||
+						(firstView == "full" && !turnMetadata(older, threadID).CountsKnown) {
 						valid = false
 						break
 					}

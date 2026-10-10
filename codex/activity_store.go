@@ -98,6 +98,7 @@ func cloneObservation(value *activityObservation) *activityObservation {
 	result := *value
 	result.Flags = append([]string(nil), value.Flags...)
 	result.Requests = maps.Clone(value.Requests)
+	result.ToolWaits = maps.Clone(value.ToolWaits)
 	return &result
 }
 
@@ -384,7 +385,7 @@ func loadActivityCheckpoint(path, threadID string) (activityCheckpoint, error) {
 			return result, errors.New("invalid activity turn summary")
 		}
 	}
-	if result.Current != nil && (len(result.Current.Requests) > activityPendingLimit || result.Current.ThroughMS < result.Current.SinceMS) {
+	if result.Current != nil && (len(result.Current.Requests) > activityPendingLimit || len(result.Current.ToolWaits) > activityPendingLimit || result.Current.ThroughMS < result.Current.SinceMS) {
 		return result, errors.New("invalid activity observation")
 	}
 	return result, nil

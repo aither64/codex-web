@@ -219,12 +219,12 @@ func TestActivityFailureKeepsLastDurableCheckpoint(t *testing.T) {
 
 func TestTurnMetadataCountsDistinctActualRootItems(t *testing.T) {
 	items := []any{}
-	for _, kind := range []string{"agentMessage", "plan", "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration", "sleep", "functionCallOutput", "subAgentActivity", "reasoning", "contextCompaction", "enteredReviewMode"} {
+	for _, kind := range []string{"userMessage", "agentMessage", "plan", "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch", "imageView", "imageGeneration", "sleep", "functionCallOutput", "subAgentActivity", "reasoning", "contextCompaction", "enteredReviewMode"} {
 		items = append(items, map[string]any{"id": kind, "type": kind})
 	}
 	items = append(items, map[string]any{"id": "agentMessage", "type": "agentMessage"}, map[string]any{"id": "root-agent", "type": "collabAgentToolCall", "senderThreadId": "root"}, map[string]any{"id": "child-agent", "type": "collabAgentToolCall", "senderThreadId": "child"})
 	metadata := turnMetadata(map[string]any{"id": "turn", "status": "inProgress", "items": items}, "root")
-	if metadata.Messages != 2 || metadata.ToolCalls != 9 {
+	if metadata.Messages != 2 || metadata.ReceivedMessages != 1 || metadata.ToolCalls != 9 {
 		t.Fatalf("counts = %#v", metadata)
 	}
 }
@@ -414,9 +414,6 @@ func TestReadActivityPaginatedHistoryCacheAndRevert(t *testing.T) {
 				}
 				params := request["params"].(map[string]any)
 				view := "full"
-				if page > 0 {
-					view = "notLoaded"
-				}
 				if params["itemsView"] != view {
 					return fmt.Errorf("itemsView = %v", params["itemsView"])
 				}
@@ -444,11 +441,79 @@ func TestReadActivityPaginatedHistoryCacheAndRevert(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if snapshot.BetweenTurnsMS != 200000 || snapshot.UnclassifiedMS != 205000 || snapshot.Messages != 1 {
+		if snapshot.BetweenTurnsMS != 200000 || snapshot.UnclassifiedMS != 205000 || snapshot.Messages != 1 || snapshot.SentMessages != 41 || snapshot.TotalToolCalls != 0 || !snapshot.CountsComplete {
 			t.Fatalf("history = %#v", snapshot)
 		}
 	}
 	if requests != 7 {
 		t.Fatalf("turn page requests = %d", requests)
+	}
+}
+
+func TestActivityAutomaticWaitUnionAndRuntimeIdle(t *testing.T) {
+	r := startActivity(t, filepath.Join(t.TempDir(), "activity.json"))
+	item := func(method, id, kind, tool string, at int64) {
+		activityEvent(r, "connection:1", method, nil, map[string]any{"threadId": "thread", "turnId": "turn", "item": map[string]any{"id": id, "type": kind, "tool": tool, "senderThreadId": "thread", "durationMs": float64(5000)}, "startedAtMs": at}, at)
+	}
+	item("item/started", "sleep", "sleep", "", 3000)
+	activityEvent(r, "connection:1", "thread/status/changed", nil, map[string]any{"threadId": "thread", "status": map[string]any{"type": "idle"}}, 3500)
+	r.reconcile("thread", "connection:1", activityTurn("inProgress", 0), map[string]any{"type": "idle"}, 4000, r.revision("thread"))
+	got := r.snapshot("thread", activityTurn("inProgress", 0), "thread", 4000)
+	if got.CurrentState != "waiting" || got.WaitReason != "sleep" || got.WaitUntilMS != 8000 || got.WorkingMS != 2000 || got.OpenWaitingMS != 1000 {
+		t.Fatalf("sleep: %#v", got)
+	}
+	item("item/started", "wait", "collabAgentToolCall", "wait", 5000)
+	item("item/completed", "sleep", "sleep", "", 6000)
+	r.reconcile("thread", "connection:1", activityTurn("inProgress", 0), map[string]any{"type": "idle"}, 7000, r.revision("thread"))
+	got = r.snapshot("thread", activityTurn("inProgress", 0), "thread", 7000)
+	if got.WaitReason != "subagents" || got.OpenWaitingMS != 4000 {
+		t.Fatalf("overlap: %#v", got)
+	}
+	item("item/completed", "wait", "collabAgentToolCall", "wait", 8000)
+	activityEvent(r, "connection:1", "turn/completed", nil, map[string]any{"threadId": "thread", "turn": map[string]any{"id": "turn", "status": "interrupted"}}, 10000)
+	got = r.snapshot("thread", activityTurn("interrupted", 10000), "thread", 12000)
+	if got.CurrentState != "idle" || got.WaitReason != "" || got.WorkingMS != 4000 || got.WaitingMS != 5000 || got.IdleMS != 2000 {
+		t.Fatalf("finished: %#v", got)
+	}
+}
+
+func TestActivityReconnectDuringSleepRemainsUnclassified(t *testing.T) {
+	r := startActivity(t, filepath.Join(t.TempDir(), "activity.json"))
+	turns := activityTurn("inProgress", 0)
+	turns[0].HasSleep = true
+	r.disconnected("connection:1", "thread")
+	r.connected("thread", "connection:2", 3000)
+	r.reconcile("thread", "connection:2", turns, map[string]any{"type": "idle"}, 3000, 0)
+	r.reconcile("thread", "connection:2", turns, map[string]any{"type": "idle"}, 6000, r.revision("thread"))
+	got := r.snapshot("thread", turns, "thread", 6000)
+	if got.CurrentState != "unclassified" || got.WorkingMS != 0 || got.WaitingMS != 0 || got.UnclassifiedMS != 5000 {
+		t.Fatalf("invented sleep coverage: %#v", got)
+	}
+}
+
+func TestActivityReconnectRestoresOngoingTeamWait(t *testing.T) {
+	r := startActivity(t, filepath.Join(t.TempDir(), "activity.json"))
+	turns := activityTurn("inProgress", 0)
+	turns[0].AutomaticWaits = map[string]activityToolWait{"wait": {TurnID: "turn", Reason: "subagents"}}
+	turns[0].CountsKnown = true
+	r.disconnected("connection:1", "thread")
+	r.connected("thread", "connection:2", 3000)
+	r.reconcile("thread", "connection:2", turns, map[string]any{"type": "active"}, 3000, 0)
+	r.reconcile("thread", "connection:2", turns, map[string]any{"type": "active"}, 6000, r.revision("thread"))
+	got := r.snapshot("thread", turns, "thread", 6000)
+	if got.CurrentState != "waiting" || got.WaitReason != "subagents" || got.WorkingMS != 0 || got.OpenWaitingMS != 3000 {
+		t.Fatalf("lost ongoing team wait: %#v", got)
+	}
+}
+
+func TestTurnMetadataAutomaticWaitEvidence(t *testing.T) {
+	metadata := turnMetadata(map[string]any{"id": "turn", "items": []any{
+		map[string]any{"id": "sleep", "type": "sleep", "durationMs": float64(5000)},
+		map[string]any{"id": "active", "type": "collabAgentToolCall", "tool": "wait", "senderThreadId": "thread", "status": "inProgress"},
+		map[string]any{"id": "done", "type": "collabAgentToolCall", "tool": "wait", "senderThreadId": "thread", "status": "completed"},
+		map[string]any{"id": "foreign", "type": "collabAgentToolCall", "tool": "wait", "senderThreadId": "other", "status": "inProgress"},
+	}}, "thread")
+	if !metadata.HasSleep || len(metadata.AutomaticWaits) != 1 || metadata.AutomaticWaits["active"].Reason != "subagents" {
+		t.Fatal(metadata)
 	}
 }
