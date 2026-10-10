@@ -87,7 +87,8 @@ activity even when native thread status becomes idle during sleep. Unobserved
 turn time remains unclassified. On reconnect, ongoing team waits are restored
 from their native status. Sleep items have no lifecycle status in history; if
 the observer missed the turn start, ambiguous time stays unclassified until
-that turn ends. The additive checkpoint fields can be ignored by
+fresh native active status establishes current work. Recovered coverage starts
+at that observation and never assigns earlier unknown intervals to work. The additive checkpoint fields can be ignored by
 preceding versions; restoring older checkpoints does not invent wait coverage.
 Attachment support uses `NewUploadHandler` and application-owned storage and
 authorization.

@@ -491,6 +491,41 @@ func TestActivityReconnectDuringSleepRemainsUnclassified(t *testing.T) {
 	}
 }
 
+func TestActivityReconnectRecoversWorkAfterHistoricalSleep(t *testing.T) {
+	for _, notification := range []bool{false, true} {
+		t.Run(fmt.Sprint(notification), func(t *testing.T) {
+			r := startActivity(t, filepath.Join(t.TempDir(), "activity.json"))
+			turns := activityTurn("inProgress", 0)
+			turns[0].HasSleep = true
+			r.disconnected("connection:1", "thread")
+			r.connected("thread", "connection:2", 3000)
+			r.reconcile("thread", "connection:2", turns, map[string]any{"type": "idle"}, 3000, 0)
+			if notification {
+				activityEvent(r, "connection:2", "thread/status/changed", nil, map[string]any{"threadId": "thread", "status": map[string]any{"type": "active"}}, 6000)
+			} else {
+				r.reconcile("thread", "connection:2", turns, map[string]any{"type": "active"}, 6000, r.revision("thread"))
+			}
+			r.reconcile("thread", "connection:2", turns, map[string]any{"type": "active"}, 9000, r.revision("thread"))
+			got := r.snapshot("thread", turns, "thread", 9000)
+			if got.CurrentState != "working" || got.StateSinceMS != 6000 || got.WorkingMS != 3000 || got.UnclassifiedMS != 5000 || got.CoverageComplete {
+				t.Fatalf("lost recovered work or invented earlier coverage: %#v", got)
+			}
+			activityEvent(r, "connection:2", "item/started", nil, map[string]any{"threadId": "thread", "turnId": "turn", "item": map[string]any{"id": "sleep", "type": "sleep"}}, 9000)
+			r.reconcile("thread", "connection:2", turns, map[string]any{"type": "active"}, 10000, r.revision("thread"))
+			if got := r.snapshot("thread", turns, "thread", 10000); got.CurrentState != "waiting" || got.WaitReason != "sleep" || got.WorkingMS != 3000 || got.OpenWaitingMS != 1000 {
+				t.Fatalf("active status erased an explicit wait: %#v", got)
+			}
+
+			r.disconnected("connection:2", "thread")
+			r.connected("thread", "connection:3", 10000)
+			r.reconcile("thread", "connection:3", turns, map[string]any{"type": "idle"}, 10000, 0)
+			if got := r.snapshot("thread", turns, "thread", 10000); got.CurrentState != "unclassified" {
+				t.Fatalf("reused another connection's evidence: %#v", got)
+			}
+		})
+	}
+}
+
 func TestActivityReconnectRestoresOngoingTeamWait(t *testing.T) {
 	r := startActivity(t, filepath.Join(t.TempDir(), "activity.json"))
 	turns := activityTurn("inProgress", 0)

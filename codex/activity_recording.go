@@ -254,6 +254,7 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 		}
 	case "turn/started":
 		live.TurnStartObserved = true
+		live.WorkObserved = false
 		live.ToolWaits = map[string]activityToolWait{}
 		live.TurnID = stringValue(params.Turn["id"])
 		live.OpenWaitingMS = 0
@@ -281,6 +282,9 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 		}
 	case "thread/status/changed":
 		live.Flags = params.Status.ActiveFlags
+		if live.Active && params.Status.Type == "active" {
+			live.WorkObserved, live.Ready = true, true
+		}
 		// Runtime idle during an interruptible sleep does not end its turn.
 		// Turn lifecycle and history establish that boundary.
 	default:
@@ -366,6 +370,7 @@ func (r *ActivityRecorder) reconcile(threadID, connection string, turns []TurnMe
 		}
 		if previousTurn != live.TurnID {
 			live.TurnStartObserved = false
+			live.WorkObserved = false
 			live.OpenWaitingMS = 0
 			live.ToolWaits = map[string]activityToolWait{}
 		}
@@ -374,10 +379,13 @@ func (r *ActivityRecorder) reconcile(threadID, connection string, turns []TurnMe
 		}
 		if live.Active {
 			latest := turns[len(turns)-1]
-			// Sleep items have no lifecycle status in native history. If we
-			// missed the turn start, they cannot prove whether sleep has ended.
-			// Keep the remainder unclassified rather than invent working time.
-			live.Ready = !latest.HasSleep || live.TurnStartObserved
+			// Native active status proves current work after reconnect, even
+			// when historical sleep items have no completion status. Coverage
+			// starts at this observation; earlier ambiguous time stays unknown.
+			if statusValue(status) == "active" {
+				live.WorkObserved = true
+			}
+			live.Ready = !latest.HasSleep || live.TurnStartObserved || live.WorkObserved
 			for id, wait := range live.ToolWaits {
 				if latest.CountsKnown && wait.Reason == "subagents" {
 					delete(live.ToolWaits, id)

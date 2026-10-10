@@ -394,7 +394,11 @@ display estimates and must not be written back as observation. Disconnects and
 restarts end coverage at the last durable checkpoint. Unobserved historical
 and offline turn intervals remain in `unclassifiedMs`; they are never assigned
 to work. `coverageComplete` and `coverageReason` expose missing coverage, and
-`timingApproximate` identifies observation precision. No historical approval
+`timingApproximate` identifies observation precision. After reconnect during an
+ambiguous historical sleep, fresh native active status can establish current work
+without requiring a new turn. That evidence belongs only to the current connection
+and turn. Existing automatic and blocking waits still take precedence; unknown
+intervals before recovery remain unclassified. No historical approval
 or question durations are reconstructed from rollout text. Summary coverage
 must fit the authoritative turn bounds. Changed or ambiguous bounds remain
 unclassified; second-precision completion timestamps discard the observed

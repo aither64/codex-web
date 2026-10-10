@@ -82,6 +82,7 @@ type activityObservation struct {
 	Connected         bool                        `json:"-"`
 	Ready             bool                        `json:"-"`
 	TurnStartObserved bool                        `json:"-"`
+	WorkObserved      bool                        `json:"-"`
 	TurnID            string                      `json:"turnId,omitempty"`
 	Active            bool                        `json:"active"`
 	Flags             []string                    `json:"-"`
