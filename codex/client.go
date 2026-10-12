@@ -427,7 +427,9 @@ type SendAcknowledgement struct {
 }
 
 type ThreadSettings struct {
-	Model             string       `json:"model,omitempty"`
+	Model string `json:"model,omitempty"`
+	// ModelProvider is a lifecycle override, not a thread/settings/update field.
+	ModelProvider     string       `json:"modelProvider,omitempty"`
 	ReasoningEffort   string       `json:"reasoningEffort,omitempty"`
 	CollaborationMode string       `json:"collaborationMode,omitempty"`
 	Policy            ThreadPolicy `json:"policy,omitempty"`
@@ -829,6 +831,12 @@ type ClientOptions struct {
 	// calling this client. Nil retains ordinary subscription behavior. Explicit
 	// activation and sends remain the caller's responsibility.
 	AllowImplicitResume func(threadID string) bool
+	// LifecycleSettings resolves application-owned provider and retained model
+	// settings immediately before every start, resume, fork and reconnect resume.
+	// An empty thread ID denotes a new thread. Explicit model/effort parameters
+	// take precedence; the resolved provider takes precedence over caller input.
+	// The resolver may perform reads, but must not issue lifecycle requests.
+	LifecycleSettings func(context.Context, string) (ThreadSettings, error)
 	// ObserverOnly prevents responses, unsupported-request rejections and
 	// thread-setting overrides. Use a dedicated client for passive monitoring.
 	ObserverOnly     bool
@@ -1052,7 +1060,30 @@ func (c *Client) requestConnectedGeneration(ctx context.Context, expectedGenerat
 		defer cancel()
 		ctx = admitted
 	}
-	return c.requestOn(ctx, connection, generation, method, params, result)
+	params, provider, err := c.lifecycleParams(ctx, method, params)
+	if err != nil {
+		return err
+	}
+	if provider == "" {
+		return c.requestOn(ctx, connection, generation, method, params, result)
+	}
+	var response json.RawMessage
+	if err := c.requestOn(ctx, connection, generation, method, params, &response); err != nil {
+		return err
+	}
+	var routing struct {
+		ModelProvider string `json:"modelProvider"`
+	}
+	if err := json.Unmarshal(response, &routing); err != nil {
+		return fmt.Errorf("decode Codex lifecycle routing: %w", err)
+	}
+	if routing.ModelProvider != provider {
+		return fmt.Errorf("Codex lifecycle provider mismatch: requested %q, effective %q", provider, routing.ModelProvider)
+	}
+	if result == nil {
+		return nil
+	}
+	return json.Unmarshal(response, result)
 }
 
 func (c *Client) requestOn(
@@ -3151,6 +3182,9 @@ func (c *Client) settingsParams(settings ThreadSettings, params map[string]any, 
 	applyThreadMCP(config, settings.Policy)
 	if settings.Model != "" {
 		params["model"] = settings.Model
+	}
+	if settings.ModelProvider != "" {
+		params["modelProvider"] = settings.ModelProvider
 	}
 	if settings.ReasoningEffort != "" {
 		config["model_reasoning_effort"] = settings.ReasoningEffort

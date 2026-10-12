@@ -332,6 +332,17 @@ if COVERAGE_ONLY:
 for message in client_requests:
     validate("ClientRequest.json", message, f"client request {message['method']}")
 
+for method, name in (("thread/start", "ThreadStart"), ("thread/resume", "ThreadResume"), ("thread/fork", "ThreadFork")):
+    require_root_property(f"v2/{name}Params.json", "modelProvider", "explicit lifecycle routing")
+    require_root_property(f"v2/{name}Response.json", "modelProvider", "effective lifecycle routing")
+    routing_schema = json.loads((SCHEMA_DIR / f"v2/{name}Response.json").read_text())
+    if "modelProvider" not in routing_schema.get("required", []):
+        raise ValueError("effective lifecycle provider must be required")
+    params = {"modelProvider": "pool", "model": "test-model", "config": {"model_reasoning_effort": "low"}}
+    if method != "thread/start":
+        params["threadId"] = "thread-1"
+    validate("ClientRequest.json", request(method, params), "lifecycle provider override")
+
 require_root_property(
     "v2/ThreadListParams.json", "useStateDbOnly", "database-only thread discovery"
 )

@@ -16,6 +16,16 @@ The package does not decide who may access a conversation. Your application
 maps its own opaque conversation ID to the trusted Codex thread, working
 directory, App Server client, and allowed operations.
 
+Applications can pass `ThreadSettings.ModelProvider` on lifecycle calls or set
+`ClientOptions.LifecycleSettings` to resolve routing before every start, resume,
+fork and reconnect. The resolver supplies retained model and reasoning effort
+when the caller omits them. Explicit caller model/effort settings take precedence;
+the application resolver owns provider selection. A requested provider must match
+the top-level effective provider in the native response. A mismatch is an error,
+including when an already loaded thread ignores a provider override. Changing
+existing routing requires the application's own idle transition and recovery
+workflow. Passive observer clients do not resume threads or resolve routing.
+
 ## Try the local example
 
 The reference application serves one trusted conversation on a loopback
