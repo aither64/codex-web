@@ -727,7 +727,7 @@ func TestEphemeralSinkFrameAndAggregateBounds(t *testing.T) {
 }
 
 func TestEphemeralStaticProfilePreconnection(t *testing.T) {
-	for _, pair := range [][2]string{{"gpt-6-luna", "low"}, {"gpt-5.5", "high"}, {"gpt-5.5 ", "low"}, {"", "low"}} {
+	for _, pair := range [][2]string{{"gpt-6.1-sol", "low"}, {"gpt-5.5", "high"}, {"gpt-5.5 ", "low"}, {"", "low"}} {
 		t.Run(pair[0]+"/"+pair[1], func(t *testing.T) {
 			opts := ephemeralTestOptions(t)
 			opts.Model, opts.Effort = pair[0], pair[1]
@@ -837,11 +837,74 @@ func TestEphemeralCatalogIsPublicImmutableMetadata(t *testing.T) {
 	if err := os.Link(path, link); err != nil {
 		t.Fatal(err)
 	}
-	if !validEphemeralCatalog(link) {
+	if !validEphemeralCatalog(link, "gpt-5.5") {
 		t.Fatal("public read-only catalog acquired private-file ownership/link rules")
 	}
 	content, err := os.ReadFile(path)
 	if err != nil || len(content) != 472512 {
 		t.Fatal("full original catalog fixture changed")
+	}
+}
+
+func TestEphemeralLunaUsesToolFreeCatalog(t *testing.T) {
+	original, err := os.ReadFile("testdata/ephemeral-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived, err := os.ReadFile("ephemeral_luna_models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var full, selected struct {
+		Models []map[string]any `json:"models"`
+	}
+	if json.Unmarshal(original, &full) != nil || json.Unmarshal(derived, &selected) != nil || len(selected.Models) != 1 {
+		t.Fatal("invalid profile catalogs")
+	}
+	var luna map[string]any
+	for _, model := range full.Models {
+		if model["slug"] == "gpt-6-luna" {
+			luna = model
+			break
+		}
+	}
+	if luna == nil || luna["tool_mode"] != "code_mode_only" {
+		t.Fatal("native Luna profile changed")
+	}
+	luna["tool_mode"] = "direct"
+	luna["experimental_supported_tools"] = []any{}
+	luna["use_responses_lite"] = false
+	expected, _ := json.Marshal(luna)
+	actual, _ := json.Marshal(selected.Models[0])
+	if string(actual) != string(expected) {
+		t.Fatal("utility profile changes more than Luna tool metadata")
+	}
+	path := filepath.Join(t.TempDir(), "luna-models.json")
+	if err := os.WriteFile(path, derived, 0444); err != nil {
+		t.Fatal(err)
+	}
+	opts := ephemeralTestOptions(t)
+	originalPath := opts.ModelCatalogFile
+	opts.Model, opts.ModelCatalogFile = "gpt-6-luna", path
+	f := &ephemeralFake{models: map[string]any{"data": []any{map[string]any{"model": "gpt-6-luna", "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}}}}, "nextCursor": nil}, config: map[string]any{"config": map[string]any{"model_catalog_json": path}, "origins": map[string]any{"model_catalog_json": map[string]any{"name": map[string]any{"type": "sessionFlags"}}}}}
+	client := newTestClient(f.serve(t))
+	defer client.Close()
+	result, err := runEphemeralTest(t, client, opts)
+	if err != nil || result.Text == "" {
+		t.Fatalf("Luna failed: %v", err)
+	}
+	for _, call := range f.snapshot() {
+		if call["method"] == "thread/start" || call["method"] == "turn/start" {
+			if call["params"].(map[string]any)["model"] != "gpt-6-luna" {
+				t.Fatal("model changed")
+			}
+		}
+	}
+	for _, pair := range []struct{ model, catalog string }{{"gpt-6-luna", originalPath}, {"gpt-5.5", path}} {
+		opts.Model, opts.ModelCatalogFile = pair.model, pair.catalog
+		_, err := runEphemeralTest(t, New("/must-not-connect"), opts)
+		if !errors.Is(err, ErrEphemeralIsolation) {
+			t.Fatalf("mismatched model/catalog accepted: %v", err)
+		}
 	}
 }

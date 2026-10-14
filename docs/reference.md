@@ -610,14 +610,16 @@ Codex build they deploy.
 Go API for trusted application callers; there is no browser route for selecting
 its socket, paths, model or restriction settings.
 
-The supported profile is Codex 0.160.0 with `Model: "gpt-5.5"` and
-`Effort: "low"`. Other pairs fail with `ErrEphemeralSettings` before connecting.
-The caller runs a dedicated utility App Server with the full original model
-catalog selected at startup. This helper does not support CodeModeOnly models
-or certify an arbitrary daemon. Model names and `model/list` alone do not
+The supported profiles use Codex 0.160.0 and `Effort: "low"`, with either
+`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Each requires its matching
+immutable catalog below. Other pairs fail with `ErrEphemeralSettings` before
+connecting.
+The caller runs a dedicated utility App Server with the selected profile
+catalog at startup. The profile must use direct tool mode. The helper cannot
+certify an arbitrary daemon. Model names and `model/list` alone do not
 establish tool mode: an ordinary dynamic catalog can refresh that hidden field.
 
-Options require that exact pair, explicit nonempty `Instructions`,
+Options require one of those exact pairs, explicit nonempty `Instructions`,
 UTF-8 text `Input`, and a JSON-object `OutputSchema`. `Directory` is an empty,
 canonical absolute directory owned by the application user, with mode 0700 and
 a private parent, outside workspace/project trees. `InstructionFile` is a
@@ -635,9 +637,20 @@ Empty-file callers of this unreleased API must update together with the provider
 dependency; there is no legacy empty-file fallback.
 
 `ModelCatalogFile` is a canonical absolute regular read-only file containing
-the full unchanged original Codex 0.160.0 model catalog, at most 1 MiB. Its
-SHA-256 is
+the selected profile catalog, at most 1 MiB. GPT-5.5 uses the full unchanged
+original Codex 0.160.0 catalog, SHA-256
 `fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b`.
+GPT-6 Luna uses `codex/ephemeral_luna_models.json`, SHA-256
+`1798846a6ac93cd8ec89facc13a0b3d344d9dab9d0182da53862e098a275216b`.
+It contains the original Luna metadata
+with `tool_mode` set to `direct`, `experimental_supported_tools` emptied and
+`use_responses_lite` set to `false`. The native request uses the standard
+Responses shape with top-level `tools: []` and no `additional_tools` input role.
+These settings prevent the model profile from introducing a code executor,
+user questions or the clock tool. Catalogs are bound to their model; they cannot be
+interchanged. Normal conversation catalogs remain unchanged. GPT-5.5 availability
+depends on the provider; ChatGPT sign-in no longer offers it after its
+[retirement](https://developers.openai.com/codex/models/).
 Supply an immutable resource for the utility daemon's entire lifetime; resolve
 package links before passing its path. This public metadata file does not use
 the private instruction file's ownership, mode-0600 or hard-link rules. Missing,
@@ -791,3 +804,10 @@ go test -mod=readonly -tags=codex_integration ./codex \
 A passing schema or fake-transport check does not authorize live use. Record the
 exact binary/profile/model identities and executed isolation evidence before
 enabling a deployment that uses this helper.
+
+For Luna profile acceptance, run that same native hostile-dispatch suite with
+`CODEX_EPHEMERAL_TEST_MODEL=gpt-6-luna` and `CODEX_EPHEMERAL_TEST_CATALOG` set to
+the canonical immutable `codex/ephemeral_luna_models.json` path from the reviewed
+provider revision. The default invocation retains the original GPT-5.5 profile.
+Both runs must prove empty tool exposure and rejection of model-emitted calls;
+fake-client tests do not establish native dispatch isolation.

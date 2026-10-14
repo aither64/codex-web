@@ -34,13 +34,14 @@ var (
 const EphemeralInstructionFileContent = "Preserve the current utility task and its explicit instructions.\n"
 
 const (
-	ephemeralCatalogHash  = "fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b"
-	ephemeralCatalogLimit = 1024 * 1024
-	ephemeralFrameLimit   = 256 * 1024
-	ephemeralEventLimit   = 256
-	ephemeralByteLimit    = 1024 * 1024
-	ephemeralOutputLimit  = 16 * 1024
-	ephemeralCleanup      = 250 * time.Millisecond
+	ephemeralLunaCatalogHash = "1798846a6ac93cd8ec89facc13a0b3d344d9dab9d0182da53862e098a275216b"
+	ephemeralCatalogHash     = "fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b"
+	ephemeralCatalogLimit    = 1024 * 1024
+	ephemeralFrameLimit      = 256 * 1024
+	ephemeralEventLimit      = 256
+	ephemeralByteLimit       = 1024 * 1024
+	ephemeralOutputLimit     = 16 * 1024
+	ephemeralCleanup         = 250 * time.Millisecond
 )
 
 //go:embed ephemeral_policy.json
@@ -57,8 +58,8 @@ var ephemeralPolicyJSON []byte
 type EphemeralTurnOptions struct {
 	Directory       string
 	InstructionFile string
-	// ModelCatalogFile is the full immutable original catalog used by a trusted
-	// naming-only daemon through its startup CLI override.
+	// ModelCatalogFile is the immutable catalog for the selected profile,
+	// used by a naming-only daemon through its startup CLI override.
 	ModelCatalogFile string
 	Model            string
 	Effort           string
@@ -83,10 +84,10 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
-	if opts.Model != "gpt-5.5" || opts.Effort != "low" {
+	if (opts.Model != "gpt-5.5" && opts.Model != "gpt-6-luna") || opts.Effort != "low" {
 		return result, ErrEphemeralSettings
 	}
-	valid := validEphemeralOptions(opts) && validEphemeralCatalog(opts.ModelCatalogFile)
+	valid := validEphemeralOptions(opts) && validEphemeralCatalog(opts.ModelCatalogFile, opts.Model)
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
@@ -354,7 +355,7 @@ func validEphemeralOptions(opts EphemeralTurnOptions) bool {
 
 // The catalog is public package metadata, not a private instruction file. The
 // trusted caller keeps this exact read-only resource for the daemon lifetime.
-func validEphemeralCatalog(path string) bool {
+func validEphemeralCatalog(path, model string) bool {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return false
 	}
@@ -376,7 +377,11 @@ func validEphemeralCatalog(path string) bool {
 		return false
 	}
 	digest := sha256.Sum256(content)
-	return hex.EncodeToString(digest[:]) == ephemeralCatalogHash
+	expected := ephemeralCatalogHash
+	if model == "gpt-6-luna" {
+		expected = ephemeralLunaCatalogHash
+	}
+	return hex.EncodeToString(digest[:]) == expected
 }
 
 func privateEphemeralPath(path string, directory bool) bool {

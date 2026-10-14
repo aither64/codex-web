@@ -523,6 +523,15 @@ func TestEphemeralNamespaceOwnedHelper(t *testing.T) {
 // Native builtin OpenAI HTTP-fallback coverage exercises HTTP/SSE after a real
 // upgrade refusal. It does not cover successful WebSocket framing, continuation
 // caching, reconnects or hostile delivery specifically over WebSockets.
+// The default retains the original API-key profile. Explicit Luna acceptance
+// runs this same hostile-dispatch suite with its immutable utility catalog.
+func integrationUtilityModel() string {
+	if model := os.Getenv("CODEX_EPHEMERAL_TEST_MODEL"); model != "" {
+		return model
+	}
+	return "gpt-5.5"
+}
+
 func TestEphemeralProtocolIntegration(t *testing.T) {
 	binary := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_BINARY")
 	expected := os.Getenv("CODEX_EPHEMERAL_TEST_SHA256")
@@ -578,7 +587,7 @@ func TestEphemeralProtocolIntegration(t *testing.T) {
 			unchanged = low && model.ToolMode == nil && !model.Lite && len(model.Tools) == 0
 		}
 	}
-	if !unchanged || !validEphemeralCatalog(filepath.Join(source, "models-manager/models.json")) {
+	if !unchanged || !validEphemeralCatalog(filepath.Join(source, "models-manager/models.json"), "gpt-5.5") {
 		t.Fatal("candidate must retain original gpt-5.5 Direct/non-Lite metadata")
 	}
 	ip := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_IP")
@@ -1519,9 +1528,13 @@ func newEphemeralIntegrationHarness(t *testing.T, binary, nft string, owner ephe
 	if h.canaryHits.Load() != 0 {
 		t.Fatal("egress guard canary was reached")
 	}
-	h.catalog, err = filepath.EvalSymlinks(filepath.Join(os.Getenv("CODEX_EPHEMERAL_TEST_SOURCE"), "models-manager/models.json"))
-	if err != nil || !validEphemeralCatalog(h.catalog) {
-		t.Fatal("immutable original catalog unavailable")
+	catalogPath := filepath.Join(os.Getenv("CODEX_EPHEMERAL_TEST_SOURCE"), "models-manager/models.json")
+	if integrationUtilityModel() == "gpt-6-luna" {
+		catalogPath = os.Getenv("CODEX_EPHEMERAL_TEST_CATALOG")
+	}
+	h.catalog, err = filepath.EvalSymlinks(catalogPath)
+	if err != nil || !validEphemeralCatalog(h.catalog, integrationUtilityModel()) {
+		t.Fatal("immutable utility profile catalog unavailable")
 	}
 	h.utilitySocket = filepath.Join(root, "naming.sock")
 	h.startupCwd = filepath.Join(root, "startup")
@@ -1799,7 +1812,7 @@ func (h *ephemeralIntegrationHarness) respond(w http.ResponseWriter, r *http.Req
 	index := len(h.requests)
 	mode, namespace, attack, control := h.mode, h.namespace, h.attack, h.controlMode
 	if !control {
-		if request["model"] != "gpt-5.5" {
+		if request["model"] != integrationUtilityModel() {
 			h.failure = "model substitution"
 		}
 		reasoning, _ := request["reasoning"].(map[string]any)
@@ -2570,7 +2583,7 @@ func (h *ephemeralIntegrationHarness) proxy(t *testing.T, mode string, generatio
 						policy["tools.experimental_request_user_input.enabled"] = true
 					}
 					if message.Method == "turn/start" {
-						params["collaborationMode"] = map[string]any{"mode": "plan", "settings": map[string]any{"model": "gpt-5.5", "reasoning_effort": "low", "developer_instructions": nil}}
+						params["collaborationMode"] = map[string]any{"mode": "plan", "settings": map[string]any{"model": integrationUtilityModel(), "reasoning_effort": "low", "developer_instructions": nil}}
 					}
 					raw, _ = json.Marshal(object)
 				}
@@ -2877,7 +2890,7 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	client := New(h.proxy(t, mode, generation))
 	defer client.Close()
 	opts := ephemeralTestOptions(t)
-	opts.ModelCatalogFile = h.catalog
+	opts.ModelCatalogFile, opts.Model = h.catalog, integrationUtilityModel()
 	// Provision the provider-owned nonempty file contract used by real callers.
 	content, fileErr := os.ReadFile(opts.InstructionFile)
 	if fileErr != nil || string(content) != EphemeralInstructionFileContent {
@@ -3146,7 +3159,7 @@ func (h *ephemeralIntegrationHarness) managedConflict(t *testing.T) {
 	client := New(h.utilitySocket)
 	defer client.Close()
 	opts := ephemeralTestOptions(t)
-	opts.ModelCatalogFile = h.catalog
+	opts.ModelCatalogFile, opts.Model = h.catalog, integrationUtilityModel()
 	_, err := runEphemeralTest(t, client, opts)
 	if !errors.Is(err, ErrEphemeralIsolation) {
 		t.Fatalf("managed restriction not refused: %v", err)
