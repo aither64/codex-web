@@ -129,7 +129,7 @@ func scanOwnActivityTurns(ctx context.Context, path, root string, cutoff uint64,
 	if limit == 0 {
 		limit = info.Size()
 	}
-	if limit < 0 || limit > info.Size() || limit > readLimit {
+	if limit < 0 || limit > info.Size() {
 		return errors.New("activity lineage exceeds available bounded history")
 	}
 	if meta.Base != nil && meta.Base.EndOrdinal > cutoff {

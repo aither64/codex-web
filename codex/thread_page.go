@@ -231,7 +231,7 @@ func pageItem(turn map[string]any, item map[string]any) []TranscriptEntry {
 type pageRequestFunc func(context.Context, string, any, any) error
 
 func (c *Client) ReadThreadPage(ctx context.Context, threadID, cursor string) (TranscriptPage, error) {
-	return c.readThreadPage(ctx, threadID, cursor, c.Request)
+	return c.readThreadPage(ctx, threadID, cursor, c.pagedHistoryRequest)
 }
 
 func (c *Client) readThreadPage(ctx context.Context, threadID, cursor string, request pageRequestFunc) (TranscriptPage, error) {

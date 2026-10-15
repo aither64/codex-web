@@ -746,6 +746,8 @@ func ResolveForkThreadSettings(
 }
 
 type Client struct {
+	historyPageMu     sync.Mutex
+	historyPageLimit  int
 	socket            string
 	ephemeral         *ephemeralSink // private utility only; installed before Ensure
 	options           ClientOptions
@@ -810,6 +812,8 @@ type ClientInfo struct {
 }
 
 type ClientOptions struct {
+	// HistoryReader optionally isolates history I/O; its owner must close it.
+	HistoryReader         HistoryReader
 	ClientInfo            ClientInfo
 	DeveloperInstructions string
 	// PreserveThreadInstructionsOnResume omits an instruction override from
@@ -3825,6 +3829,9 @@ func (c *Client) SetName(ctx context.Context, threadID, name string) error {
 }
 
 func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, error) {
+	if c.options.HistoryReader != nil {
+		return c.readRecentThread(ctx, threadID)
+	}
 	var metadata struct {
 		Thread map[string]any `json:"thread"`
 	}

@@ -103,6 +103,30 @@ preceding versions; restoring older checkpoints does not invent wait coverage.
 Attachment support uses `NewUploadHandler` and application-owned storage and
 authorization.
 
+## History reads
+
+Applications with large conversations should share a `codex.NewHistoryPool(socket)`
+through `ClientOptions.HistoryReader` on their interactive and observer clients.
+The application closes the pool after those clients stop. The pool has two
+passive connections and admits only history reads. It keeps history failures
+separate from live subscriptions and approval offers. Omitting the option keeps
+the existing client transport behavior.
+
+With this reader, activity uses turn metadata and cursor-paged items. It retains
+counts and small item projections rather than message bodies or tool output.
+Completed turns contribute cached totals; cold history backfills in small batches
+and reports `refreshing: true` with `countsComplete: false` until it finishes.
+Fork verification runs in the background and then scans only appended records.
+These caches are disposable and do not change activity checkpoint formats.
+
+Item reads start at 32 entries. If a reply exceeds the 64 MiB message safeguard,
+the reader halves the page size and retries its original cursor. A single item
+that exceeds the safeguard returns an explicit error. Conversation length has
+no total byte or turn limit. Transcript paging keeps full content available
+without requesting whole turns. Hosts may retain their last good snapshot with
+`stale: true`; its observation timestamp must remain unchanged, and it must not
+produce fresh notifications.
+
 ## Reference and development
 
 The [technical reference](docs/reference.md) contains the complete Go and

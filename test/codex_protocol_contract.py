@@ -315,9 +315,27 @@ client_source += "\n" + "\n".join(
     source.read_text() for source in sorted(CLIENT_SOURCE.parent.glob("*.go"))
     if source != CLIENT_SOURCE and not source.name.endswith("_test.go")
 )
-client_requests.append(request("thread/read", {"threadId": "thread-1", "excludeTurns": True}))
+client_requests.extend([
+    request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
+    request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
+    request("thread/turns/list", {
+        "threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": "notLoaded",
+    }),
+    request("thread/turns/list", {
+        "threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": "notLoaded",
+    }),
+    request("thread/turns/list", {
+        "threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": "notLoaded", "cursor": "older-page",
+    }),
+    request("thread/turns/list", {
+        "threadId": "thread-1", "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded",
+    }),
+    request("thread/items/list", {
+        "threadId": "thread-1", "turnId": "turn-1", "limit": 32, "sortDirection": "asc", "cursor": "older-items",
+    }),
+])
 call_pattern = re.compile(
-    r'\b(?:Request|requestConnected|requestConnectedGeneration|requestOn|request)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
+    r'\b(?:Request|historyRequest|requestConnected|requestConnectedGeneration|requestOn|request)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
     re.DOTALL,
 )
 implemented_calls = Counter(call_pattern.findall(client_source))

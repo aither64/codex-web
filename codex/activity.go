@@ -14,6 +14,8 @@ import (
 // time includes observation through ObservedAtMS. A UI may project an open state
 // from ObservedAtMS, but must not persist that browser projection as coverage.
 type ActivitySnapshot struct {
+	Stale             bool   `json:"stale,omitempty"`
+	Refreshing        bool   `json:"refreshing,omitempty"`
 	ThreadID          string `json:"threadId"`
 	CurrentTurnID     string `json:"currentTurnId,omitempty"`
 	Messages          int    `json:"messages"`
@@ -161,6 +163,14 @@ func (c *Client) activityConnection(generation uint64) string {
 func (c *Client) ReadActivity(ctx context.Context, threadID string) (ActivitySnapshot, error) {
 	history := c.retainTurnHistory(threadID, false)
 	defer c.releaseTurnHistory(threadID, false)
+	if c.options.HistoryReader != nil {
+		select {
+		case history.snapshotGate <- struct{}{}:
+		case <-ctx.Done():
+			return ActivitySnapshot{}, ctx.Err()
+		}
+		defer func() { <-history.snapshotGate }()
+	}
 	if err := c.options.ActivityRecorder.retain(ctx, threadID, false); err != nil {
 		return ActivitySnapshot{}, err
 	}
@@ -169,13 +179,20 @@ func (c *Client) ReadActivity(ctx context.Context, threadID string) (ActivitySna
 	var metadata struct {
 		Thread map[string]any `json:"thread"`
 	}
-	if err := c.Request(ctx, "thread/read", map[string]any{"threadId": threadID, "excludeTurns": true}, &metadata); err != nil {
+	if err := c.historyRequest(ctx, "thread/read", map[string]any{"threadId": threadID, "excludeTurns": true}, &metadata); err != nil {
 		return ActivitySnapshot{}, err
 	}
 	if metadata.Thread == nil || stringValue(metadata.Thread["id"]) != threadID {
 		return ActivitySnapshot{}, errors.New("thread/read returned invalid activity identity")
 	}
-	rawTurns, err := c.readTurnHistory(ctx, threadID, "full", stringValue(metadata.Thread["path"]), history)
+	var rawTurns []map[string]any
+	complete := true
+	var err error
+	if c.options.HistoryReader != nil {
+		rawTurns, complete, err = c.readActivityHistory(ctx, metadata.Thread, history)
+	} else {
+		rawTurns, err = c.readTurnHistory(ctx, threadID, "full", stringValue(metadata.Thread["path"]), history)
+	}
 	if err != nil && !c.freshThreadMissingSourceRollout(metadata.Thread, threadID, err) {
 		return ActivitySnapshot{}, err
 	}
@@ -183,7 +200,12 @@ func (c *Client) ReadActivity(ctx context.Context, threadID string) (ActivitySna
 	for _, turn := range rawTurns {
 		turns = append(turns, turnMetadata(turn, threadID))
 	}
-	turns, scope := c.ownActivityTurns(ctx, metadata.Thread, turns)
+	scope := "unknown"
+	if c.options.HistoryReader != nil && history.activity != nil {
+		turns, scope = c.ownPagedActivityTurns(ctx, metadata.Thread, turns, history.activity)
+	} else {
+		turns, scope = c.ownActivityTurns(ctx, metadata.Thread, turns)
+	}
 	c.connectionMu.Lock()
 	generation := c.generation
 	c.connectionMu.Unlock()
@@ -192,9 +214,19 @@ func (c *Client) ReadActivity(ctx context.Context, threadID string) (ActivitySna
 	c.options.ActivityRecorder.seedCurrent(ctx, threadID, turns)
 	c.options.ActivityRecorder.reconcile(threadID, c.activityConnection(generation), turns, status, now, revision)
 	checkpointErr := c.options.ActivityRecorder.flush(ctx, threadID)
-	result := c.options.ActivityRecorder.snapshotContext(ctx, threadID, turns, scope, now, checkpointErr)
+	var prefix *activityPrefix
+	if c.options.HistoryReader != nil && history.activity != nil {
+		prefix = &history.activity.prefix
+	}
+	result := c.options.ActivityRecorder.snapshotContextCached(ctx, threadID, turns, scope, now, checkpointErr, prefix)
+	if !complete || scope == "unknown" && history.activity != nil && history.activity.lineagePending() {
+		result.CountsComplete = false
+		result.CoverageComplete = false
+		result.Refreshing = true
+		result.CoverageReason = "History statistics are loading."
+	}
 	result.CreatedAtMS = integerValue(metadata.Thread["createdAt"]) * 1000
-	if scope != "unknown" && result.CreatedAtMS > 0 {
+	if complete && scope != "unknown" && result.CreatedAtMS > 0 {
 		end := now
 		if len(turns) > 0 {
 			end = turns[0].StartedAtMS

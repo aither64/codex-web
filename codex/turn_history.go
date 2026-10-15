@@ -35,8 +35,10 @@ type cachedTurnHistory struct {
 const idleTurnHistoryLimit = 8
 
 type threadHistoryCache struct {
-	gate   chan struct{}
-	cached cachedTurnHistory // Protected by gate.
+	snapshotGate chan struct{}
+	activity     *activityHistory
+	gate         chan struct{}
+	cached       cachedTurnHistory // Protected by gate.
 	// Ownership and retry eligibility are protected by Client.turnHistoryMu.
 	readers  int
 	watchers int
@@ -51,7 +53,7 @@ func (c *Client) retainTurnHistory(threadID string, watch bool) *threadHistoryCa
 	}
 	cache := c.turnHistory[threadID]
 	if cache == nil {
-		cache = &threadHistoryCache{gate: make(chan struct{}, 1)}
+		cache = &threadHistoryCache{gate: make(chan struct{}, 1), snapshotGate: make(chan struct{}, 1)}
 		c.turnHistory[threadID] = cache
 	}
 	if watch {
@@ -174,9 +176,6 @@ func (c *Client) readTurnHistory(ctx context.Context, threadID, firstView, rollo
 		id := stringValue(turn["id"])
 		if id == "" || seenIDs[id] {
 			return errors.New("thread/turns/list returned missing or repeated turn identity")
-		}
-		if len(turns) >= 100000 {
-			return errors.New("thread history exceeds activity limit")
 		}
 		seenIDs[id] = true
 		if cursor != "" && firstView == "full" {

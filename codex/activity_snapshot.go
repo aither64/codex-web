@@ -36,6 +36,31 @@ func (r *ActivityRecorder) seedCurrent(ctx context.Context, threadID string, tur
 }
 
 func (r *ActivityRecorder) snapshotContext(ctx context.Context, threadID string, turns []TurnMetadata, scope string, now int64, checkpointErr error) ActivitySnapshot {
+	return r.snapshotContextCached(ctx, threadID, turns, scope, now, checkpointErr, nil)
+}
+
+type activityPrefix struct {
+	count              int
+	first, last, scope string
+	totals             ActivitySnapshot
+}
+
+func (result *ActivitySnapshot) addHistory(value ActivitySnapshot) {
+	result.SentMessages += value.SentMessages
+	result.ReceivedMessages += value.ReceivedMessages
+	result.TotalToolCalls += value.TotalToolCalls
+	result.WorkingMS += value.WorkingMS
+	result.WaitingMS += value.WaitingMS
+	result.BetweenTurnsMS += value.BetweenTurnsMS
+	result.UnclassifiedMS += value.UnclassifiedMS
+	result.CountsComplete = result.CountsComplete && value.CountsComplete
+	result.CoverageComplete = result.CoverageComplete && value.CoverageComplete
+	if value.CoverageStartMS > 0 && (result.CoverageStartMS == 0 || value.CoverageStartMS < result.CoverageStartMS) {
+		result.CoverageStartMS = value.CoverageStartMS
+	}
+}
+
+func (r *ActivityRecorder) snapshotContextCached(ctx context.Context, threadID string, turns []TurnMetadata, scope string, now int64, checkpointErr error, prefix *activityPrefix) ActivitySnapshot {
 	result := ActivitySnapshot{ThreadID: threadID, CurrentState: "idle", ObservedAtMS: now, Scope: scope, TimingApproximate: true, CoverageComplete: true, CountsComplete: scope != "unknown"}
 	if len(turns) > 0 {
 		latest := turns[len(turns)-1]
@@ -92,7 +117,23 @@ func (r *ActivityRecorder) snapshotContext(ctx context.Context, threadID string,
 	if scope == "unknown" {
 		result.CurrentState = "unclassified"
 	}
-	for index, turn := range turns {
+	firstIndex := 0
+	if prefix != nil {
+		if prefix.count > 0 && (prefix.scope != scope || prefix.count > len(turns) || turns[0].ID != prefix.first || turns[prefix.count-1].ID != prefix.last) {
+			*prefix = activityPrefix{}
+		}
+		if prefix.count > 0 {
+			result.addHistory(prefix.totals)
+			firstIndex = prefix.count
+		}
+	}
+	for index := firstIndex; index < len(turns); index++ {
+		turn := turns[index]
+		if prefix != nil && checkpointErr == nil && ctx.Err() != nil {
+			result.CoverageComplete = false
+			result.CountsComplete = false
+			break
+		}
 		result.SentMessages += turn.Messages
 		result.ReceivedMessages += turn.ReceivedMessages
 		result.TotalToolCalls += turn.ToolCalls
@@ -138,6 +179,15 @@ func (r *ActivityRecorder) snapshotContext(ctx context.Context, threadID string,
 			}
 		}
 		result.UnclassifiedMS += end - start - known
+		// flush above settled historical writes. Keep the newest two turns mutable;
+		// older finalized summaries can be folded without reopening every shard.
+		if prefix != nil && checkpointErr == nil && prefix.count == index && index < len(turns)-2 && turn.CountsKnown && turn.CompletedAtMS > 0 && turn.Status != "inProgress" {
+			prefix.count = index + 1
+			prefix.first = turns[0].ID
+			prefix.last = turn.ID
+			prefix.scope = scope
+			prefix.totals = result
+		}
 	}
 	if result.CurrentState == "waiting" && result.OpenWaitingMS == 0 && live != nil {
 		result.OpenWaitingMS = max(int64(0), result.ObservedAtMS-live.SinceMS)
