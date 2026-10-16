@@ -3585,12 +3585,22 @@ func TestConfiguredCodexFreshThreadContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start exact Codex thread: %v\n%s", err, output.String())
 	}
-	materialized, err := client.HistoryMaterialized(ctx, threadID, cwd)
-	if err != nil {
-		t.Fatalf("read exact fresh Codex thread: %v\n%s", err, output.String())
+	// Naming a loaded no-turn thread can flush only its session metadata. Team
+	// setup can likewise leave enough time for that write before the first turn.
+	if err := client.SetName(ctx, threadID, "initial metadata contract"); err != nil {
+		t.Fatal(err)
 	}
-	if materialized {
-		t.Fatal("exact Codex materialized a fresh thread before its first user turn")
+	var materialized bool
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		materialized, err = client.HistoryMaterialized(ctx, threadID, cwd)
+		if err == nil && materialized {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("exact Codex did not persist metadata before its initial turn: %v\n%s", err, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	const goal = "workspace portal protocol contract"
 	if err := client.EnsureInitialMessage(ctx, threadID, cwd, goal, true); err != nil {

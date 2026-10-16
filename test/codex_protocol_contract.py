@@ -192,6 +192,7 @@ client_requests = [
     ),
     request("thread/name/set", {"threadId": "thread-1", "name": "example"}),
     request("thread/read", {"threadId": "thread-1"}),
+    request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1", "includeTurns": False}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),

@@ -159,8 +159,13 @@ recovered.
 `EnsureInitialMessageWithOptions` does not itself durably bind options before
 an initial `turn/start`. A recovering application must prepublish and retain
 the exact binding before that call; the workspace team's Phase 2B creation
-flow owns that durable precondition. It must never retry a materialized initial
-thread with caller-supplied replacement options.
+flow owns that durable precondition. The first-submission grant also permits an
+idle application root whose rollout contains metadata but whose complete turn
+history is empty. Native Codex may persist that metadata before the first turn.
+Without that grant, empty history still refuses submission; matching initial
+history returns success without replaying options. Conflicting or partial
+history never authorizes a new initial turn. `HistoryMaterialized` continues to
+report rollout-file existence for other lifecycle callers.
 
 Nonblocking user-input requests stay pending by default. Set
 `ClientOptions.NonBlockingUserInput` only when the embedding application owns

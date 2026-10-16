@@ -5065,8 +5065,9 @@ func (c *Client) EnsureInitialMessage(ctx context.Context, threadID, cwd, text s
 }
 
 // EnsureInitialMessageWithOptions creates the initial message only for a fresh
-// idle thread. Its optional model, effort, and application context therefore
-// use turn/start and are never replayed against materialized history.
+// idle thread under the caller's durable first-submission grant, including a
+// root with persisted metadata but no turns. Existing matching history never
+// replays optional model, effort, or application context against turn/start.
 func (c *Client) EnsureInitialMessageWithOptions(
 	ctx context.Context, threadID, cwd, text string, allowUnmaterializedStart bool,
 	options TurnOptions,
@@ -5079,34 +5080,42 @@ func (c *Client) EnsureInitialMessageWithOptions(
 	if err != nil {
 		return err
 	}
-	input := []map[string]any{{"type": "text", "text": text}}
-	if !materialized {
-		if !allowUnmaterializedStart {
-			return errors.New("initial request may already have been accepted by the unmaterialized Codex thread")
-		}
-		params := map[string]any{"threadId": threadID, "input": input}
-		if normalizedOptions.Model != "" {
-			params["model"] = normalizedOptions.Model
-		}
-		if normalizedOptions.ReasoningEffort != "" {
-			params["effort"] = normalizedOptions.ReasoningEffort
-		}
-		if additionalContext := normalizedOptions.additionalContextParameter(); additionalContext != nil {
-			params["additionalContext"] = additionalContext
-		}
-		if err := c.Request(ctx, "turn/start", params, nil); err != nil {
+	if materialized {
+		matched, empty, err := c.initialMessageState(ctx, threadID, text)
+		if err != nil {
 			return err
 		}
-		return c.waitForInitialMessage(ctx, threadID, cwd, text)
+		if matched {
+			return nil
+		}
+		if !allowUnmaterializedStart || !empty {
+			return errors.New("materialized Codex thread has no initial user request")
+		}
+		// Native Codex can flush session metadata before the first turn. A
+		// complete empty turn page and the caller's one-time submission grant
+		// permit that root to start, after rechecking its idle identity.
+		if err := c.requireFreshInitialThread(ctx, threadID, cwd); err != nil {
+			return err
+		}
+	} else if !allowUnmaterializedStart {
+		return errors.New("initial request may already have been accepted by the unmaterialized Codex thread")
 	}
-	matched, err := c.initialMessageMatches(ctx, threadID, text)
-	if err != nil {
+	params := map[string]any{
+		"threadId": threadID, "input": []map[string]any{{"type": "text", "text": text}},
+	}
+	if normalizedOptions.Model != "" {
+		params["model"] = normalizedOptions.Model
+	}
+	if normalizedOptions.ReasoningEffort != "" {
+		params["effort"] = normalizedOptions.ReasoningEffort
+	}
+	if additionalContext := normalizedOptions.additionalContextParameter(); additionalContext != nil {
+		params["additionalContext"] = additionalContext
+	}
+	if err := c.Request(ctx, "turn/start", params, nil); err != nil {
 		return err
 	}
-	if !matched {
-		return errors.New("materialized Codex thread has no initial user request")
-	}
-	return nil
+	return c.waitForInitialMessage(ctx, threadID, cwd, text)
 }
 
 func (c *Client) waitForInitialMessage(ctx context.Context, threadID, cwd, text string) error {
@@ -5153,8 +5162,13 @@ func initialHistoryPending(err error) bool {
 }
 
 func (c *Client) initialMessageMatches(ctx context.Context, threadID, text string) (bool, error) {
+	matched, _, err := c.initialMessageState(ctx, threadID, text)
+	return matched, err
+}
+
+func (c *Client) initialMessageState(ctx context.Context, threadID, text string) (matched, empty bool, err error) {
 	if err := c.resumeThread(ctx, threadID); err != nil {
-		return false, err
+		return false, false, err
 	}
 	var page struct {
 		Data *[]struct {
@@ -5166,17 +5180,18 @@ func (c *Client) initialMessageMatches(ctx context.Context, threadID, text strin
 				} `json:"content"`
 			} `json:"items"`
 		} `json:"data"`
+		NextCursor *string `json:"nextCursor"`
 	}
 	if err := c.Request(ctx, "thread/turns/list", map[string]any{
 		"threadId": threadID, "limit": 1, "sortDirection": "asc", "itemsView": "full",
 	}, &page); err != nil {
-		return false, err
+		return false, false, err
 	}
 	if page.Data == nil {
-		return false, errors.New("thread/turns/list returned no data")
+		return false, false, errors.New("thread/turns/list returned no data")
 	}
 	if len(*page.Data) == 0 {
-		return false, nil
+		return false, page.NextCursor == nil || *page.NextCursor == "", nil
 	}
 	var initialRequests []string
 	for _, item := range (*page.Data)[0].Items {
@@ -5186,19 +5201,48 @@ func (c *Client) initialMessageMatches(ctx context.Context, threadID, text strin
 		var parts []string
 		for _, content := range item.Content {
 			if content.Type != "text" {
-				return false, errors.New("Codex thread has a non-text initial request")
+				return false, false, errors.New("Codex thread has a non-text initial request")
 			}
 			parts = append(parts, content.Text)
 		}
 		initialRequests = append(initialRequests, strings.TrimSpace(strings.Join(parts, "\n")))
 	}
 	if len(initialRequests) == 0 {
-		return false, nil
+		return false, false, nil
 	}
 	if len(initialRequests) != 1 || initialRequests[0] != strings.TrimSpace(text) {
-		return false, errors.New("Codex thread already has a different initial request")
+		return false, false, errors.New("Codex thread already has a different initial request")
 	}
-	return true, nil
+	return true, false, nil
+}
+
+// requireFreshInitialThread complements the complete empty turn page. It does
+// not supply the caller's durable first-submission grant or authorize a retry.
+func (c *Client) requireFreshInitialThread(ctx context.Context, threadID, cwd string) error {
+	var metadata struct {
+		Thread struct {
+			ID           string            `json:"id"`
+			Cwd          string            `json:"cwd"`
+			Source       any               `json:"source"`
+			Ephemeral    *bool             `json:"ephemeral"`
+			HistoryMode  string            `json:"historyMode"`
+			Preview      string            `json:"preview"`
+			ForkedFromID *string           `json:"forkedFromId"`
+			Status       map[string]any    `json:"status"`
+			Turns        *[]map[string]any `json:"turns"`
+		} `json:"thread"`
+	}
+	if err := c.Request(ctx, "thread/read", map[string]any{"threadId": threadID}, &metadata); err != nil {
+		return err
+	}
+	t := metadata.Thread
+	if t.ID != threadID || t.Cwd != cwd || !c.threadSource(t.Source) ||
+		t.Ephemeral == nil || *t.Ephemeral || t.HistoryMode != "paginated" ||
+		t.Preview != "" || (t.ForkedFromID != nil && *t.ForkedFromID != "") ||
+		statusValue(t.Status) != "idle" || t.Turns == nil || len(*t.Turns) != 0 {
+		return errors.New("initial request requires a fresh idle application thread")
+	}
+	return nil
 }
 
 func (c *Client) HistoryMaterialized(ctx context.Context, threadID, cwd string) (bool, error) {
