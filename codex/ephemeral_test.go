@@ -15,7 +15,7 @@ import (
 	"github.com/coder/websocket"
 )
 
-// Full unchanged Codex 0.160.0 source catalog, not a reduced model fixture.
+// Full unchanged Codex 0.163.0 source catalog, not a reduced model fixture.
 // Source: codex-rs/models-manager/models.json, SHA-256 ephemeralCatalogHash.
 var ephemeralCatalogFixtures sync.Map
 
@@ -841,7 +841,7 @@ func TestEphemeralCatalogIsPublicImmutableMetadata(t *testing.T) {
 		t.Fatal("public read-only catalog acquired private-file ownership/link rules")
 	}
 	content, err := os.ReadFile(path)
-	if err != nil || len(content) != 472512 {
+	if err != nil || len(content) != 472072 {
 		t.Fatal("full original catalog fixture changed")
 	}
 }

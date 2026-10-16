@@ -34,8 +34,8 @@ var (
 const EphemeralInstructionFileContent = "Preserve the current utility task and its explicit instructions.\n"
 
 const (
-	ephemeralLunaCatalogHash = "1798846a6ac93cd8ec89facc13a0b3d344d9dab9d0182da53862e098a275216b"
-	ephemeralCatalogHash     = "fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b"
+	ephemeralLunaCatalogHash = "049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1"
+	ephemeralCatalogHash     = "943ca7fe1d19ed019054158303f0dbbd80b3bef43b3aa425a71aa7cb3fb52c2b"
 	ephemeralCatalogLimit    = 1024 * 1024
 	ephemeralFrameLimit      = 256 * 1024
 	ephemeralEventLimit      = 256

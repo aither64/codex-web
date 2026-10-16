@@ -1831,7 +1831,7 @@ func (h *ephemeralIntegrationHarness) respond(w http.ResponseWriter, r *http.Req
 				h.toolDiagnostic = integrationToolDiagnostic(request, names, toolErr, expectedCount)
 			}
 		}
-		if instructions, ok := request["instructions"].(string); !ok || !strings.Contains(instructions, "Return the requested JSON.") {
+		if !integrationBaseInstructions(request) {
 			h.failure = "explicit base instructions missing from Direct request"
 		}
 		if request["store"] != false || request["stream"] != true {
@@ -2156,6 +2156,52 @@ func integrationToolNames(request map[string]any, questionControl bool) (map[str
 		return names, errors.New("unexpected tool role")
 	}
 	return names, nil
+}
+
+// Codex 0.163.0 prefixes input with a BaseInstructionsFragment developer
+// message. Text elsewhere cannot prove this instruction role.
+func integrationBaseInstructions(request map[string]any) bool {
+	if _, present := request["instructions"]; present {
+		return false
+	}
+	input, ok := request["input"].([]any)
+	if !ok || len(input) == 0 {
+		return false
+	}
+	message, ok := input[0].(map[string]any)
+	if !ok || message["type"] != "message" || message["role"] != "developer" {
+		return false
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 1 {
+		return false
+	}
+	part, ok := content[0].(map[string]any)
+	return ok && part["type"] == "input_text" && part["text"] == "Return the requested JSON."
+}
+
+func TestEphemeralIntegrationBaseInstructionShape(t *testing.T) {
+	message := func(role, text string) any {
+		return map[string]any{"type": "message", "role": role, "content": []any{map[string]any{"type": "input_text", "text": text}}}
+	}
+	for _, test := range []struct {
+		name    string
+		request map[string]any
+		valid   bool
+	}{
+		{"developer prefix", map[string]any{"input": []any{message("developer", "Return the requested JSON.")}}, true},
+		{"user text", map[string]any{"input": []any{message("user", "Return the requested JSON.")}}, false},
+		{"later developer", map[string]any{"input": []any{message("user", "raw input"), message("developer", "Return the requested JSON.")}}, false},
+		{"altered instruction", map[string]any{"input": []any{message("developer", "Return the requested JSON. with extra policy")}}, false},
+		{"predecessor field", map[string]any{"instructions": "Return the requested JSON.", "input": []any{}}, false},
+		{"missing", map[string]any{}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if integrationBaseInstructions(test.request) != test.valid {
+				t.Fatal("native instruction shape mismatch")
+			}
+		})
+	}
 }
 
 func TestEphemeralIntegrationToolSchemaShapes(t *testing.T) {
@@ -3184,7 +3230,7 @@ type ephemeralIntegrationSQLiteDiagnostic struct {
 	Owners                                   []ephemeralIntegrationSQLiteOwner
 }
 
-// The complete current definition in pinned Codex 0.160.0
+// The complete current definition in pinned Codex 0.163.0
 // state/logs_migrations/0002_logs_feedback_log_body.sql. This is a fixture
 // acceptance boundary, not a schema compatibility or migration mechanism.
 const integrationLogsDDL = `CREATE TABLE logs (

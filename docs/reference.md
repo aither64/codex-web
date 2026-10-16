@@ -610,7 +610,7 @@ Codex build they deploy.
 Go API for trusted application callers; there is no browser route for selecting
 its socket, paths, model or restriction settings.
 
-The supported profiles use Codex 0.160.0 and `Effort: "low"`, with either
+The supported profiles use Codex 0.163.0 and `Effort: "low"`, with either
 `Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Each requires its matching
 immutable catalog below. Other pairs fail with `ErrEphemeralSettings` before
 connecting.
@@ -638,14 +638,17 @@ dependency; there is no legacy empty-file fallback.
 
 `ModelCatalogFile` is a canonical absolute regular read-only file containing
 the selected profile catalog, at most 1 MiB. GPT-5.5 uses the full unchanged
-original Codex 0.160.0 catalog, SHA-256
-`fd219bd9f061278275f528939f82f54d2eb97df4b25c23b022adbe48813d920b`.
+original Codex 0.163.0 catalog, SHA-256
+`943ca7fe1d19ed019054158303f0dbbd80b3bef43b3aa425a71aa7cb3fb52c2b`.
 GPT-6 Luna uses `codex/ephemeral_luna_models.json`, SHA-256
-`1798846a6ac93cd8ec89facc13a0b3d344d9dab9d0182da53862e098a275216b`.
+`049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1`.
 It contains the original Luna metadata
 with `tool_mode` set to `direct`, `experimental_supported_tools` emptied and
 `use_responses_lite` set to `false`. The native request uses the standard
 Responses shape with top-level `tools: []` and no `additional_tools` input role.
+Codex 0.163.0 sends explicit base instructions as the first developer message
+in `input`, rather than a top-level `instructions` field. The native fixture
+checks that exact role, position and text independently of ordinary user input.
 These settings prevent the model profile from introducing a code executor,
 user questions or the clock tool. Catalogs are bound to their model; they cannot be
 interchanged. Normal conversation catalogs remain unchanged. GPT-5.5 availability
@@ -743,7 +746,7 @@ public protocol has no scoped stop/join operation for them.
 Native ephemeral mode omits resumable conversation storage. Codex's separate
 SQLite diagnostic logger can retain plaintext utility input and thread/turn
 identities in `logs_2.sqlite` under the configured SQLite home. The helper keeps
-that existing local logger enabled. Codex 0.160.0 prunes rows older than ten days
+that existing local logger enabled. Codex 0.163.0 prunes rows older than ten days
 at startup; this is not a guaranteed erasure deadline. Application operational
 logs and normal conversation history have separate retention contracts.
 
