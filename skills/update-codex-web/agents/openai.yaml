@@ -1,0 +1,3 @@
+interface:
+  display_name: "Update codex-web compatibility"
+  short_description: "Validate codex-web against a selected Codex release"

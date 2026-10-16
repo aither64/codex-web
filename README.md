@@ -1,5 +1,8 @@
 # codex-web
 
+For a Codex release upgrade, follow the
+[compatibility update skill](skills/update-codex-web/SKILL.md).
+
 `codex-web` lets a Go application present and control trusted Codex App Server
 conversations in a browser. It is for applications that already own user
 authentication and conversation access decisions.

@@ -18,6 +18,10 @@ for the packaged suite. Focused Go tests run from the directory containing
 
 ## Security and compatibility
 
+For a Codex release upgrade, read
+[the compatibility update skill](skills/update-codex-web/SKILL.md) before editing
+protocol contracts or model catalogs.
+
 The HTTP integration must resolve an opaque application conversation ID to a
 trusted thread, canonical working directory, App Server connection and allowed
 operations on every request. Do not accept a socket, thread ID or working
