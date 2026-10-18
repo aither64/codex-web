@@ -359,6 +359,39 @@ func TestHandlerRejectsWrongOriginBeforeResolving(t *testing.T) {
 	}
 }
 
+func TestConversationModelCatalogControlsPickerAndSettings(t *testing.T) {
+	handler, _, _, _, _ := newTestHandler(t, Capabilities{Settings: true})
+	resolver := handler.resolver
+	handler.resolver = ResolverFunc(func(ctx context.Context, request ResolveRequest) (Target, error) {
+		target, err := resolver.ResolveConversation(ctx, request)
+		target.ModelCatalog = func(context.Context) ([]codex.Model, error) {
+			return []codex.Model{{Model: "session-model", SupportedReasoningEfforts: []codex.ReasoningEffortOption{{ReasoningEffort: "ultra"}}}}, nil
+		}
+		return target, err
+	})
+	for _, test := range []struct {
+		method, path, body string
+		status             int
+	}{
+		{http.MethodGet, "models", "", http.StatusOK},
+		{http.MethodPost, "settings", `{"model":"session-model","reasoningEffort":"ultra"}`, http.StatusOK},
+		{http.MethodPost, "settings", `{"model":"model","reasoningEffort":"high"}`, http.StatusBadRequest},
+	} {
+		request := httptest.NewRequest(test.method, "/codex/conversations/opaque/"+test.path, strings.NewReader(test.body))
+		if test.method == http.MethodPost {
+			request.Header.Set("Origin", "https://workspace.example.test")
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != test.status {
+			t.Fatalf("%s: %d %s", test.path, response.Code, response.Body.String())
+		}
+		if test.method == http.MethodGet && !strings.Contains(response.Body.String(), "session-model") {
+			t.Fatal("picker used daemon catalog")
+		}
+	}
+}
+
 func TestHandlerUsesOnlyResolvedThread(t *testing.T) {
 	handler, client, _, resolved, releases := newTestHandler(t, Capabilities{Send: true})
 	request := httptest.NewRequest(

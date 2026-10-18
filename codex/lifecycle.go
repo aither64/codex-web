@@ -5,6 +5,15 @@ import (
 	"errors"
 )
 
+// LifecycleRequest describes the application-supplied lifecycle destination.
+// ThreadID is empty for start and identifies the source thread for fork. Cwd
+// can be empty on reconnect; applications can then resolve it from ThreadID.
+type LifecycleRequest struct {
+	Method   string
+	ThreadID string
+	Cwd      string
+}
+
 // lifecycleParams copies caller-owned maps before adding routing overrides.
 // Keeping this at the RPC boundary also covers implicit watch restoration.
 func (c *Client) lifecycleParams(ctx context.Context, method string, value any) (any, string, error) {
@@ -15,7 +24,7 @@ func (c *Client) lifecycleParams(ctx context.Context, method string, value any) 
 	}
 	original, ok := value.(map[string]any)
 	if !ok {
-		if c.options.LifecycleSettings == nil {
+		if c.options.LifecycleSettings == nil && c.options.LifecycleRequestSettings == nil {
 			return value, "", nil
 		}
 		return nil, "", errors.New("Codex lifecycle parameters must be an object")
@@ -24,8 +33,14 @@ func (c *Client) lifecycleParams(ctx context.Context, method string, value any) 
 	for key, value := range original {
 		params[key] = value
 	}
-	if c.options.LifecycleSettings != nil {
-		settings, err := c.options.LifecycleSettings(ctx, stringValue(params["threadId"]))
+	if c.options.LifecycleSettings != nil || c.options.LifecycleRequestSettings != nil {
+		var settings ThreadSettings
+		var err error
+		if resolve := c.options.LifecycleRequestSettings; resolve != nil {
+			settings, err = resolve(ctx, LifecycleRequest{Method: method, ThreadID: stringValue(params["threadId"]), Cwd: stringValue(params["cwd"])})
+		} else {
+			settings, err = c.options.LifecycleSettings(ctx, stringValue(params["threadId"]))
+		}
 		if err != nil {
 			return nil, "", err
 		}

@@ -21,7 +21,11 @@ directory, App Server client, and allowed operations.
 
 Applications can pass `ThreadSettings.ModelProvider` on lifecycle calls or set
 `ClientOptions.LifecycleSettings` to resolve routing before every start, resume,
-fork and reconnect. The resolver supplies retained model and reasoning effort
+fork and reconnect. Applications with session-specific routing can use
+`LifecycleRequestSettings` instead: it receives the method, source thread ID
+and trusted destination directory, including for new threads and forks. It
+takes precedence over the original callback. A reconnect can omit the directory;
+resolve that case from the retained thread identity. The resolver supplies retained model and reasoning effort
 when the caller omits them. Explicit caller model/effort settings take precedence;
 the application resolver owns provider selection. A requested provider must match
 the top-level effective provider in the native response. A mismatch is an error,
@@ -42,6 +46,13 @@ turn's policy.
 Use `QueueWithPolicy` for application-owned queued work: adding to a loaded
 native thread can execute immediately. It applies permissions before enqueueing
 and keeps cold queues unloaded until explicit activation.
+
+Set `conversation.Target.ModelCatalog` when a conversation's provider has a
+different catalog from the shared App Server. The picker and settings validation
+both use that callback. Without it they use `Client.ListModels`.
+After an application closes and reopens native threads without disconnecting
+the server, call `RefreshThreadSubscription` for affected threads. It rejoins
+existing watches and retains the application's execution admission policy.
 
 ## Try the local example
 

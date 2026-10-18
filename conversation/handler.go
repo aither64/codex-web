@@ -107,8 +107,11 @@ type ResolveRequest struct {
 // that mutates the same conversation. Release is called after the operation,
 // including an event stream.
 type Target struct {
-	Attachments         AttachmentProvider
-	Client              Client
+	Attachments AttachmentProvider
+	Client      Client
+	// ModelCatalog optionally resolves models for this trusted conversation's
+	// provider. Both the picker and settings validation use the same catalog.
+	ModelCatalog        func(context.Context) ([]codex.Model, error)
 	Activity            ActivityProvider
 	ThreadID            string
 	Directory           string
@@ -116,6 +119,13 @@ type Target struct {
 	MutationLock        MutationLocker
 	TransformTranscript func(*codex.Transcript)
 	Release             func()
+}
+
+func (target Target) models(ctx context.Context) ([]codex.Model, error) {
+	if target.ModelCatalog != nil {
+		return target.ModelCatalog(ctx)
+	}
+	return target.Client.ListModels(ctx)
 }
 
 // Resolver maps an application-defined opaque ID to its trusted App Server
@@ -464,7 +474,7 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
-		models, err := target.Client.ListModels(ctx)
+		models, err := target.models(ctx)
 		if err != nil {
 			handler.serverError(response, request, err)
 			return
@@ -786,7 +796,7 @@ func (handler *Handler) settings(response http.ResponseWriter, request *http.Req
 			writeError(response, http.StatusBadRequest, "select a Codex model and an explicit reasoning setting")
 			return
 		}
-		models, err := target.Client.ListModels(request.Context())
+		models, err := target.models(request.Context())
 		if err != nil {
 			handler.serverError(response, request, err)
 			return

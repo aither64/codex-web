@@ -845,6 +845,11 @@ type ClientOptions struct {
 	// take precedence; the resolved provider takes precedence over caller input.
 	// The resolver may perform reads, but must not issue lifecycle requests.
 	LifecycleSettings func(context.Context, string) (ThreadSettings, error)
+	// LifecycleRequestSettings additionally identifies the trusted destination
+	// directory, including for new threads and forks. When set it takes precedence
+	// over LifecycleSettings. The application must resolve and authorize this
+	// directory before calling the client; it is not a browser authorization API.
+	LifecycleRequestSettings func(context.Context, LifecycleRequest) (ThreadSettings, error)
 	// ObserverOnly prevents responses, unsupported-request rejections and
 	// thread-setting overrides. Use a dedicated client for passive monitoring.
 	ObserverOnly     bool
@@ -1242,6 +1247,14 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 		if message.Method == "thread/settings/updated" {
 			c.handleThreadSettingsUpdated(message.Params, generation)
 		}
+		if message.Method == "thread/closed" {
+			thread := threadIDFromParams(message.Params)
+			c.watchedMu.Lock()
+			delete(c.watchedGeneration, thread)
+			c.watchedMu.Unlock()
+			c.invalidateThreadSettings(thread)
+			c.options.ActivityRecorder.disconnected(c.activityConnection(generation), thread)
+		}
 		if message.Method == "item/started" || message.Method == "item/completed" {
 			c.observeItemTimestamp(message.Method, message.Params)
 		}
@@ -1590,6 +1603,23 @@ func (c *Client) restoreWatched() {
 			}
 		}()
 	}
+}
+
+// RefreshThreadSubscription rejoins an application-reopened thread on the same
+// connection. It never adds a watch or bypasses AllowImplicitResume. Applications
+// call it after a scoped native close/reopen, once their execution fence opens.
+func (c *Client) RefreshThreadSubscription(ctx context.Context, thread string) error {
+	c.watchedMu.Lock()
+	watched := c.watched[thread] > 0
+	delete(c.watchedGeneration, thread)
+	c.watchedMu.Unlock()
+	if !watched {
+		return nil
+	}
+	if err := c.Ensure(ctx); err != nil {
+		return err
+	}
+	return c.resumeWatched(ctx, thread)
 }
 
 func (c *Client) resumeWatched(ctx context.Context, threadID string) error {
