@@ -240,6 +240,7 @@ type TurnOptions struct {
 type ThreadPolicy struct {
 	DeveloperInstructions string           `json:"developerInstructions,omitempty"`
 	Sandbox               string           `json:"sandbox,omitempty"`
+	ApprovalPolicy        string           `json:"approvalPolicy,omitempty"`
 	MCPServer             *ThreadMCPServer `json:"mcpServer,omitempty"`
 }
 
@@ -343,8 +344,11 @@ func validateThreadPolicy(policy ThreadPolicy) error {
 	if !utf8.ValidString(policy.DeveloperInstructions) || len(policy.DeveloperInstructions) > 64*1024 {
 		return errors.New("thread developer instructions must be valid Unicode and at most 64 KiB")
 	}
-	if policy.Sandbox != "" && policy.Sandbox != "read-only" && policy.Sandbox != "workspace-write" {
-		return errors.New("thread sandbox must be read-only or workspace-write")
+	if policy.Sandbox != "" && policy.Sandbox != "read-only" && policy.Sandbox != "workspace-write" && policy.Sandbox != "danger-full-access" {
+		return errors.New("thread sandbox must be read-only, workspace-write or danger-full-access")
+	}
+	if policy.ApprovalPolicy != "" && policy.ApprovalPolicy != "never" {
+		return errors.New("thread approval policy must be empty or never")
 	}
 	if server := policy.MCPServer; server != nil {
 		if !threadMCPNamePattern.MatchString(server.Name) || !threadMCPNamePattern.MatchString(server.Tool) {
@@ -3225,6 +3229,9 @@ func (c *Client) applyThreadPolicy(params map[string]any, policy ThreadPolicy, e
 	if policy.Sandbox != "" {
 		params["sandbox"] = policy.Sandbox
 	}
+	if policy.ApprovalPolicy != "" {
+		params["approvalPolicy"] = policy.ApprovalPolicy
+	}
 }
 
 func (c *Client) addRuntimeWorkspaceRoots(params map[string]any) error {
@@ -3334,7 +3341,7 @@ func (c *Client) ResumeThreadWithSettings(
 	params["cwd"] = cwd
 	params["config"] = config
 	c.settingsParams(settings, params, config)
-	if err := c.Request(ctx, "thread/resume", params, &response); err != nil {
+	if err := c.resumeApplyingExecutionPolicy(ctx, threadID, params, settings.Policy, &response); err != nil {
 		return "", err
 	}
 	if response.Thread.ID != threadID || response.Thread.Cwd != cwd {
@@ -4175,7 +4182,7 @@ func (c *Client) ActivateThreadWithSettings(ctx context.Context, threadID string
 			ID string `json:"id"`
 		} `json:"thread"`
 	}
-	if err := c.Request(ctx, "thread/resume", params, &response); err != nil {
+	if err := c.resumeApplyingExecutionPolicy(ctx, threadID, params, policy, &response); err != nil {
 		return err
 	}
 	if response.Thread.ID != threadID {
@@ -4224,7 +4231,57 @@ func (c *Client) resumeThreadWithPolicy(ctx context.Context, threadID string, po
 		applyThreadMCP(config, policy)
 		params["config"] = config
 	}
-	return c.Request(ctx, "thread/resume", params, &response)
+	return c.resumeApplyingExecutionPolicy(ctx, threadID, params, policy, &response)
+}
+
+// Warm resumes retain native permissions. Apply settings before resuming a
+// loaded thread so newly released queues/goals see the policy. Cold resumes
+// receive the policy in their load request. Settings updates affect subsequent
+// turns and preserve an already running turn's captured permissions.
+func (c *Client) resumeApplyingExecutionPolicy(ctx context.Context, threadID string, resume map[string]any, policy ThreadPolicy, response any) error {
+	update := executionPolicyUpdate(threadID, policy)
+	applied, err := c.applyLoadedExecutionPolicy(ctx, threadID, update)
+	if err != nil {
+		return err
+	}
+	if err := c.Request(ctx, "thread/resume", resume, response); err != nil {
+		return err
+	}
+	if len(update) != 0 && !applied {
+		return c.Request(ctx, "thread/settings/update", update, nil)
+	}
+	return nil
+}
+
+func executionPolicyUpdate(threadID string, policy ThreadPolicy) map[string]any {
+	update := map[string]any{"threadId": threadID}
+	if policy.Sandbox == "danger-full-access" {
+		update["sandboxPolicy"] = map[string]any{"type": "dangerFullAccess"}
+	}
+	if policy.ApprovalPolicy != "" {
+		update["approvalPolicy"] = policy.ApprovalPolicy
+	}
+	if len(update) == 1 {
+		return nil
+	}
+	return update
+}
+
+func (c *Client) applyLoadedExecutionPolicy(ctx context.Context, threadID string, update map[string]any) (bool, error) {
+	if len(update) == 0 {
+		return false, nil
+	}
+	metadata, err := c.ReadThreadMetadata(ctx, threadID, true)
+	if err != nil {
+		return false, err
+	}
+	if metadata.Status["type"] == "notLoaded" {
+		return false, nil
+	}
+	if err := c.Request(ctx, "thread/settings/update", update, nil); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (c *Client) threadResumeParams(threadID string) map[string]any {
@@ -4288,6 +4345,15 @@ func (c *Client) ListQueue(ctx context.Context, threadID string) ([]QueueEntry, 
 }
 
 func (c *Client) Queue(ctx context.Context, threadID, text, clientID string) (QueueEntry, error) {
+	return c.QueueWithPolicy(ctx, threadID, text, clientID, ThreadPolicy{})
+}
+
+// QueueWithPolicy prepares loaded-thread permissions before adding work, since
+// native queue additions can execute immediately. It never loads a cold thread.
+func (c *Client) QueueWithPolicy(ctx context.Context, threadID, text, clientID string, policy ThreadPolicy) (QueueEntry, error) {
+	if err := validateThreadPolicy(policy); err != nil {
+		return QueueEntry{}, err
+	}
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -4306,6 +4372,9 @@ func (c *Client) Queue(ctx context.Context, threadID, text, clientID string) (Qu
 		return QueueEntry{}, errors.New(
 			"previous queued message outcome is still unknown; refusing to submit it again",
 		)
+	}
+	if _, err := c.applyLoadedExecutionPolicy(ctx, threadID, executionPolicyUpdate(threadID, policy)); err != nil {
+		return QueueEntry{}, err
 	}
 	var response struct {
 		Submission struct {

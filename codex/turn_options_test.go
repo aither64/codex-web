@@ -40,14 +40,17 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 		name       string
 		activeTurn string
 		method     string
+		sandbox    string
 	}{
-		{name: "idle start", method: "turn/start"},
-		{name: "active steer", activeTurn: "turn-active", method: "turn/steer"},
+		{name: "idle start", method: "turn/start", sandbox: "read-only"},
+		{name: "full access start", method: "turn/start", sandbox: "danger-full-access"},
+		{name: "active steer", activeTurn: "turn-active", method: "turn/steer", sandbox: "read-only"},
+		{name: "full access steer", activeTurn: "turn-active", method: "turn/steer", sandbox: "danger-full-access"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			policy := ThreadPolicy{
-				DeveloperInstructions: "Review the assigned change.", Sandbox: "read-only",
+				DeveloperInstructions: "Review the assigned change.", Sandbox: test.sandbox, ApprovalPolicy: "never",
 				MCPServer: &ThreadMCPServer{Name: "team_bus", Command: "/usr/bin/team-bus", Args: []string{"--member", "reviewer0"}, Tool: "report"},
 			}
 			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
@@ -55,6 +58,11 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 					return err
 				}
 				for index, method := range []string{"thread/resume", "thread/turns/list", test.method} {
+					if index == 0 {
+						if err := acceptWarmExecutionPreparation(connection, policy); err != nil {
+							return err
+						}
+					}
 					request, err := readObject(connection)
 					if err != nil {
 						return err
@@ -64,7 +72,7 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 					}
 					params := request["params"].(map[string]any)
 					if index == 0 && (params["developerInstructions"] != sessionLifecycleDeveloperInstructions+"\n\n"+policy.DeveloperInstructions ||
-						params["sandbox"] != "read-only") {
+						params["sandbox"] != test.sandbox || params["approvalPolicy"] != "never") {
 						return fmt.Errorf("assignment resume omitted retained policy: %#v", params)
 					}
 					if index == 0 {
@@ -124,6 +132,42 @@ func TestSendWithOptionsUsesStartAndSteerProtocolFields(t *testing.T) {
 				t.Fatalf("receipt = %#v", receipt)
 			}
 		})
+	}
+}
+
+func TestSendRefusesBeforeSubmissionWhenExecutionUpdateFails(t *testing.T) {
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for _, method := range []string{"thread/read", "thread/settings/update"} {
+			request, err := readObject(connection)
+			if err != nil || request["method"] != method {
+				return fmt.Errorf("expected %s: %v", method, err)
+			}
+			response := map[string]any{"id": request["id"], "result": map[string]any{}}
+			if method == "thread/read" {
+				response["result"] = map[string]any{"thread": map[string]any{"id": "thread-1", "status": map[string]any{"type": "idle"}}}
+			}
+			if method == "thread/settings/update" {
+				delete(response, "result")
+				response["error"] = map[string]any{"code": -32602, "message": "execution policy refused"}
+			}
+			if err := writeObject(connection, response); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	client := newTestClient(socket)
+	defer client.Close()
+	options := TurnOptions{ThreadPolicy: ThreadPolicy{Sandbox: "danger-full-access", ApprovalPolicy: "never"}}
+	_, err := client.SendWithOptions(context.Background(), "thread-1", "message", "client-1", "action", options)
+	if err == nil || !strings.Contains(err.Error(), "execution policy refused") {
+		t.Fatalf("execution update failure: %v", err)
+	}
+	if _, attempted, err := client.OriginalSendOptions("thread-1", "message", "client-1", "action"); err != nil || attempted {
+		t.Fatalf("message attempted before permissions were applied: %t, %v", attempted, err)
 	}
 }
 
@@ -325,7 +369,7 @@ func TestOriginalSendOptionsSurviveSettingChangesAndReconnect(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "absent-socket")
 	client := newTestClient(socket)
 	options := testTurnOptions()
-	options.ThreadPolicy = ThreadPolicy{DeveloperInstructions: "member policy", Sandbox: "read-only"}
+	options.ThreadPolicy = ThreadPolicy{DeveloperInstructions: "member policy", Sandbox: "danger-full-access", ApprovalPolicy: "never"}
 	want := cloneTurnOptions(options)
 	if err := client.recordSendAttemptWithOptions(
 		"thread-1", "message-1", "message", "", false, options,

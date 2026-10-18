@@ -127,6 +127,11 @@ client_requests = [
     ),
     request("collaborationMode/list", {}),
     request("account/rateLimits/read", None),
+    request("thread/settings/update", {
+        "threadId": "thread-1",
+        "sandboxPolicy": {"type": "dangerFullAccess"},
+        "approvalPolicy": "never",
+    }),
     request("account/rateLimitResetCredit/consume", {"idempotencyKey": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "creditId": "reset-credit-1"}),
     request(
         "thread/settings/update",
@@ -163,22 +168,12 @@ client_requests = [
             },
         },
     ),
-    request(
-        "thread/resume",
-        {
-            "threadId": "thread-1",
-            "excludeTurns": True,
-            "developerInstructions": lifecycle_developer_instructions,
-        },
-    ),
-    request(
-        "thread/resume",
-        {
-            "threadId": "thread-1",
-            "excludeTurns": True,
-            "developerInstructions": lifecycle_developer_instructions,
-        },
-    ),
+    # Cold-load and already-loaded branches use the same absolute policy.
+    request("thread/settings/update", {
+        "threadId": "thread-1",
+        "sandboxPolicy": {"type": "dangerFullAccess"},
+        "approvalPolicy": "never",
+    }),
     request(
         "thread/list",
         {
@@ -383,6 +378,14 @@ for message in [
     request("thread/list", {"projectId": "member:example:reviewer0", "limit": 100}),
 ]:
     validate("ClientRequest.json", message, f"member policy request {message['method']}")
+
+for method in ("thread/start", "thread/resume", "thread/fork"):
+    params = {"sandbox": "danger-full-access", "approvalPolicy": "never"}
+    if method == "thread/start":
+        params["cwd"] = "/workspace/work/example"
+    else:
+        params["threadId"] = "thread-1"
+    validate("ClientRequest.json", request(method, params), "explicit unrestricted thread policy")
 
 validate("ClientNotification.json", {"method": "initialized"}, "initialized notification")
 

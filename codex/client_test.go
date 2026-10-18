@@ -418,114 +418,154 @@ func TestStartThreadRejectsWrongWorkingDirectory(t *testing.T) {
 }
 
 func TestThreadLifecycleInstructionsCoverStartResumeAndFork(t *testing.T) {
-	policy := ThreadPolicy{
-		DeveloperInstructions: "Review the assigned change. Do not edit source.", Sandbox: "read-only",
-		MCPServer: &ThreadMCPServer{Name: "team_bus", Command: "/usr/bin/team-bus", Args: []string{"--member", "reviewer0"}, Tool: "report"},
+	for _, sandbox := range []string{"read-only", "danger-full-access"} {
+		t.Run(sandbox, func(t *testing.T) {
+			policy := ThreadPolicy{
+				DeveloperInstructions: "Review the assigned change. Do not edit source.", Sandbox: sandbox, ApprovalPolicy: "never",
+				MCPServer: &ThreadMCPServer{Name: "team_bus", Command: "/usr/bin/team-bus", Args: []string{"--member", "reviewer0"}, Tool: "report"},
+			}
+			combined := sessionLifecycleDeveloperInstructions + "\n\n" + policy.DeveloperInstructions
+			methods := []string{
+				"thread/start",
+				"thread/resume",
+				"thread/resume",
+				"thread/resume",
+				"thread/turns/list",
+				"thread/resume",
+				"thread/turns/list",
+				"thread/fork",
+			}
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				for index, method := range methods {
+					if index == 1 {
+						if err := acceptWarmExecutionPreparation(connection, policy); err != nil {
+							return err
+						}
+					}
+					request, err := readObject(connection)
+					if err != nil {
+						return err
+					}
+					if request["method"] != method {
+						return fmt.Errorf("request %d = %#v, want %s", index, request, method)
+					}
+					params, _ := request["params"].(map[string]any)
+					switch index {
+					case 0, 1, 7:
+						if params["developerInstructions"] != combined || params["sandbox"] != sandbox || params["approvalPolicy"] != "never" {
+							return fmt.Errorf("%s omitted member policy: %#v", method, params)
+						}
+						if err := checkThreadMCPConfig(params, policy.MCPServer); err != nil {
+							return fmt.Errorf("%s: %w", method, err)
+						}
+					case 5:
+						if params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
+							return fmt.Errorf("root reconciliation omitted lifecycle instructions: %#v", params)
+						}
+					case 2, 3:
+						if _, exists := params["developerInstructions"]; exists {
+							return fmt.Errorf("generic resume replaced retained instructions: %#v", params)
+						}
+						if _, exists := params["config"]; exists {
+							return fmt.Errorf("generic resume gained member MCP config: %#v", params)
+						}
+					}
+					result := map[string]any{}
+					switch index {
+					case 0:
+						result["thread"] = map[string]any{
+							"id": "thread-1", "cwd": "/workspace/work/example",
+						}
+					case 1:
+						result["thread"] = map[string]any{
+							"id": "thread-1", "cwd": "/workspace/work/example",
+						}
+					case 4, 6:
+						result["data"] = []any{}
+					case 7:
+						result["thread"] = map[string]any{
+							"id": "thread-fork", "cwd": "/workspace/work/fork",
+							"forkedFromId": "thread-1",
+						}
+					}
+					if err := writeObject(connection, map[string]any{
+						"id": request["id"], "result": result,
+					}); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			client := NewWithOptions(socket, ClientOptions{
+				DeveloperInstructions:              sessionLifecycleDeveloperInstructions,
+				PreserveThreadInstructionsOnResume: true,
+			})
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			environment := map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"}
+			if _, err := client.StartThreadWithSettings(ctx, "/workspace/work/example", environment,
+				ThreadSettings{Policy: policy}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ResumeThreadWithSettings(ctx, "thread-1", "/workspace/work/example", environment,
+				ThreadSettings{Policy: policy}); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.resumeThread(ctx, "thread-1"); err != nil {
+				t.Fatal(err)
+			}
+			client.watchedMu.Lock()
+			client.watched["thread-1"] = 1
+			client.retainTurnHistory("thread-1", true)
+			client.watchedMu.Unlock()
+			if err := client.resumeWatched(ctx, "thread-1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.ReconcileThreadInstructions(ctx, "thread-1"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ForkThread(
+				ctx, "thread-1", "/workspace/work/fork", environment, ThreadSettings{Policy: policy},
+			); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
-	combined := sessionLifecycleDeveloperInstructions + "\n\n" + policy.DeveloperInstructions
-	methods := []string{
-		"thread/start",
-		"thread/resume",
-		"thread/resume",
-		"thread/resume",
-		"thread/turns/list",
-		"thread/resume",
-		"thread/turns/list",
-		"thread/fork",
+}
+
+func acceptWarmExecutionPreparation(connection *websocket.Conn, policy ThreadPolicy) error {
+	request, err := readObject(connection)
+	if err != nil || request["method"] != "thread/read" {
+		return fmt.Errorf("missing passive execution lookup: %#v, %v", request, err)
 	}
-	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
-		if err := handshake(connection); err != nil {
-			return err
+	if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": "thread-1", "status": map[string]any{"type": "idle"}}}}); err != nil {
+		return err
+	}
+	return acceptExecutionPolicyUpdate(connection, policy)
+}
+
+func acceptExecutionPolicyUpdate(connection *websocket.Conn, policy ThreadPolicy) error {
+	request, err := readObject(connection)
+	if err != nil {
+		return err
+	}
+	params, _ := request["params"].(map[string]any)
+	if request["method"] != "thread/settings/update" || params["threadId"] != "thread-1" || params["approvalPolicy"] != policy.ApprovalPolicy {
+		return fmt.Errorf("missing warm-thread execution update: %#v", request)
+	}
+	if policy.Sandbox == "danger-full-access" {
+		sandbox, _ := params["sandboxPolicy"].(map[string]any)
+		if sandbox["type"] != "dangerFullAccess" {
+			return fmt.Errorf("missing full-access permission update: %#v", params)
 		}
-		for index, method := range methods {
-			request, err := readObject(connection)
-			if err != nil {
-				return err
-			}
-			if request["method"] != method {
-				return fmt.Errorf("request %d = %#v, want %s", index, request, method)
-			}
-			params, _ := request["params"].(map[string]any)
-			switch index {
-			case 0, 1, 7:
-				if params["developerInstructions"] != combined || params["sandbox"] != "read-only" {
-					return fmt.Errorf("%s omitted member policy: %#v", method, params)
-				}
-				if err := checkThreadMCPConfig(params, policy.MCPServer); err != nil {
-					return fmt.Errorf("%s: %w", method, err)
-				}
-			case 5:
-				if params["developerInstructions"] != sessionLifecycleDeveloperInstructions {
-					return fmt.Errorf("root reconciliation omitted lifecycle instructions: %#v", params)
-				}
-			case 2, 3:
-				if _, exists := params["developerInstructions"]; exists {
-					return fmt.Errorf("generic resume replaced retained instructions: %#v", params)
-				}
-				if _, exists := params["config"]; exists {
-					return fmt.Errorf("generic resume gained member MCP config: %#v", params)
-				}
-			}
-			result := map[string]any{}
-			switch index {
-			case 0:
-				result["thread"] = map[string]any{
-					"id": "thread-1", "cwd": "/workspace/work/example",
-				}
-			case 1:
-				result["thread"] = map[string]any{
-					"id": "thread-1", "cwd": "/workspace/work/example",
-				}
-			case 4, 6:
-				result["data"] = []any{}
-			case 7:
-				result["thread"] = map[string]any{
-					"id": "thread-fork", "cwd": "/workspace/work/fork",
-					"forkedFromId": "thread-1",
-				}
-			}
-			if err := writeObject(connection, map[string]any{
-				"id": request["id"], "result": result,
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	client := NewWithOptions(socket, ClientOptions{
-		DeveloperInstructions:              sessionLifecycleDeveloperInstructions,
-		PreserveThreadInstructionsOnResume: true,
-	})
-	defer client.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	environment := map[string]string{"DEV_SESSION_WORKSPACE": "/workspace"}
-	if _, err := client.StartThreadWithSettings(ctx, "/workspace/work/example", environment,
-		ThreadSettings{Policy: policy}); err != nil {
-		t.Fatal(err)
+	} else if _, exists := params["sandboxPolicy"]; exists {
+		return fmt.Errorf("legacy sandbox policy was changed: %#v", params)
 	}
-	if _, err := client.ResumeThreadWithSettings(ctx, "thread-1", "/workspace/work/example", environment,
-		ThreadSettings{Policy: policy}); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.resumeThread(ctx, "thread-1"); err != nil {
-		t.Fatal(err)
-	}
-	client.watchedMu.Lock()
-	client.watched["thread-1"] = 1
-	client.retainTurnHistory("thread-1", true)
-	client.watchedMu.Unlock()
-	if err := client.resumeWatched(ctx, "thread-1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.ReconcileThreadInstructions(ctx, "thread-1"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.ForkThread(
-		ctx, "thread-1", "/workspace/work/fork", environment, ThreadSettings{Policy: policy},
-	); err != nil {
-		t.Fatal(err)
-	}
+	return writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{}})
 }
 
 func checkThreadMCPConfig(params map[string]any, expected *ThreadMCPServer) error {
@@ -605,7 +645,7 @@ func TestUnscopedSettingsResumePreservesPersistedMemberPolicy(t *testing.T) {
 	if _, exists := params["sandbox"]; exists {
 		t.Fatalf("unscoped settings resume overwrote retained sandbox: %#v", params)
 	}
-	if err := validateThreadPolicy(ThreadPolicy{Sandbox: "danger-full-access"}); err == nil {
+	if err := validateThreadPolicy(ThreadPolicy{Sandbox: "unknown"}); err == nil {
 		t.Fatal("unsupported member sandbox was accepted")
 	}
 }
@@ -1464,6 +1504,11 @@ func TestQueueUsesFIFOAppServerContracts(t *testing.T) {
 			return err
 		}
 		for index := 0; index < 10; index++ {
+			if index == 7 {
+				if err := acceptWarmExecutionPreparation(connection, ThreadPolicy{Sandbox: "danger-full-access", ApprovalPolicy: "never"}); err != nil {
+					return err
+				}
+			}
 			request, err := readObject(connection)
 			if err != nil {
 				return err
@@ -1546,7 +1591,8 @@ func TestQueueUsesFIFOAppServerContracts(t *testing.T) {
 				})
 			case 7:
 				if request["method"] != "thread/resume" || params["threadId"] != "thread-1" ||
-					!strings.Contains(stringValue(params["developerInstructions"]), "member queue policy") {
+					!strings.Contains(stringValue(params["developerInstructions"]), "member queue policy") ||
+					params["sandbox"] != "danger-full-access" || params["approvalPolicy"] != "never" {
 					return fmt.Errorf("invalid queue resume: %#v", request)
 				}
 				err = writeObject(connection, map[string]any{
@@ -1591,7 +1637,7 @@ func TestQueueUsesFIFOAppServerContracts(t *testing.T) {
 	if err := client.DeleteQueueEntry(ctx, "thread-1", "queued-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.StartQueueWithPolicy(ctx, "thread-1", "queued-2", ThreadPolicy{DeveloperInstructions: "member queue policy"}); err != nil {
+	if err := client.StartQueueWithPolicy(ctx, "thread-1", "queued-2", ThreadPolicy{DeveloperInstructions: "member queue policy", Sandbox: "danger-full-access", ApprovalPolicy: "never"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -4899,5 +4945,11 @@ func TestQueueDeletionCompletionSurvivesRestart(t *testing.T) {
 				t.Fatal("completed deletion retained intent", err)
 			}
 		})
+	}
+}
+
+func TestThreadPolicyRejectsUnknownApprovalPolicy(t *testing.T) {
+	if err := validateThreadPolicy(ThreadPolicy{ApprovalPolicy: "approve-everything"}); err == nil {
+		t.Fatal("unsupported approval policy accepted")
 	}
 }

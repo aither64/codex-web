@@ -371,3 +371,136 @@ func TestActivationValidatesExactThreadWithoutReplacingEnvironment(t *testing.T)
 		})
 	}
 }
+
+func TestActivationAppliesFullAccessBeforeWarmResume(t *testing.T) {
+	for _, scenario := range []string{"warm", "cold", "failed warm update"} {
+		t.Run(scenario, func(t *testing.T) {
+			policy := ThreadPolicy{Sandbox: "danger-full-access", ApprovalPolicy: "never"}
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				request, err := readObject(connection)
+				if err != nil || request["method"] != "thread/read" {
+					return fmt.Errorf("expected passive lookup: %#v, %v", request, err)
+				}
+				status := "idle"
+				if scenario == "cold" {
+					status = "notLoaded"
+				}
+				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": "thread-1", "status": map[string]any{"type": status}}}}); err != nil {
+					return err
+				}
+				if scenario == "failed warm update" {
+					request, err := readObject(connection)
+					if err != nil || request["method"] != "thread/settings/update" {
+						return fmt.Errorf("expected settings before activation: %#v, %v", request, err)
+					}
+					return writeObject(connection, map[string]any{"id": request["id"], "error": map[string]any{"code": -32602, "message": "execution refused"}})
+				}
+				if scenario == "warm" {
+					if err := acceptExecutionPolicyUpdate(connection, policy); err != nil {
+						return err
+					}
+				}
+				request, err = readObject(connection)
+				if err != nil || request["method"] != "thread/resume" {
+					return fmt.Errorf("expected activation resume: %#v, %v", request, err)
+				}
+				params := request["params"].(map[string]any)
+				if params["sandbox"] != "danger-full-access" || params["approvalPolicy"] != "never" || params["cwd"] != nil || params["config"] != nil {
+					return fmt.Errorf("activation changed environment or omitted policy: %#v", params)
+				}
+				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": "thread-1"}}}); err != nil {
+					return err
+				}
+				if scenario == "cold" {
+					return acceptExecutionPolicyUpdate(connection, policy)
+				}
+				return nil
+			})
+			client := newTestClient(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			err := client.ActivateThreadWithSettings(ctx, "thread-1", ThreadSettings{Policy: policy})
+			if (err != nil) != (scenario == "failed warm update") {
+				t.Fatalf("activation result: %v", err)
+			}
+		})
+	}
+}
+
+func TestQueuePolicyPrecedesLoadedExecutionAndKeepsColdThreadsUnloaded(t *testing.T) {
+	for _, scenario := range []string{"warm", "cold", "failed warm update"} {
+		t.Run(scenario, func(t *testing.T) {
+			policy := ThreadPolicy{Sandbox: "danger-full-access", ApprovalPolicy: "never"}
+			socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+				if err := handshake(connection); err != nil {
+					return err
+				}
+				if scenario == "warm" {
+					if err := acceptWarmExecutionPreparation(connection, policy); err != nil {
+						return err
+					}
+				} else {
+					request, err := readObject(connection)
+					if err != nil || request["method"] != "thread/read" {
+						return fmt.Errorf("queue loaded lookup: %#v, %v", request, err)
+					}
+					status := "notLoaded"
+					if scenario == "failed warm update" {
+						status = "idle"
+					}
+					if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"thread": map[string]any{"id": "thread-1", "status": map[string]any{"type": status}}}}); err != nil {
+						return err
+					}
+					if scenario == "failed warm update" {
+						request, err := readObject(connection)
+						if err != nil || request["method"] != "thread/settings/update" {
+							return fmt.Errorf("queue update: %#v, %v", request, err)
+						}
+						return writeObject(connection, map[string]any{"id": request["id"], "error": map[string]any{"code": -32602, "message": "execution refused"}})
+					}
+				}
+				request, err := readObject(connection)
+				if err != nil || request["method"] != "thread/queue/add" {
+					return fmt.Errorf("queue add ordering: %#v, %v", request, err)
+				}
+				params := request["params"].(map[string]any)
+				if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"queuedSubmission": map[string]any{"id": "queued-1", "input": params["input"], "clientUserMessageId": "client-1"}}}); err != nil {
+					return err
+				}
+				if scenario == "warm" {
+					request, err = readObject(connection)
+					if err != nil || request["method"] != "thread/queue/list" {
+						return fmt.Errorf("retry changed policy or resubmitted: %#v, %v", request, err)
+					}
+					return writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{"data": []any{map[string]any{"id": "queued-1", "input": params["input"], "clientUserMessageId": "client-1"}}, "nextCursor": nil}})
+				}
+				return nil
+			})
+			client := newTestClient(socket)
+			defer client.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			entry, err := client.QueueWithPolicy(ctx, "thread-1", "queued work", "client-1", policy)
+			if scenario == "failed warm update" {
+				if err == nil {
+					t.Fatal("queue accepted after permission failure")
+				}
+				if attempted, err := client.queueAttempt("thread-1", "client-1", "queued work"); err != nil || attempted {
+					t.Fatalf("queue attempted after permission failure: %t, %v", attempted, err)
+				}
+			} else if err != nil || entry.ID != "queued-1" {
+				t.Fatalf("queue result: %#v, %v", entry, err)
+			}
+			if scenario == "warm" {
+				retry, err := client.QueueWithPolicy(ctx, "thread-1", "queued work", "client-1", policy)
+				if err != nil || retry.ID != entry.ID || retry.Text != entry.Text || retry.ClientUserMessageID != entry.ClientUserMessageID {
+					t.Fatalf("stable queue retry: %#v, %v", retry, err)
+				}
+			}
+		})
+	}
+}

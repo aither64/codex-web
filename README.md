@@ -29,6 +29,20 @@ including when an already loaded thread ignores a provider override. Changing
 existing routing requires the application's own idle transition and recovery
 workflow. Passive observer clients do not resume threads or resolve routing.
 
+Trusted application callers can set `ThreadPolicy.Sandbox` to `danger-full-access`
+and `ThreadPolicy.ApprovalPolicy` to `never` for unrestricted command execution.
+Apply the policy when creating, resuming or forking a thread and on later sends
+and queue starts. These fields are application-owned; do not accept execution
+policy from untrusted browser input. Omitted fields retain existing behavior.
+Loaded threads receive unrestricted execution through `thread/settings/update`
+before resume can release saved work; native resume overrides alone do not
+change their retained permissions. Cold threads receive the policy in their
+load request. Settings updates apply to subsequent turns and preserve an active
+turn's policy.
+Use `QueueWithPolicy` for application-owned queued work: adding to a loaded
+native thread can execute immediately. It applies permissions before enqueueing
+and keeps cold queues unloaded until explicit activation.
+
 ## Try the local example
 
 The reference application serves one trusted conversation on a loopback
