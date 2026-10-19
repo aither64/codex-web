@@ -191,21 +191,24 @@ type TranscriptPage struct {
 }
 
 type TranscriptEntry struct {
-	DisplayText             *string             `json:"displayText,omitempty"`
-	Attachments             []Attachment        `json:"attachments,omitempty"`
-	TurnID                  string              `json:"turnId,omitempty"`
-	TurnStatus              string              `json:"turnStatus,omitempty"`
-	ItemID                  string              `json:"itemId,omitempty"`
-	ClientUserMessageID     string              `json:"clientUserMessageId,omitempty"`
-	ClientUserMessageDigest string              `json:"clientUserMessageDigest,omitempty"`
-	Kind                    string              `json:"kind"`
-	Summary                 string              `json:"summary,omitempty"`
-	Text                    string              `json:"text,omitempty"`
-	HTML                    string              `json:"html,omitempty"`
-	Details                 string              `json:"details,omitempty"`
-	Timestamp               string              `json:"timestamp,omitempty"`
-	TimestampApproximate    bool                `json:"timestampApproximate,omitempty"`
-	Activity                *TranscriptActivity `json:"activity,omitempty"`
+	Delivery                string               `json:"delivery,omitempty"`
+	Questions               []AsyncQuestion      `json:"questions,omitempty"`
+	QuestionReplies         []AsyncQuestionReply `json:"questionReplies,omitempty"`
+	DisplayText             *string              `json:"displayText,omitempty"`
+	Attachments             []Attachment         `json:"attachments,omitempty"`
+	TurnID                  string               `json:"turnId,omitempty"`
+	TurnStatus              string               `json:"turnStatus,omitempty"`
+	ItemID                  string               `json:"itemId,omitempty"`
+	ClientUserMessageID     string               `json:"clientUserMessageId,omitempty"`
+	ClientUserMessageDigest string               `json:"clientUserMessageDigest,omitempty"`
+	Kind                    string               `json:"kind"`
+	Summary                 string               `json:"summary,omitempty"`
+	Text                    string               `json:"text,omitempty"`
+	HTML                    string               `json:"html,omitempty"`
+	Details                 string               `json:"details,omitempty"`
+	Timestamp               string               `json:"timestamp,omitempty"`
+	TimestampApproximate    bool                 `json:"timestampApproximate,omitempty"`
+	Activity                *TranscriptActivity  `json:"activity,omitempty"`
 }
 
 type SendReceipt struct {
@@ -4052,12 +4055,19 @@ func transcriptEntries(turn map[string]any) []TranscriptEntry {
 		switch entry.Kind {
 		case "userMessage":
 			entry.Text = textContent(item["content"])
+			entry.QuestionReplies = parseAsyncQuestionReplies(entry.Text)
+			if len(entry.QuestionReplies) > 0 {
+				display := asyncQuestionReplyText(entry.QuestionReplies)
+				entry.DisplayText = &display
+			}
 			entry.ClientUserMessageID = stringValue(item["clientId"])
 			if canonicalText, err := userMessageText(item); err == nil {
 				entry.ClientUserMessageDigest = queueTextDigest(canonicalText)
 			}
 		case "agentMessage":
 			entry.Text = stringValue(item["text"])
+			entry.Delivery = stringValue(item["delivery"])
+			entry.Questions = asyncQuestions(entry.ItemID, item["questions"])
 		case "commandExecution":
 			entry.Summary = "$ " + stringValue(item["command"])
 			entry.Details = stringValue(item["aggregatedOutput"])

@@ -171,6 +171,36 @@ Nonblocking user-input requests stay pending by default. Set
 `ClientOptions.NonBlockingUserInput` only when the embedding application owns
 an explicit automatic-response policy.
 
+Optional asynchronous questions belong to transcript agent messages. Their
+`questions` carry stable IDs, titles and suggested options; `delivery` preserves
+native message metadata. They have no pending RPC request to answer. User-message
+`questionReplies` identify native replies, while `displayText` presents the quoted
+question and answer. Raw `text`, client message IDs and digests stay intact for
+durable-send reconciliation.
+
+The mounted UI provides controls in the original message and a panel pinned
+above the composer. Clicking a suggested option sends it immediately; typed
+answers use **Send answer**. **Dismiss** removes a question from the panel without
+sending a message. Turn completion and accepted ordinary follow-ups also clear
+the panel. Unanswered questions remain answerable from the original message;
+answered questions show the submitted answer. Drafts survive unpinning and
+reloads in browser storage scoped to the conversation and thread.
+
+Custom renderers use `createAsyncQuestions({storage, namespace, send,
+acknowledge, canSend, onChange})`. Feed ordered transcript entries and current
+thread metadata to `update(snapshot)`, append `inline(entry)` controls to their
+source message, and call `renderPinned(container)` from `onChange`. Call
+`ordinaryAccepted()` after an ordinary message or queue operation is accepted.
+`send({threadId, message, id, retry})` must check the current trusted conversation
+and use the ordinary durable message endpoint. `acknowledge(entries)` uses its
+existing acknowledgement endpoint. Set `maxMessageBytes` to the handler's message
+budget when it differs from the default 48 KiB; the controller checks the complete
+encoded reply before submission. Validation rejections keep the answer editable.
+Suggestions and free text share native reply
+formatting, per-question state and retry identity across both views. Local
+storage is required before submission; uncertain delivery exposes **Retry answer**
+with the same identity. Canonical transcript replies reconcile other clients.
+
 Pending prompts expose an opaque `token` for each offer. Send that token with
 answers, decisions and snoozes through `RespondPrompt`; an expired offer returns
 `PromptResponseError`. Its `NotSent` field distinguishes a rejected response

@@ -3,6 +3,8 @@ export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createU
 import {createConversationSync, renderConnectionStatus} from "./sync.js?v=2";
 export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=2";
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
+import {createAsyncQuestions} from "./questions.js?v=1";
+export {createAsyncQuestions, asyncQuestionReply} from "./questions.js?v=1";
 export {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 
 const defaultLabels = {
@@ -873,6 +875,8 @@ export function mountConversation(root, options) {
   const historyStatus = createElement("span", {role: "status"});
   historyControls.append(loadOlder, historyStatus, retryHistory);
   const prompts = createElement("section", {class: "codex-conversation-prompts"});
+  const optionalQuestions = createElement("section", {class: "codex-question-panel", "aria-label": "Optional questions"});
+  optionalQuestions.hidden = true;
   const pendingStatus = createElement("div", {class: "codex-lane-status", role: "status"});
   const pendingStatusLabel = createElement("span", {}, "Loading requests…");
   const retryPending = createElement("button", {type: "button"}, "Retry requests");
@@ -923,8 +927,11 @@ export function mountConversation(root, options) {
   if (capabilities.settings) children.push(settingsBar, settingsDialog);
   children.push(historyControls, transcript);
   if (capabilities.pending) children.push(pendingStatus, prompts);
-  if (capabilities.queueRead) children.push(queueStatus, queue);
-  if (capabilities.send || capabilities.queue || capabilities.interrupt) children.push(form);
+  const dock = createElement("div", {class: "codex-conversation-dock"});
+  dock.append(optionalQuestions);
+  if (capabilities.queueRead) dock.append(queueStatus, queue);
+  if (capabilities.send || capabilities.queue || capabilities.interrupt) dock.append(form);
+  children.push(dock);
   root.replaceChildren(...children);
   let uploads = null;
   if (options?.uploadBasePath && (capabilities.send || capabilities.queue)) {
@@ -1065,6 +1072,21 @@ export function mountConversation(root, options) {
   };
 
   const history = createTranscriptHistory({policy});
+  let questionStorage;
+  try { questionStorage = options?.storage || globalThis.localStorage; } catch (_) {}
+  const questions = createAsyncQuestions({
+    storage: questionStorage, namespace: conversationTargetIdentities.get(client)?.durableNamespace ||
+      (capabilities.send ? conversationTarget(options).durableNamespace : options?.durableNamespace || options?.id),
+    maxMessageBytes: options?.maxMessageBytes,
+    canSend: () => capabilities.send && !settingsSaving,
+    send: async ({threadId, message, id, retry}) => {
+      if (currentThread?.threadId !== threadId) throw new Error("The conversation changed. Refresh before answering.");
+      const receipt = await client.message(message, id, retry);
+      void refresh(); return receipt;
+    },
+    acknowledge: entries => client.acknowledgeMessages(entries),
+    onChange: () => questions.renderPinned(optionalQuestions),
+  });
   let legacy = false, historyRead = null, historyError = "", historyRetryTimer = null, historyFailureKind = null;
   let metadataRetryTimer = null, metadataRetryDelay = policy.retryInitialMs;
   let pendingRead = null, queueRead = null, pendingScope = null, queueScope = null;
@@ -1111,6 +1133,8 @@ export function mountConversation(root, options) {
     header.append(createElement("strong", {}, heading || "Activity"));
     item.append(header);
     item.append(createTranscriptActivity(entry) || createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? ""));
+    const questionControls = questions.inline(entry);
+    if (questionControls) item.append(questionControls);
     if (entry.attachments?.length) item.append(renderAttachments(entry.attachments, {onRemove: removeAttachment}));
     const footer = createElement("div", {class: "codex-entry-footer"});
     const timeAttributes = {class: "codex-entry-time", title: timestamp.title};
@@ -1183,6 +1207,7 @@ export function mountConversation(root, options) {
     const update = kind === "older" ? history.applyOlder(page) :
       kind === "repair" ? history.applyRepair(page) : history.applyNewest(page);
     if (update.reset) { generation++; entryNodes.clear(); }
+    questions.update({...((kind === "newest" ? page : currentThread) || page), entries: history.entries});
     patchEntries(update.changed, kind !== "newest");
     if (kind === "newest") {
       if (historyRead) page.entries.forEach((entry, index) => {
@@ -1362,6 +1387,7 @@ export function mountConversation(root, options) {
     try {
       uploads?.lock(true);
       await sender.send(textarea.value, uploads?.ids() || []);
+      questions.ordinaryAccepted();
       uploads?.clear();
       await refresh();
     } catch (error) {
@@ -1411,6 +1437,7 @@ export function mountConversation(root, options) {
     try {
       uploads?.lock(true);
       await sender.queue(message, uploads?.ids() || []);
+      questions.ordinaryAccepted();
       uploads?.clear();
       textarea.value = "";
       void refreshQueue(true);
