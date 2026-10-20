@@ -125,11 +125,13 @@ export function createAsyncQuestions({storage, namespace, send, acknowledge,
           for (const id of candidates) { const record = recordFor(id); record.state.cleared = true; save(record); }
           candidates.clear();
         }
-        const record = [...records.values()].find(record => record.state.attempt?.id === entry.clientUserMessageId);
-        if (record && entry.clientUserMessageDigest && acknowledge && !record.acknowledging) {
-          record.state.answer = record.state.attempt.answer;
+        const record = entry.clientUserMessageId ? [...records.values()].find(record =>
+          record.state.attempt && record.state.attempt.id === entry.clientUserMessageId) : undefined;
+        const attempt = record?.state.attempt;
+        if (attempt && entry.clientUserMessageDigest && acknowledge && !record.acknowledging) {
+          record.state.answer = attempt.answer;
           record.acknowledging = true;
-          const attemptId = record.state.attempt.id;
+          const attemptId = attempt.id;
           void acknowledge([{clientUserMessageId: attemptId, digest: entry.clientUserMessageDigest}]).then(result => {
             if (result?.acknowledgedClientUserMessageIds?.includes(attemptId) && record.state.attempt?.id === attemptId) {
               delete record.state.attempt; save(record);

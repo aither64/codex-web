@@ -10,6 +10,30 @@ class Storage {
   setItem(key, value) { this.values.set(key, value); }
 }
 
+test("repeated ID-less user messages do not match an absent question attempt", async () => {
+  const {createAsyncQuestions} = await load();
+  const storage = new Storage(), acknowledgements = [];
+  const options = {storage, namespace: "conversation", send: async () => {},
+    acknowledge: async rows => { acknowledgements.push(...rows); return {acknowledgedClientUserMessageIds: rows.map(row => row.clientUserMessageId)}; }};
+  const initial = {kind: "userMessage", text: "Initial task", clientUserMessageDigest: "a".repeat(64)};
+  let controller = createAsyncQuestions(options);
+  const entries = [initial, agent("source")];
+  controller.update(snapshot(entries));
+  controller.update(snapshot(entries));
+  controller.update(snapshot([{...initial, clientUserMessageId: ""}, agent("source")]));
+  controller.update(snapshot([...entries, {kind: "userMessage", clientUserMessageId: "ordinary", clientUserMessageDigest: "b".repeat(64)}]));
+  assert.equal(controller.state(q("source").id).answer, undefined);
+  assert.deepEqual(acknowledgements, []);
+  storage.setItem(`codex-web:questions:conversation:thread:${encodeURIComponent(q("source").id)}`,
+    JSON.stringify({schema: 1, draft: "Two", attempt: {id: "question-answer", answer: "Two", message: "Exact saved envelope"}}));
+  controller = createAsyncQuestions(options);
+  controller.update(snapshot([...entries, {kind: "userMessage", clientUserMessageId: "question-answer", clientUserMessageDigest: "c".repeat(64)}]));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(controller.state(q("source").id).answer, "Two");
+  assert.equal(controller.state(q("source").id).attempt, undefined);
+  assert.deepEqual(acknowledgements, [{clientUserMessageId: "question-answer", digest: "c".repeat(64)}]);
+});
+
 test("native reply envelope retains identity and bounds UTF-8 framing", async () => {
   const {asyncQuestionReply} = await load();
   const text = asyncQuestionReply({...q("source", 1), title: "界".repeat(300) + "\n"}, "A\nB");
