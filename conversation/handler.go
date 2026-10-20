@@ -118,7 +118,10 @@ type Target struct {
 	Capabilities        Capabilities
 	MutationLock        MutationLocker
 	TransformTranscript func(*codex.Transcript)
-	Release             func()
+	// PresentTranscript renders application-owned presentation after attachment
+	// decoration. TransformTranscript retains its earlier, pre-attachment order.
+	PresentTranscript func(*codex.Transcript)
+	Release           func()
 }
 
 func (target Target) models(ctx context.Context) ([]codex.Model, error) {
@@ -418,6 +421,9 @@ func (handler *Handler) serveOperation(
 				return
 			}
 		}
+		if target.PresentTranscript != nil {
+			target.PresentTranscript(&page.Transcript)
+		}
 		writeJSON(response, http.StatusOK, page)
 	case "activity":
 		if request.Method != http.MethodGet || !target.Capabilities.Read {
@@ -456,6 +462,9 @@ func (handler *Handler) serveOperation(
 				uploadError(response, err)
 				return
 			}
+		}
+		if target.PresentTranscript != nil {
+			target.PresentTranscript(&transcript)
 		}
 		writeJSON(response, http.StatusOK, transcript)
 	case "pending":

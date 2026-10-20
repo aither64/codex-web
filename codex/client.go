@@ -191,26 +191,35 @@ type TranscriptPage struct {
 }
 
 type TranscriptEntry struct {
-	Citations               []CitationSpan       `json:"citations,omitempty"`
-	CitationsPending        bool                 `json:"citationsPending,omitempty"`
-	Delivery                string               `json:"delivery,omitempty"`
-	Questions               []AsyncQuestion      `json:"questions,omitempty"`
-	QuestionReplies         []AsyncQuestionReply `json:"questionReplies,omitempty"`
-	DisplayText             *string              `json:"displayText,omitempty"`
-	Attachments             []Attachment         `json:"attachments,omitempty"`
-	TurnID                  string               `json:"turnId,omitempty"`
-	TurnStatus              string               `json:"turnStatus,omitempty"`
-	ItemID                  string               `json:"itemId,omitempty"`
-	ClientUserMessageID     string               `json:"clientUserMessageId,omitempty"`
-	ClientUserMessageDigest string               `json:"clientUserMessageDigest,omitempty"`
-	Kind                    string               `json:"kind"`
-	Summary                 string               `json:"summary,omitempty"`
-	Text                    string               `json:"text,omitempty"`
-	HTML                    string               `json:"html,omitempty"`
-	Details                 string               `json:"details,omitempty"`
-	Timestamp               string               `json:"timestamp,omitempty"`
-	TimestampApproximate    bool                 `json:"timestampApproximate,omitempty"`
-	Activity                *TranscriptActivity  `json:"activity,omitempty"`
+	Communication           *TranscriptCommunication `json:"communication,omitempty"`
+	Citations               []CitationSpan           `json:"citations,omitempty"`
+	CitationsPending        bool                     `json:"citationsPending,omitempty"`
+	Delivery                string                   `json:"delivery,omitempty"`
+	Questions               []AsyncQuestion          `json:"questions,omitempty"`
+	QuestionReplies         []AsyncQuestionReply     `json:"questionReplies,omitempty"`
+	DisplayText             *string                  `json:"displayText,omitempty"`
+	Attachments             []Attachment             `json:"attachments,omitempty"`
+	TurnID                  string                   `json:"turnId,omitempty"`
+	TurnStatus              string                   `json:"turnStatus,omitempty"`
+	ItemID                  string                   `json:"itemId,omitempty"`
+	ClientUserMessageID     string                   `json:"clientUserMessageId,omitempty"`
+	ClientUserMessageDigest string                   `json:"clientUserMessageDigest,omitempty"`
+	Kind                    string                   `json:"kind"`
+	Summary                 string                   `json:"summary,omitempty"`
+	Text                    string                   `json:"text,omitempty"`
+	HTML                    string                   `json:"html,omitempty"`
+	Details                 string                   `json:"details,omitempty"`
+	Timestamp               string                   `json:"timestamp,omitempty"`
+	TimestampApproximate    bool                     `json:"timestampApproximate,omitempty"`
+	Activity                *TranscriptActivity      `json:"activity,omitempty"`
+}
+
+// TranscriptCommunication is an application-owned presentation hint. It does
+// not authenticate a sender or authorize access to another conversation.
+type TranscriptCommunication struct {
+	Kind string `json:"kind"`
+	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
 }
 
 type SendReceipt struct {
