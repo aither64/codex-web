@@ -1,4 +1,6 @@
 import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=6";
+import {citationCopyText, createCitationMessage} from "./citations.js?v=1";
+export {citationCopyText, createCitationMessage} from "./citations.js?v=1";
 export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=6";
 import {createConversationSync, renderConnectionStatus} from "./sync.js?v=2";
 export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=2";
@@ -131,7 +133,8 @@ export function transcriptEntryCopyText(entry) {
   const text = typeof entry?.text === "string" ? entry.text : "";
   const summary = typeof entry?.summary === "string" ? entry.summary : "";
   const details = typeof entry?.details === "string" ? entry.details : "";
-  if (["userMessage", "agentMessage", "reasoning", "plan"].includes(entry?.kind)) return text;
+  if (["agentMessage", "reasoning", "plan"].includes(entry?.kind)) return citationCopyText(entry);
+  if (entry?.kind === "userMessage") return text;
   if (entry?.kind === "commandExecution") {
     return [summary.replace(/^\$ /, ""), details].filter(Boolean).join("\n");
   }
@@ -321,7 +324,7 @@ export async function readTranscriptPage(client, {signal, cursor, legacy = false
       (page.hasOlder && (typeof page.olderCursor !== "string" || !page.olderCursor || page.olderCursor === cursor))) {
     throw new Error("Invalid conversation page");
   }
-  return {...page, legacy: false};
+  return {...page, legacy: false, requestCursor: cursor || null};
 }
 
 export function createTranscriptHistory(options = {}) {
@@ -330,6 +333,12 @@ export function createTranscriptHistory(options = {}) {
   let olderCursor = null, hasOlder = false, gapCursor = null, gapStart = -1;
   let repairCursor = null, repairTarget = "", lastActiveRepair = -Infinity, cursorReset = false;
   let resetRecovery = null, repairVersion = 0;
+  const citationPages = new Map();
+  const rememberCitations = (page) => {
+    if (!page.requestCursor) return;
+    if (page.entries.some(entry => entry.citationsPending)) citationPages.set(page.requestCursor, true);
+    else citationPages.delete(page.requestCursor);
+  };
   const pairs = (entries) => {
     const seen = new Set();
     return entries.map((entry, index) => {
@@ -357,6 +366,7 @@ export function createTranscriptHistory(options = {}) {
     rows = rows.map((row) => updates.get(row.key) || row);
   };
   const clear = (nextThread = "") => {
+    citationPages.clear();
     threadId = nextThread; rows = []; initialized = false; legacy = false;
     olderCursor = null; hasOlder = false; gapCursor = null; gapStart = -1;
     repairCursor = null; repairTarget = ""; cursorReset = false; resetRecovery = null;
@@ -380,6 +390,7 @@ export function createTranscriptHistory(options = {}) {
     if (!page?.threadId || !Array.isArray(page.entries)) throw new Error("Invalid conversation page");
     const reset = threadId !== page.threadId;
     if (reset) clear(page.threadId);
+    rememberCitations(page);
     const incoming = pairs(page.entries);
     const changed = changes(incoming);
     if (!initialized || page.legacy) {
@@ -458,10 +469,14 @@ export function createTranscriptHistory(options = {}) {
       hasOlder = Boolean(page.hasOlder);
     }
     initialized = true;
-    if (!legacy && gapStart < 0 && page.olderCursor && now - lastActiveRepair >= policy.historyRepairMs) {
+    if (!legacy && gapStart < 0 && !repairTarget && page.olderCursor &&
+        now - lastActiveRepair >= policy.historyRepairMs) {
       const newest = new Set(incoming.map((row) => row.key));
-      const active = rows.find((row) => row.entry.turnStatus &&
-        !["completed", "failed", "interrupted", "error"].includes(row.entry.turnStatus) && !newest.has(row.key));
+      // Pending citations still need repair after a completed row leaves the
+      // newest page. Keep the current target until pagination reaches it.
+      const active = rows.find((row) => !newest.has(row.key) &&
+        (row.entry.citationsPending || (row.entry.turnStatus &&
+        !["completed", "failed", "interrupted", "error"].includes(row.entry.turnStatus))));
       if (active) {
         repairTarget = active.key;
         repairCursor = page.olderCursor;
@@ -472,6 +487,7 @@ export function createTranscriptHistory(options = {}) {
   };
   const applyOlder = (page) => {
     if (page.threadId !== threadId || !Array.isArray(page.entries)) throw new Error("Conversation history changed");
+    rememberCitations(page);
     const incoming = pairs(page.entries);
     const changed = changes(incoming);
     rows = distinct(incoming, rows);
@@ -482,6 +498,7 @@ export function createTranscriptHistory(options = {}) {
   };
   const applyRepair = (page) => {
     if (page.threadId !== threadId || !Array.isArray(page.entries)) throw new Error("Conversation history changed");
+    rememberCitations(page);
     const incoming = pairs(page.entries);
     if (resetRecovery) {
       const before = rows, recovery = resetRecovery;
@@ -525,6 +542,7 @@ export function createTranscriptHistory(options = {}) {
   return {
     applyNewest, applyOlder, applyRepair, clear,
     invalidateCursor() {
+      citationPages.clear();
       cursorReset = true; olderCursor = null; hasOlder = false;
       gapStart = -1; gapCursor = null; repairCursor = null; repairTarget = "";
       resetRecovery = null; repairVersion++;
@@ -537,7 +555,8 @@ export function createTranscriptHistory(options = {}) {
     get olderCursor() { return olderCursor; },
     get hasOlder() { return hasOlder; },
     get gap() { return Boolean(resetRecovery) || gapStart >= 0 || Boolean(repairTarget) || cursorReset; },
-    get repairCursor() { return resetRecovery?.cursor || (gapStart >= 0 ? gapCursor : repairCursor); },
+    get repairCursor() { return resetRecovery?.cursor || (gapStart >= 0 ? gapCursor : repairCursor) || citationPages.keys().next().value; },
+    get citationsPending() { return citationPages.size > 0; },
     get repairVersion() { return repairVersion; },
   };
 }
@@ -1133,7 +1152,8 @@ export function mountConversation(root, options) {
     const header = createElement("div", {class: "codex-entry-header"});
     header.append(createElement("strong", {}, heading || "Activity"));
     item.append(header);
-    item.append(createTranscriptActivity(entry) || createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? ""));
+    item.append(createTranscriptActivity(entry) || (entry.citations?.length ? createCitationMessage(entry) :
+      createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? "")));
     const questionControls = questions.inline(entry);
     if (questionControls) item.append(questionControls);
     if (entry.attachments?.length) item.append(renderAttachments(entry.attachments, {onRemove: removeAttachment}));
@@ -1226,7 +1246,7 @@ export function mountConversation(root, options) {
       lastThreadStatus = page.status;
       if (metadataRetryTimer !== null) clearTimeout(metadataRetryTimer);
       metadataRetryTimer = null;
-      if (page.metadataPending && !destroyed && !paused) {
+      if ((page.metadataPending || page.entries.some(entry => entry.citationsPending)) && !destroyed && !paused) {
         metadataRetryTimer = setTimeout(() => { metadataRetryTimer = null; sync?.scheduleRefresh(0); }, metadataRetryDelay);
         metadataRetryDelay = Math.min(policy.retryMaxMs, metadataRetryDelay * 2);
       } else metadataRetryDelay = policy.retryInitialMs;
@@ -1330,8 +1350,8 @@ export function mountConversation(root, options) {
       if (!historyError) scheduleHistoryRepair();
     }
   };
-  const scheduleHistoryRepair = (delay = policy.historyPageMs) => {
-    if (!history.gap || !history.repairCursor || historyRetryTimer !== null ||
+  const scheduleHistoryRepair = (delay = history.gap ? policy.historyPageMs : policy.retryInitialMs) => {
+    if ((!history.gap && !history.citationsPending) || !history.repairCursor || historyRetryTimer !== null ||
         historyRead || historyError && historyFailureKind !== "repair" || legacy || destroyed || paused || globalThis.document?.hidden) return;
     historyRetryTimer = setTimeout(() => { historyRetryTimer = null; void runHistoryRead("repair"); }, delay);
   };

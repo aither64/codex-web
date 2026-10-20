@@ -871,3 +871,34 @@ the canonical immutable `codex/ephemeral_luna_models.json` path from the reviewe
 provider revision. The default invocation retains the original GPT-5.5 profile.
 Both runs must prove empty tool exposure and rejection of model-emitted calls;
 fake-client tests do not establish native dispatch isolation.
+
+## Web citations
+
+Assistant transcript entries can include `citations` and `citationsPending`.
+Each citation has `start` and `end` offsets into the original `text`, measured
+in UTF-8 bytes, and zero or more `sources` with `url`, `title` and a message-local
+`number`. `unavailable` marks a missing source; `incomplete` marks an unfinished
+token. The original `text` is never rewritten. Consumers without citation support
+can ignore these optional fields.
+
+The client recognizes web-tool citation tokens outside Markdown code and reads
+source records from MCP results, including `_meta.raw_messages` records of type
+`sonic_webpage`. It does not require output-text annotations. Only absolute HTTP
+and HTTPS destinations without embedded credentials are accepted. Sources sharing
+the same URL share a number within the message.
+
+`codex.CitationMarkdown` substitutes ordinary numbered Markdown links for the
+normalized spans. Applications must sanitize their rendered HTML. The browser
+exports `createCitationMessage` for DOM rendering and `citationCopyText` for
+copying Markdown links; the standard conversation view and Copy message control
+use these helpers. Code examples and unrelated private-use characters remain
+literal. Completed references without sources show `[source unavailable]`.
+
+Missing sources are recovered asynchronously through passive paginated history,
+starting before the cited message and continuing through earlier turns. Lookup
+workers yield after bounded work and continue on subsequent reads. Cache entries
+are scoped to the thread, connection generation and rollout identity; they are
+not durable state and require no migration. A pending lookup reports
+`citationsPending`; the standard browser retries the affected page with backoff.
+Hosts using a custom transcript view should retry pages with pending references
+and merge updated entries by their existing turn/item identities.

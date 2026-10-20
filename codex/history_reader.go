@@ -216,5 +216,7 @@ func (c *Client) readRecentThread(ctx context.Context, threadID string) (Transcr
 		result.CollaborationMode = settings.settings.CollaborationMode
 	}
 	c.applyTranscriptTimestamps(threadID, result.Entries, rollout.itemTimes)
+	file, _ := pageFile(stringValue(meta.Thread["path"]))
+	c.presentCitations(threadID, pageIdentity(meta.Thread), stringValue(meta.Thread["path"]), c.pageGeneration(), file, result.Entries, c.pagedHistoryRequest)
 	return result, nil
 }

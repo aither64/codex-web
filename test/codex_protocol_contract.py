@@ -330,6 +330,15 @@ client_requests.extend([
         "threadId": "thread-1", "turnId": "turn-1", "limit": 32, "sortDirection": "asc", "cursor": "older-items",
     }),
 ])
+# Passive citation recovery reads earlier turns and items with bounded pages.
+client_requests.extend([
+    request("thread/turns/list", {
+        "threadId": "thread-1", "limit": 32, "sortDirection": "desc", "itemsView": "notLoaded", "cursor": "citation-turns",
+    }),
+    request("thread/items/list", {
+        "threadId": "thread-1", "turnId": "turn-1", "limit": 32, "sortDirection": "desc", "cursor": "citation-items",
+    }),
+])
 call_pattern = re.compile(
     r'\b(?:Request|historyRequest|requestConnected|requestConnectedGeneration|requestOn|request)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
     re.DOTALL,

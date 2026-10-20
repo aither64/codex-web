@@ -441,6 +441,7 @@ func (c *Client) readThreadPage(ctx context.Context, threadID, cursor string, re
 	}
 	page.CollaborationMode, page.MetadataPending = mode, pending || mode == ""
 	c.applyTranscriptTimestamps(threadID, page.Entries, times)
+	c.presentCitations(threadID, identity, path, generation, file, page.Entries, c.pagedHistoryRequest)
 	if c.pageGeneration() != generation {
 		return TranscriptPage{}, &TranscriptCursorError{Code: "transcript_reset_required"}
 	}

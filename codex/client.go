@@ -191,6 +191,8 @@ type TranscriptPage struct {
 }
 
 type TranscriptEntry struct {
+	Citations               []CitationSpan       `json:"citations,omitempty"`
+	CitationsPending        bool                 `json:"citationsPending,omitempty"`
 	Delivery                string               `json:"delivery,omitempty"`
 	Questions               []AsyncQuestion      `json:"questions,omitempty"`
 	QuestionReplies         []AsyncQuestionReply `json:"questionReplies,omitempty"`
@@ -753,6 +755,8 @@ func ResolveForkThreadSettings(
 }
 
 type Client struct {
+	citationMu        sync.Mutex
+	citationCache     map[string]*citationThread
 	historyPageMu     sync.Mutex
 	historyPageLimit  int
 	socket            string
@@ -3927,6 +3931,8 @@ func (c *Client) ReadThread(ctx context.Context, threadID string) (Transcript, e
 		transcript.CollaborationMode = rollout.mode
 	}
 	c.applyTranscriptTimestamps(threadID, transcript.Entries, rollout.itemTimes)
+	file, _ := pageFile(stringValue(metadata.Thread["path"]))
+	c.presentCitations(threadID, pageIdentity(metadata.Thread), stringValue(metadata.Thread["path"]), c.pageGeneration(), file, transcript.Entries, c.pagedHistoryRequest)
 	return transcript, nil
 }
 
