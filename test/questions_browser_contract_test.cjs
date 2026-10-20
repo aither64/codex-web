@@ -10,6 +10,30 @@ class Storage {
   setItem(key, value) { this.values.set(key, value); }
 }
 
+test("untouched drafts select the recommendation or first option without replacing saved answers", async () => {
+  const {createAsyncQuestions} = await load();
+  const cases = [
+    {options: ["One", "Two (Recommended)"], expected: "Two (Recommended)"},
+    {options: ["One", "Two"], expected: "One"},
+    {options: ["One"], saved: {draft: "", choice: "", note: ""}, expected: ""},
+    {options: ["One"], saved: {draft: "Custom answer"}, expected: "Custom answer"},
+    {options: ["One"], saved: {draft: "", attempt: {id: "pending", answer: "Two", message: "Exact envelope"}}, expected: ""},
+  ];
+  for (const {options, saved, expected} of cases) {
+    const storage = new Storage(), question = {...q("source"), options};
+    if (saved) storage.setItem(`codex-web:questions:conversation:thread:${encodeURIComponent(question.id)}`,
+      JSON.stringify({schema: 1, ...saved}));
+    const config = {storage, namespace: "conversation", send: async () => {}};
+    let controller = createAsyncQuestions(config);
+    const page = snapshot([{...agent("source"), questions: [question]}]);
+    controller.update(page);
+    assert.equal(controller.state(question.id).draft, expected);
+    controller = createAsyncQuestions(config); controller.update(page);
+    assert.equal(controller.state(question.id).draft, expected, "reload retains the same draft");
+    if (saved?.attempt) assert.deepEqual(controller.state(question.id).attempt, saved.attempt);
+  }
+});
+
 test("repeated ID-less user messages do not match an absent question attempt", async () => {
   const {createAsyncQuestions} = await load();
   const storage = new Storage(), acknowledgements = [];

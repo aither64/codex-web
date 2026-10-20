@@ -3,8 +3,8 @@ export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createU
 import {createConversationSync, renderConnectionStatus} from "./sync.js?v=2";
 export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=2";
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
-import {createAsyncQuestions} from "./questions.js?v=1";
-export {createAsyncQuestions, asyncQuestionReply} from "./questions.js?v=1";
+import {createAsyncQuestions} from "./questions.js?v=3";
+export {createAsyncQuestions, asyncQuestionReply} from "./questions.js?v=3";
 export {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 
 const defaultLabels = {
@@ -1086,6 +1086,7 @@ export function mountConversation(root, options) {
     },
     acknowledge: entries => client.acknowledgeMessages(entries),
     onChange: () => questions.renderPinned(optionalQuestions),
+    onPanelEmpty: () => textarea.focus({preventScroll: true}),
   });
   let legacy = false, historyRead = null, historyError = "", historyRetryTimer = null, historyFailureKind = null;
   let metadataRetryTimer = null, metadataRetryDelay = policy.retryInitialMs;
