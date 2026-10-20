@@ -645,6 +645,12 @@ Codex build they deploy.
 Go API for trusted application callers; there is no browser route for selecting
 its socket, paths, model or restriction settings.
 
+`ModelProvider` optionally selects a trusted provider ID on `thread/start`.
+The helper requires the server to confirm that provider before `turn/start`;
+a missing or different provider fails with `ErrEphemeralServer` without sending
+the prompt for inference. An empty value uses the native server's default.
+Callers with their own provider selection must resolve and pass it on each call.
+
 The supported profiles use Codex 0.163.0 and `Effort: "low"`, with either
 `Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Each requires its matching
 immutable catalog below. Other pairs fail with `ErrEphemeralSettings` before

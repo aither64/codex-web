@@ -111,6 +111,9 @@ func (f *ephemeralFake) serve(t *testing.T) string {
 				}
 			case "thread/start":
 				result = map[string]any{"model": params["model"], "cwd": params["cwd"], "approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly", "networkAccess": false}, "thread": map[string]any{"id": "utility-thread", "cwd": params["cwd"], "ephemeral": true, "path": nil, "environments": []any{}}}
+				if provider, ok := params["modelProvider"]; ok {
+					result.(map[string]any)["modelProvider"] = provider
+				}
 				if f.start != nil {
 					f.start(result.(map[string]any))
 				}
@@ -155,6 +158,70 @@ func runEphemeralTest(t *testing.T, client *Client, opts EphemeralTurnOptions) (
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	return client.RunEphemeralTurn(ctx, opts)
+}
+
+func TestEphemeralExplicitProvider(t *testing.T) {
+	for _, test := range []struct {
+		name, requested, effective string
+		failed                     bool
+	}{
+		{name: "native default"},
+		{name: "subscription", requested: "openai", effective: "openai"},
+		{name: "pool", requested: "selected-pool", effective: "selected-pool"},
+		{name: "wrong provider", requested: "openai", effective: "stale-pool", failed: true},
+		{name: "missing provider echo", requested: "openai", failed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &ephemeralFake{start: func(response map[string]any) {
+				if test.effective == "" {
+					delete(response, "modelProvider")
+				} else {
+					response["modelProvider"] = test.effective
+				}
+			}}
+			client := New(fake.serve(t))
+			defer client.Close()
+			opts := ephemeralTestOptions(t)
+			opts.ModelProvider = test.requested
+			_, err := runEphemeralTest(t, client, opts)
+			if test.failed {
+				if !errors.Is(err, ErrEphemeralServer) {
+					t.Fatalf("provider mismatch error = %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			var started, turns int
+			for _, call := range fake.snapshot() {
+				switch call["method"] {
+				case "thread/start":
+					started++
+					provider, present := call["params"].(map[string]any)["modelProvider"]
+					if present != (test.requested != "") || present && provider != test.requested {
+						t.Fatalf("provider selection = %v, present = %v", provider, present)
+					}
+				case "turn/start":
+					turns++
+				}
+			}
+			if started != 1 || test.failed && turns != 0 || !test.failed && turns != 1 {
+				t.Fatalf("thread starts = %d, inference turns = %d", started, turns)
+			}
+		})
+	}
+}
+
+func TestEphemeralRejectsInvalidProviderBeforeConnecting(t *testing.T) {
+	for _, provider := range []string{" openai", "openai\n", "pool name", "pool\x00", strings.Repeat("x", 257)} {
+		opts := ephemeralTestOptions(t)
+		opts.ModelProvider = provider
+		client := New("/unused-socket")
+		_, err := runEphemeralTest(t, client, opts)
+		client.Close()
+		if !errors.Is(err, ErrEphemeralSettings) {
+			t.Fatalf("provider %q error = %v", provider, err)
+		}
+	}
 }
 
 func TestEphemeralEarlyCompletionUsesPrivatePolicy(t *testing.T) {

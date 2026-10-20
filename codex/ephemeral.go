@@ -61,11 +61,15 @@ type EphemeralTurnOptions struct {
 	// ModelCatalogFile is the immutable catalog for the selected profile,
 	// used by a naming-only daemon through its startup CLI override.
 	ModelCatalogFile string
-	Model            string
-	Effort           string
-	Instructions     string
-	Input            string
-	OutputSchema     json.RawMessage
+	// ModelProvider selects the trusted caller's provider for this new utility
+	// thread. Empty retains the native default. The lifecycle RPC validates the
+	// effective provider before the helper can start inference.
+	ModelProvider string
+	Model         string
+	Effort        string
+	Instructions  string
+	Input         string
+	OutputSchema  json.RawMessage
 }
 
 type EphemeralTurnResult struct{ Text string }
@@ -85,6 +89,9 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 		return result, ctx.Err()
 	}
 	if (opts.Model != "gpt-5.5" && opts.Model != "gpt-6-luna") || opts.Effort != "low" {
+		return result, ErrEphemeralSettings
+	}
+	if opts.ModelProvider != "" && (!ephemeralID(opts.ModelProvider) || strings.TrimSpace(opts.ModelProvider) != opts.ModelProvider || strings.ContainsAny(opts.ModelProvider, "\x00\r\n\t ")) {
 		return result, ErrEphemeralSettings
 	}
 	valid := validEphemeralOptions(opts) && validEphemeralCatalog(opts.ModelCatalogFile, opts.Model)
@@ -239,12 +246,16 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 		return result, ErrEphemeralSettings
 	}
 	var started json.RawMessage
-	if private.requestConnectedGeneration(inference, generation, "thread/start", map[string]any{
+	startParams := map[string]any{
 		"ephemeral": true, "model": opts.Model, "allowProviderModelFallback": false,
 		"cwd": opts.Directory, "baseInstructions": opts.Instructions, "developerInstructions": "",
 		"approvalPolicy": "never", "sandbox": "read-only", "environments": []any{},
 		"runtimeWorkspaceRoots": []string{}, "selectedCapabilityRoots": []string{}, "dynamicTools": []any{}, "config": policy,
-	}, &started) != nil {
+	}
+	if opts.ModelProvider != "" {
+		startParams["modelProvider"] = opts.ModelProvider
+	}
+	if private.requestConnectedGeneration(inference, generation, "thread/start", startParams, &started) != nil {
 		return result, failure(ErrEphemeralServer)
 	}
 	start, ok := ephemeralObject(started)
