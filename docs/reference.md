@@ -520,6 +520,20 @@ pending send is acknowledged only after a matching message is observed in the
 retained transcript, including an older page; a partial newest page cannot
 prove that the message is absent.
 
+`submissionFailurePresentation(error)` returns `{message, uncertain}` for inline
+delivery errors. Only explicit `error.notSent === true` establishes an unsent
+message. Transport failures, HTTP 502/503/504, aborts and unknown errors remain
+uncertain. The helper preserves the error and performs no request, retry,
+storage change or receipt acknowledgement. The mounted composer retains input
+and the original durable attempt on failure; a previously observed message or
+accepted receipt takes precedence over a lost response. Retry that original
+submission through the durable sender rather than generating a new identity.
+The notice belongs to the original conversation, thread, attempt and action.
+Acceptance or observation of that attempt clears the notice; unrelated
+confirmations leave it unchanged. Clearing the notice does not remove a durable
+retry record.
+Changed draft text or attachment selections remain intact during reconciliation.
+
 `formatTranscriptTimestamp(entry)` supplies the mounted interface's local clock
 label, full timestamp tooltip and local calendar date for custom renderers.
 It returns `text`, `title`, `dateTime`, `dateKey`, `dateLabel` and `approximate`.

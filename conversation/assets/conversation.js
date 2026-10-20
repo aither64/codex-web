@@ -96,6 +96,16 @@ export function transcriptEntryVisible(entry, filter = "all") {
   return true;
 }
 
+// This is display text, never a delivery decision or an instruction to clear
+// receipts. Only an explicit server refusal establishes a definitely unsent input.
+export function submissionFailurePresentation(error) {
+  const uncertain = error?.notSent !== true;
+  const detail = typeof error?.message === "string" ? error.message.trim().slice(0, 512) : "";
+  const guidance = uncertain ? "Delivery could not be confirmed. Retry the original submission to check its status." :
+    "The message was not sent. Try again.";
+  return {message: detail ? `${detail} ${guidance}` : guidance, uncertain};
+}
+
 // Shared typed activity body. Thread identities are text only: a transcript
 // event cannot grant navigation to another conversation. URL schemes and
 // credentials are checked again at the browser boundary.
@@ -951,7 +961,33 @@ export function mountConversation(root, options) {
   if (capabilities.queue) actions.append(queueButton);
   if (capabilities.interrupt) actions.append(interrupt);
   const form = createElement("form", {class: "codex-conversation-form"});
-  form.append(textarea, actions);
+  const submissionStatus = createElement("p", {class: "codex-submission-status", role: "status"});
+  submissionStatus.hidden = true;
+  let submissionFailure = null;
+  const renderSubmissionFailure = () => {
+    submissionStatus.hidden = !submissionFailure || submissionFailure.threadId !== currentThread?.threadId;
+    submissionStatus.textContent = submissionFailure?.message || "";
+  };
+  const confirmSubmission = (action, attempt, threadId) => {
+    if (!attempt?.id || submissionFailure?.conversation !== client ||
+        submissionFailure.threadId !== threadId || currentThread?.threadId !== threadId ||
+        submissionFailure.action !== action || submissionFailure.attemptId !== attempt.id) return;
+    submissionFailure = null;
+    renderSubmissionFailure();
+  };
+  const failSubmission = (error, action, attempt, threadId) => {
+    if (currentThread?.threadId === threadId && attempt?.id && history.entries.some(entry =>
+      entry.kind === "userMessage" && entry.clientUserMessageId === attempt.id &&
+      /^[0-9a-f]{64}$/.test(entry.clientUserMessageDigest || ""))) return;
+    // A different operation cannot replace an unresolved attempt's warning.
+    if (submissionFailure && (submissionFailure.conversation !== client ||
+        submissionFailure.threadId !== threadId || submissionFailure.action !== action ||
+        submissionFailure.attemptId !== attempt?.id)) return;
+    submissionFailure = {conversation: client, threadId, action, attemptId: attempt?.id,
+      message: submissionFailurePresentation(error).message};
+    renderSubmissionFailure();
+  };
+  form.append(textarea, actions, submissionStatus);
   const policy = {...refreshPolicy, ...options?.refreshPolicy};
   const settingsBar = createElement("div", {class: "codex-conversation-settings"});
   const settingsSummary = createElement("span", {}, "Settings unavailable");
@@ -1268,8 +1304,13 @@ export function mountConversation(root, options) {
     if (!sender || !capabilities.send) return;
     const attempt = sender.pending(), draft = textarea.value;
     void sender.acknowledge(history.entries).then(acknowledged => {
-      if (acknowledged && currentThread?.threadId === threadId &&
-          draft.trim() === attempt?.message && textarea.value === draft) textarea.value = "";
+      if (!acknowledged || currentThread?.threadId !== threadId) return;
+      confirmSubmission("send", attempt, threadId);
+      if (draft.trim() === attempt?.message && textarea.value === draft &&
+          (!uploads || uploads.ready() && sameAttachments(uploads.ids(), attempt.attachmentIds || []))) {
+        textarea.value = "";
+        uploads?.clear();
+      }
     }).catch(error => { status.textContent = error.message; });
   };
   const renderThread = (page, isCurrent = () => true, kind = "newest") => {
@@ -1284,6 +1325,7 @@ export function mountConversation(root, options) {
         historyRead.newerKeys.add(transcriptEntryKey(entry, index, page.entries));
       });
       currentThread = page;
+      renderSubmissionFailure();
       legacy = Boolean(page.legacy);
       if (!history.gap && !historyRead) {historyError = ""; historyFailureKind = null; historyNotice.success();}
       applyThreadSettings();
@@ -1300,6 +1342,11 @@ export function mountConversation(root, options) {
         metadataRetryDelay = Math.min(policy.retryMaxMs, metadataRetryDelay * 2);
       } else metadataRetryDelay = policy.retryInitialMs;
       if (Date.now() - pendingLastRead >= policy.pendingMs) void refreshPending();
+    }
+    if (submissionFailure && history.entries.some(entry => entry.kind === "userMessage" &&
+        entry.clientUserMessageId === submissionFailure.attemptId &&
+        /^[0-9a-f]{64}$/.test(entry.clientUserMessageDigest || ""))) {
+      confirmSubmission(submissionFailure.action, {id: submissionFailure.attemptId}, page.threadId);
     }
     acknowledgeRetained(page.threadId);
     renderHistoryControls();
@@ -1454,14 +1501,25 @@ export function mountConversation(root, options) {
     if (settingsSaving) return;
     send.disabled = true;
     send.textContent = labels.sending;
+    const threadId = currentThread?.threadId;
+    let submittedAttempt, submittedAttachments = [];
     try {
+      submittedAttachments = uploads?.ids() || [];
       uploads?.lock(true);
-      await sender.send(textarea.value, uploads?.ids() || []);
+      const submission = sender.send(textarea.value, submittedAttachments);
+      submittedAttempt = sender.pending();
+      await submission;
+      confirmSubmission("send", submittedAttempt, threadId);
       questions.ordinaryAccepted();
-      uploads?.clear();
+      if (currentThread?.threadId === threadId && textarea.value.trim() === submittedAttempt?.message &&
+          (!uploads || uploads.ready() && sameAttachments(uploads.ids(), submittedAttachments))) uploads?.clear();
       await refresh();
     } catch (error) {
-      if (error.name !== "AbortError") status.textContent = error.message;
+      // An observed/acknowledged message takes precedence over a lost response.
+      const retained = sender.pending();
+      if (!submittedAttempt || retained?.id === submittedAttempt.id && !retained.receipt) {
+        failSubmission(error, "send", submittedAttempt, threadId);
+      }
     } finally {
       uploads?.lock(false);
       send.disabled = uploads ? !uploads.ready() : false;
@@ -1504,16 +1562,25 @@ export function mountConversation(root, options) {
     if (settingsSaving) return;
     const message = textarea.value.trim();
     if (!message && !uploads?.count()) return;
+    const threadId = currentThread?.threadId;
+    let submittedAttempt, submittedAttachments = [];
     try {
+      submittedAttachments = uploads?.ids() || [];
       uploads?.lock(true);
-      await sender.queue(message, uploads?.ids() || []);
+      const submission = sender.queue(message, submittedAttachments);
+      submittedAttempt = sender.pendingQueue();
+      await submission;
+      confirmSubmission("queue", submittedAttempt, threadId);
       questions.ordinaryAccepted();
-      uploads?.clear();
-      textarea.value = "";
+      if (currentThread?.threadId === threadId && textarea.value.trim() === message &&
+          (!uploads || uploads.ready() && sameAttachments(uploads.ids(), submittedAttachments))) {
+        uploads?.clear();
+        textarea.value = "";
+      }
       void refreshQueue(true);
       await refresh();
     } catch (error) {
-      status.textContent = error.message;
+      failSubmission(error, "queue", submittedAttempt, threadId);
     } finally { uploads?.lock(false); }
   });
   if (capabilities.interrupt) interrupt.addEventListener("click", () => void client.interrupt().then(refresh).catch((error) => {

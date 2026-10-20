@@ -28,6 +28,8 @@
 .codex-connection-status button { margin-left: .5rem; }
 .codex-history-controls { display: flex; align-items: center; gap: .65rem; margin: .5rem 0; font-size: .85rem; }
 .codex-conversation-filter { margin-block: .5rem; font: inherit; font-size: .85rem; }
+.codex-submission-status { margin: .25rem 0; color: #bf8700; overflow-wrap: anywhere; }
+.codex-submission-status[hidden] { display: none; }
 .codex-history-controls[hidden], .codex-lane-status[hidden] { display: none; }
 .codex-history-controls button[hidden], .codex-lane-status button[hidden] { display: none; }
 .codex-lane-status { margin: .4rem 0; color: #bf8700; font-size: .85rem; }

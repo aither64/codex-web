@@ -29,7 +29,7 @@ class MemoryStorage {
     createConversationClient, createDurableAttemptStore, createDurableSender, mountConversation,
     formatTranscriptTimestamp, transcriptEntryCopyText, createTranscriptCopyButton, createCopyButton,
     createTranscriptActivity,
-    transcriptEntryPresentation, transcriptEntryVisible,
+    transcriptEntryPresentation, transcriptEntryVisible, submissionFailurePresentation,
   } = await import(
     "../conversation/assets/conversation.js"
   );
@@ -55,6 +55,17 @@ class MemoryStorage {
   assert.equal(transcriptEntryPresentation({communication: {kind: "team", from: "lead"}}).label, "Team · lead");
   assert.equal(transcriptEntryPresentation({communication: {kind: "team", to: "member"}}).label, "Team → member");
   assert.equal(transcriptEntryPresentation({communication: {kind: "team", from: {name: "bad"}}}).label, "Team");
+  for (const error of [undefined, new TypeError("Failed to fetch"), new DOMException("Aborted", "AbortError"),
+    ...[502, 503, 504].map(status => Object.freeze({status, code: "transport", message: `Request failed (${status})`})),
+    {notSent: "true"}]) {
+    const before = error && {...error};
+    const failure = submissionFailurePresentation(error);
+    assert.equal(failure.uncertain, true);
+    assert.match(failure.message, /Delivery could not be confirmed/);
+    if (error) assert.deepEqual({...error}, before, "presentation must preserve error metadata");
+  }
+  assert.deepEqual(submissionFailurePresentation({notSent: true, message: "Access denied"}),
+    {message: "Access denied The message was not sent. Try again.", uncertain: false});
   const timestampOptions = {locales: "en-GB", timeZone: "Europe/Amsterdam"};
   const evening = formatTranscriptTimestamp({timestamp: "2026-09-11T21:59:00Z"}, timestampOptions);
   assert.equal(evening.text, "23:59");
@@ -831,6 +842,195 @@ class MemoryStorage {
   assert.equal(repairedLink.attributes.href, "https://example.com/source");
   assert.equal(citationList.children.length, 3);
   disposeRepairCitations();
+
+  // A failed HTTP response must retain the exact durable attempt, but must not
+  // downgrade a message already observed and acknowledged through the transcript.
+  for (const observedBeforeFailure of [false, true]) {
+    const lossStorage = new MemoryStorage();
+    let lossEvents, rejectSend, sent, accepted = false, backendTurns = 0;
+    const ids = new Set(), lossCalls = [];
+    class LossEvents {
+      constructor() { lossEvents = this; }
+      addEventListener() {}
+      close() {}
+    }
+    const lossClient = {
+      eventsPath: () => "/loss-events",
+      async thread() { return {threadId: "loss-thread", status: "idle", entries: accepted ? [{
+        kind: "userMessage", text: "retained input", clientUserMessageId: sent,
+        clientUserMessageDigest: "b".repeat(64),
+      }] : []}; },
+      async message(message, id, retry, attachmentIds) {
+        lossCalls.push({message, id, retry, attachmentIds}); sent = id;
+        if (!ids.has(id)) { ids.add(id); backendTurns++; }
+        if (lossCalls.length === 1) return new Promise((_, reject) => { rejectSend = reject; });
+        return {turnId: "accepted-turn", clientUserMessageId: id};
+      },
+      async acknowledgeMessages(entries) { return {acknowledgedClientUserMessageIds: entries.map(entry => entry.clientUserMessageId)}; },
+    };
+    const lossRoot = new FakeElement("main");
+    const disposeLoss = mountConversation(lossRoot, {id: "loss", basePath: "/codex", client: lossClient,
+      EventSource: LossEvents, refreshPolicy: {eventDebounceMs: 0}, storage: lossStorage,
+      randomUUID: () => "aa0e3d66-f923-4c79-bde5-c25c1edfd02b",
+      capabilities: {pending: false, queueRead: false, queue: false, interrupt: false, settings: false, respond: false}});
+    await new Promise(resolve => setImmediate(resolve));
+    const lossTextarea = lossRoot.descendants().find(el => el.name === "textarea");
+    const lossForm = lossRoot.descendants().find(el => el.name === "form");
+    const notice = lossRoot.descendants().find(el => el.attributes.class === "codex-submission-status");
+    lossTextarea.value = "retained input";
+    const sending = lossForm.listeners.get("submit")({preventDefault() {}});
+    await new Promise(resolve => setImmediate(resolve));
+    if (observedBeforeFailure) {
+      accepted = true; lossEvents.onmessage();
+      for (let index = 0; index < 50 && lossTextarea.value; index++) await new Promise(resolve => setTimeout(resolve, 5));
+      assert.equal(lossTextarea.value, "");
+    }
+    rejectSend(Object.assign(new Error("Request failed (502)"), {status: 502}));
+    await sending;
+    if (observedBeforeFailure) assert.equal(notice.hidden, true);
+    else {
+      assert.equal(lossTextarea.value, "retained input");
+      assert.equal(notice.hidden, false); assert.match(notice.textContent, /Delivery could not be confirmed/);
+      const retained = createDurableSender({client: lossClient, storage: lossStorage, id: "loss", basePath: "/codex",
+        randomUUID: () => { throw Error("must reuse identity"); }});
+      assert.equal(retained.pending().id, sent);
+      await retained.send("retained input");
+      assert.deepEqual(lossCalls.map(call => [call.id, call.retry]), [[sent, false], [sent, true]]);
+      const receipt = retained.pending().receipt;
+      submissionFailurePresentation({status: 502});
+      assert.deepEqual(retained.pending().receipt, receipt);
+      assert.equal(await retained.acknowledge([]), false);
+      assert(retained.pending(), "unseen receipts stay retained");
+    }
+    assert.equal(backendTurns, 1);
+    disposeLoss();
+  }
+
+  // Recovery order is independent of rendering. Exercise the mounted composer
+  // and real upload selection, including unrelated confirmations and edits.
+  class UploadElement extends FakeElement {
+    constructor(name) {
+      super(name);
+      this.classList = {add() {}, remove() {}};
+    }
+    append(...nodes) { for (const node of nodes) { node.remove?.(); node.parent = this; this.children.push(node); } }
+    prepend(...nodes) { for (const node of [...nodes].reverse()) { node.remove?.(); node.parent = this; this.children.unshift(node); } }
+    insertBefore(node, reference) {
+      if (node === reference) return;
+      node.remove?.(); node.parent = this;
+      const index = this.children.indexOf(reference);
+      this.children.splice(index < 0 ? this.children.length : index, 0, node);
+    }
+    replaceChildren(...nodes) { this.children.forEach(node => { node.parent = null; }); this.children = []; this.append(...nodes); }
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter(node => node !== this); this.parent = null; }
+    removeEventListener(name) { this.listeners.delete(name); }
+    matches() { return false; }
+    focus() {}
+  }
+  const recoveryGlobals = {document: globalThis.document, fetch: globalThis.fetch,
+    add: globalThis.addEventListener, remove: globalThis.removeEventListener};
+  try {
+    globalThis.document = {...recoveryGlobals.document,
+      createElement: name => new UploadElement(name),
+      createElementNS: (_namespace, name) => new UploadElement(name)};
+    globalThis.addEventListener = globalThis.removeEventListener = () => {};
+    for (const action of ["send", "queue"]) for (const confirmation of ["retry", "observe", "unrelated", "thread", "draft", "attachments"]) {
+      const recoveryStorage = new MemoryStorage();
+      const files = [
+        {id: "ca0e3d66-f923-4c79-bde5-c25c1edfd02b", clientId: "ca0e3d66-f923-4c79-bde5-c25c1edfd02b", name: "first.txt", size: 1, state: "ready"},
+        {id: "cb0e3d66-f923-4c79-bde5-c25c1edfd02b", clientId: "cb0e3d66-f923-4c79-bde5-c25c1edfd02b", name: "second.txt", size: 1, state: "ready"},
+      ];
+      recoveryStorage.setItem("codex-web:uploads:/recovery-uploads", JSON.stringify(files));
+      globalThis.fetch = async (_path, options = {}) => ({ok: true, json: async () => options.method === "DELETE" ? {} : {
+        limits: {fileBytes: 100, promptBytes: 100, files: 10}, files,
+      }});
+      let recoveryEvents, recoveryThread = "original-thread", observedID = "", recoveryReads = 0;
+      const recoveryCalls = [];
+      class RecoveryEvents {
+        constructor() { recoveryEvents = this; }
+        addEventListener() {}
+        close() {}
+      }
+      const dispatchRecovery = async (message, id, attachmentIds) => {
+        recoveryCalls.push({message, id, attachmentIds});
+        if (recoveryCalls.length === 1) throw Object.assign(new Error("Request failed (502)"), {status: 502});
+        return action === "send" ? {turnId: "accepted", clientUserMessageId: id} : {id: "queued", clientUserMessageId: id};
+      };
+      const recoveryClient = {
+        eventsPath: () => "/recovery-events",
+        async thread() {
+          recoveryReads++;
+          return {threadId: recoveryThread, status: "active", entries: observedID ? [{kind: "userMessage", text: "original",
+            clientUserMessageId: observedID, clientUserMessageDigest: "c".repeat(64)}] : []};
+        },
+        message: (message, id, _retry, attachmentIds) => dispatchRecovery(message, id, attachmentIds),
+        queueMessage: dispatchRecovery,
+        async acknowledgeMessages(entries) { return {acknowledgedClientUserMessageIds: entries.map(entry => entry.clientUserMessageId)}; },
+      };
+      const recoveryRoot = new UploadElement("main");
+      const disposeRecovery = mountConversation(recoveryRoot, {id: "recovery", basePath: "/codex", client: recoveryClient,
+        EventSource: RecoveryEvents, storage: recoveryStorage, uploadBasePath: "/recovery-uploads",
+        randomUUID: () => "cc0e3d66-f923-4c79-bde5-c25c1edfd02b", refreshPolicy: {eventDebounceMs: 0},
+        capabilities: {pending: false, queueRead: false, interrupt: false, settings: false, respond: false}});
+      await new Promise(resolve => setImmediate(resolve));
+      const recoveryTextarea = recoveryRoot.descendants().find(el => el.name === "textarea");
+      const recoveryForm = recoveryRoot.descendants().find(el => el.name === "form");
+      const recoveryQueue = recoveryRoot.descendants().find(el => el.textContent === "Queue");
+      const recoveryNotice = recoveryRoot.descendants().find(el => el.attributes.class === "codex-submission-status");
+      const submitRecovery = () => action === "send" ? recoveryForm.listeners.get("submit")({preventDefault() {}}) : recoveryQueue.listeners.get("click")();
+      const retainedRecovery = createDurableSender({client: recoveryClient, id: "recovery", basePath: "/codex", storage: recoveryStorage});
+      const pendingRecovery = () => action === "send" ? retainedRecovery.pending() : retainedRecovery.pendingQueue();
+      const refreshRecovery = async () => {
+        const reads = recoveryReads; recoveryEvents.onmessage();
+        for (let index = 0; index < 50 && recoveryReads === reads; index++) await new Promise(resolve => setTimeout(resolve, 5));
+        assert(recoveryReads > reads);
+        await new Promise(resolve => setImmediate(resolve));
+      };
+      recoveryTextarea.value = "original";
+      await submitRecovery();
+      assert.equal(recoveryNotice.hidden, false, `${action}/${confirmation}: initial uncertainty`);
+      const originalAttempt = pendingRecovery();
+      assert.deepEqual(originalAttempt.attachmentIds, files.map(file => file.id));
+      if (confirmation === "retry") {
+        await submitRecovery();
+        assert.equal(recoveryNotice.hidden, true, `${action}: matching acceptance clears notice`);
+        assert.deepEqual(recoveryCalls.map(call => call.id), [originalAttempt.id, originalAttempt.id]);
+        if (action === "send") assert(pendingRecovery().receipt, "accepted send receipt stays until observation");
+        else assert.equal(pendingRecovery(), null);
+      } else if (confirmation === "unrelated" || confirmation === "thread") {
+        observedID = "unrelated-attempt";
+        if (confirmation === "thread") recoveryThread = "other-thread";
+        await refreshRecovery();
+        if (confirmation === "thread") {
+          assert.equal(recoveryNotice.hidden, true, "notice stays scoped to original thread");
+          recoveryThread = "original-thread"; observedID = ""; await refreshRecovery();
+        }
+        assert.equal(recoveryNotice.hidden, false, "unrelated confirmation cannot retire original warning");
+        assert.deepEqual(pendingRecovery(), originalAttempt);
+        assert.equal(recoveryTextarea.value, "original");
+      } else {
+        if (confirmation === "draft") recoveryTextarea.value = "new draft";
+        if (confirmation === "attachments") {
+          await recoveryRoot.descendants().find(el => el.attributes["aria-label"] === "Remove first.txt").listeners.get("click")();
+        }
+        observedID = originalAttempt.id; await refreshRecovery();
+        assert.equal(recoveryNotice.hidden, true, `${action}/${confirmation}: matching observation clears notice`);
+        if (confirmation === "draft") assert.equal(recoveryTextarea.value, "new draft");
+        if (confirmation === "attachments") {
+          assert.equal(recoveryTextarea.value, "original", "changed attachments preserve current draft");
+          assert.deepEqual(JSON.parse(recoveryStorage.getItem("codex-web:uploads:/recovery-uploads")).map(file => file.id), [files[1].id]);
+        }
+        if (action === "queue") assert.deepEqual(pendingRecovery(), originalAttempt, "visual observation never clears durable queue uncertainty");
+        else assert.equal(pendingRecovery(), null);
+      }
+      disposeRecovery();
+    }
+  } finally {
+    globalThis.document = recoveryGlobals.document;
+    globalThis.fetch = recoveryGlobals.fetch;
+    globalThis.addEventListener = recoveryGlobals.add;
+    globalThis.removeEventListener = recoveryGlobals.remove;
+  }
 
   // A late catalog must initialize an already-open editor, and stale reads
   // must not overwrite a settings acknowledgement.
