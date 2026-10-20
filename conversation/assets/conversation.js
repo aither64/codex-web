@@ -68,6 +68,34 @@ function createElement(name, attributes = {}, text = "") {
   return element;
 }
 
+// Host-supplied communication metadata affects presentation only. Never infer
+// identity or authorization from a message's text or its display label.
+export function transcriptEntryPresentation(entry) {
+  if (entry?.kind === "error") return {kind: "error", label: "Error", team: false};
+  const communication = entry?.communication;
+  if (communication && typeof communication === "object" && !Array.isArray(communication) &&
+      communication.kind === "team") {
+    const from = typeof communication.from === "string" ? communication.from : "";
+    const to = typeof communication.to === "string" ? communication.to : "";
+    const label = from && to ? `${from} → ${to}` : from ? `Team · ${from}` : to ? `Team → ${to}` : "Team";
+    return {kind: "team", label, team: true};
+  }
+  if (entry?.kind === "userMessage") return {kind: "user", label: "You", team: false};
+  if (["agentMessage", "reasoning", "plan"].includes(entry?.kind)) {
+    return {kind: "agent", label: entry.kind === "reasoning" ? "Reasoning" : entry.kind === "plan" ? "Plan" : "Codex", team: false};
+  }
+  return {kind: "event", label: entry?.kind || "Activity", team: false};
+}
+
+export function transcriptEntryVisible(entry, filter = "all") {
+  const presentation = transcriptEntryPresentation(entry);
+  if (presentation.kind === "error") return true;
+  if (filter === "team") return presentation.team;
+  if (filter === "messages") return !presentation.team && ["user", "agent"].includes(presentation.kind);
+  if (filter === "activity") return !presentation.team && presentation.kind === "event";
+  return true;
+}
+
 // Shared typed activity body. Thread identities are text only: a transcript
 // event cannot grant navigation to another conversation. URL schemes and
 // credentials are checked again at the browser boundary.
@@ -888,6 +916,11 @@ export function mountConversation(root, options) {
   const status = createElement("span", {class: "codex-conversation-status"}, labels.reconnecting);
   const connectionStatus = createElement("div", {class: "codex-connection-status"});
   const transcript = createElement("ol", {class: "codex-conversation-transcript"});
+  const filter = createElement("select", {class: "codex-conversation-filter", "aria-label": "Transcript filter"});
+  for (const [value, label] of [["all", "All"], ["messages", "Messages"], ["team", "Team"], ["activity", "Activity"]]) {
+    filter.append(createElement("option", {value}, label));
+  }
+  filter.value = "all";
   const historyControls = createElement("div", {class: "codex-history-controls"});
   const loadOlder = createElement("button", {type: "button"}, "Load older");
   const retryHistory = createElement("button", {type: "button"}, "Retry history");
@@ -944,7 +977,7 @@ export function mountConversation(root, options) {
   settingsDialog.append(settingsForm);
   const children = [status, connectionStatus];
   if (capabilities.settings) children.push(settingsBar, settingsDialog);
-  children.push(historyControls, transcript);
+  children.push(filter, historyControls, transcript);
   if (capabilities.pending) children.push(pendingStatus, prompts);
   const dock = createElement("div", {class: "codex-conversation-dock"});
   dock.append(optionalQuestions);
@@ -1135,8 +1168,7 @@ export function mountConversation(root, options) {
     retryHistory.hidden = !historyNoticeState.warning;
     retryHistory.disabled = Boolean(historyRead);
     historyStatus.textContent = historyNoticeState.warning ? historyError :
-      historyNoticeState.loading ? "Loading earlier messages…" :
-        legacy ? "Older history is unavailable on this server." : "";
+      historyRead?.kind === "older" && historyNoticeState.loading ? "Loading earlier messages…" : "";
     historyControls.hidden = !older && !historyStatus.textContent && retryHistory.hidden;
   };
   const laneRead = (timeout) => {
@@ -1147,13 +1179,19 @@ export function mountConversation(root, options) {
   };
   const entryElement = (entry) => {
     const timestamp = formatTranscriptTimestamp(entry);
-    const item = createElement("li", {class: "codex-entry codex-entry-" + (entry.kind || "unknown")});
-    const heading = entry.kind === "userMessage" ? "You" : entry.kind === "agentMessage" ? "Codex" : entry.kind;
+    const presentation = transcriptEntryPresentation(entry);
+    const item = createElement("li", {class: "codex-entry codex-entry-" + (presentation.team ? "team" : entry.kind || "unknown")});
     const header = createElement("div", {class: "codex-entry-header"});
-    header.append(createElement("strong", {}, heading || "Activity"));
+    header.append(createElement("strong", {}, presentation.label));
     item.append(header);
-    item.append(createTranscriptActivity(entry) || (entry.citations?.length ? createCitationMessage(entry) :
-      createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? "")));
+    let body = createTranscriptActivity(entry);
+    if (!body && ["user", "agent", "team"].includes(presentation.kind) && typeof entry.html === "string") {
+      body = createElement("div", {class: "codex-entry-markdown"});
+      // HTML is generated and sanitized by the trusted host presentation hook.
+      body.innerHTML = entry.html;
+    }
+    if (!body && entry.citations?.length) body = createCitationMessage(entry);
+    item.append(body || createElement("pre", {}, entry.displayText ?? entry.text ?? entry.summary ?? entry.details ?? ""));
     const questionControls = questions.inline(entry);
     if (questionControls) item.append(questionControls);
     if (entry.attachments?.length) item.append(renderAttachments(entry.attachments, {onRemove: removeAttachment}));
@@ -1177,6 +1215,19 @@ export function mountConversation(root, options) {
     const nextNodes = new Map(), desired = [];
     let previousDate = "", dateOccurrence = 0;
     for (const row of history.rows) {
+      let item = entryNodes.get(row.key);
+      if (!item || changed.has(row.key)) {
+        const replacement = entryElement(row.entry);
+        const oldDetails = item?.querySelectorAll?.("details") || [];
+        const newDetails = replacement.querySelectorAll?.("details") || [];
+        for (let index = 0; index < Math.min(oldDetails.length, newDetails.length); index += 1) {
+          newDetails[index].open = oldDetails[index].open;
+        }
+        item = replacement;
+      }
+      // Keep excluded nodes current so filter changes retain disclosure state.
+      nextNodes.set(row.key, item);
+      if (!transcriptEntryVisible(row.entry, filter.value)) continue;
       const timestamp = formatTranscriptTimestamp(row.entry);
       if (timestamp.dateKey && timestamp.dateKey !== previousDate) {
         const dateKey = "date:" + timestamp.dateKey + ":" + dateOccurrence++;
@@ -1188,17 +1239,7 @@ export function mountConversation(root, options) {
         nextNodes.set(dateKey, separator); desired.push(separator);
         previousDate = timestamp.dateKey;
       }
-      let item = entryNodes.get(row.key);
-      if (!item || changed.has(row.key)) {
-        const replacement = entryElement(row.entry);
-        const oldDetails = item?.querySelectorAll?.("details") || [];
-        const newDetails = replacement.querySelectorAll?.("details") || [];
-        for (let index = 0; index < Math.min(oldDetails.length, newDetails.length); index += 1) {
-          newDetails[index].open = oldDetails[index].open;
-        }
-        item = replacement;
-      }
-      nextNodes.set(row.key, item); desired.push(item);
+      desired.push(item);
     }
     if (typeof transcript.insertBefore === "function") {
       desired.forEach((node, index) => {
@@ -1215,6 +1256,14 @@ export function mountConversation(root, options) {
     } else if (prepend) transcript.scrollTop = previousTop + Math.max(0, (transcript.scrollHeight || 0) - previousHeight);
     else transcript.scrollTop = previousTop;
   };
+  const filterScroll = new Map();
+  let activeFilter = filter.value;
+  filter.addEventListener("change", () => {
+    filterScroll.set(activeFilter, transcript.scrollTop || 0);
+    activeFilter = filter.value;
+    patchEntries(new Set(), true);
+    transcript.scrollTop = filterScroll.get(activeFilter) || 0;
+  });
   const acknowledgeRetained = (threadId) => {
     if (!sender || !capabilities.send) return;
     const attempt = sender.pending(), draft = textarea.value;

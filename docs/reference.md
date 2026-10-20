@@ -275,6 +275,37 @@ record time. When an item has no available time, a known turn
 time is marked approximate; otherwise the timestamp is omitted. This display
 metadata does not change stored conversations or require a migration.
 
+Hosts can annotate internal coordination with
+`TranscriptEntry.Communication: &codex.TranscriptCommunication{Kind: "team",
+From: "sender", To: "recipient"}`. This optional `communication` object is a
+presentation hint, not authenticated identity or authorization. The shared
+module does not infer team membership from message text.
+`transcriptEntryPresentation(entry)` returns `{kind, label, team}`, where kind
+is `user`, `agent`, `team`, `event` or `error`. Only `communication.kind: "team"`
+selects team presentation; unknown metadata preserves ordinary classification.
+Labels include available sender and recipient text and must be inserted as text.
+
+`transcriptEntryVisible(entry, filter = "all")` supports `all`, `messages`,
+`team` and `activity`. Messages includes user, agent, reasoning and plan entries
+without team metadata; Team includes coordination; Activity includes other
+entries without team metadata. Errors appear in every view. Unknown filters
+behave as All. The mounted selector retains each view's scroll position and
+keeps entry disclosure state when switching views. Team entries have a distinct
+color and identify the sender and recipient when available.
+
+`Target.TransformTranscript` runs before attachment observation, preserving its
+existing semantics. Optional `Target.PresentTranscript` runs afterward on both
+`thread` and `thread/page`, including when no attachment provider is configured.
+An attachment failure returns without presentation. Use this final hook to
+render Markdown from `displayText` when present, including an empty string,
+or `text` otherwise. Preserve canonical text, attachment identity, message IDs
+and digests. Hosts own Markdown generation, sanitization and URL rewriting.
+The mounted UI renders typed activity first. For messages, it prefers
+host-sanitized `html`, then text with citation links, then plain text. Never put
+unsanitized browser input in `html`. Older readers ignore the additive metadata,
+and nil hooks preserve existing behavior. No stored format or Codex protocol
+change is required.
+
 Search, agent tool calls and agent lifecycle entries also include typed
 `activity` data. Their existing `summary` and `details` fields remain available
 for other renderers and future protocol fields. `createTranscriptActivity(entry)`
@@ -356,7 +387,7 @@ calls the page route. `mountConversation()` loads the newest page first and offe
 pages arrive, repairs gaps after missed events, and keeps the visible scroll
 position when older entries are added. A missing page route or an explicit
 `transcript_paging_unavailable` response falls back to an authorized `/thread`
-read; the interface then says that older history is unavailable. Other HTTP,
+read; successful fallback is silent. Other HTTP,
 timeout, cursor and malformed-response errors do not trigger that fallback.
 
 The composer shows the last confirmed model and reasoning effort with **Edit**.
@@ -370,7 +401,9 @@ deadlines, retry backoff and notice delays. `createRefreshNotice()` retains the
 last successful value during background reads. Initial loading appears after
 750 ms, manual loading after 250 ms, and refresh failures after 30 continuous
 visible seconds. Hidden tabs and page restoration restart that warning grace.
-Access failures and failed user actions appear immediately. Automatic history
+Access failures and failed user actions appear immediately. Initial and automatic
+history repair remain silent while loading; manual older-page reads can show
+loading progress and actionable failures in normal document flow. Automatic history
 repair retries with capped backoff; manual older-page failures wait for Retry.
 Hosts can override individual policy values when mounting a conversation or
 creating a notice or sync controller. Domain controllers retain cursor,

@@ -29,9 +29,32 @@ class MemoryStorage {
     createConversationClient, createDurableAttemptStore, createDurableSender, mountConversation,
     formatTranscriptTimestamp, transcriptEntryCopyText, createTranscriptCopyButton, createCopyButton,
     createTranscriptActivity,
+    transcriptEntryPresentation, transcriptEntryVisible,
   } = await import(
     "../conversation/assets/conversation.js"
   );
+  const kinds = ["userMessage", "agentMessage", "reasoning", "plan", "commandExecution", "futureKind", "error"];
+  for (const [index, kind] of kinds.entries()) {
+    const ordinary = {kind};
+    const expected = index === 0 ? "user" : index < 4 ? "agent" : kind === "error" ? "error" : "event";
+    assert.equal(transcriptEntryPresentation(ordinary).kind, expected);
+    for (const communication of [undefined, null, [], "team", {kind: "future"}, {from: "sender"}]) {
+      assert.deepEqual(transcriptEntryPresentation({...ordinary, communication}), transcriptEntryPresentation(ordinary));
+    }
+    const team = {...ordinary, communication: {kind: "team", from: "lead", to: "member"}};
+    for (const [filter, visible] of Object.entries({all: true, messages: index < 4,
+      activity: index >= 4, team: false, unknown: true})) {
+      assert.equal(transcriptEntryVisible(ordinary, filter), visible || kind === "error");
+      assert.equal(transcriptEntryVisible(team, filter), kind === "error" || ["all", "team", "unknown"].includes(filter));
+    }
+    assert.equal(transcriptEntryVisible(team), true);
+  }
+  assert.deepEqual(transcriptEntryPresentation({kind: "userMessage", communication: {kind: "team"}}),
+    {kind: "team", label: "Team", team: true});
+  assert.equal(transcriptEntryPresentation({communication: {kind: "team", from: "lead", to: "member"}}).label, "lead → member");
+  assert.equal(transcriptEntryPresentation({communication: {kind: "team", from: "lead"}}).label, "Team · lead");
+  assert.equal(transcriptEntryPresentation({communication: {kind: "team", to: "member"}}).label, "Team → member");
+  assert.equal(transcriptEntryPresentation({communication: {kind: "team", from: {name: "bad"}}}).label, "Team");
   const timestampOptions = {locales: "en-GB", timeZone: "Europe/Amsterdam"};
   const evening = formatTranscriptTimestamp({timestamp: "2026-09-11T21:59:00Z"}, timestampOptions);
   assert.equal(evening.text, "23:59");
@@ -552,6 +575,7 @@ class MemoryStorage {
   globalThis.Element = FakeElement;
   globalThis.document = {
     createElement: (name) => new FakeElement(name),
+    createTextNode: text => Object.assign(new FakeElement("#text"), {textContent: text}),
     createElementNS: (_namespace, name) => new FakeElement(name),
   };
   const typedSearch = createTranscriptActivity({
@@ -698,6 +722,115 @@ class MemoryStorage {
   });
   assert.equal(root.descendants().filter((element) => element.attributes.class === "codex-conversation-date").length, 2);
   unmount();
+
+  const teamRoot = new FakeElement("main");
+  const senderLabel = '<img src=x onerror="bad()">';
+  const disposeTeam = mountConversation(teamRoot, {id: "team", client: {
+    async thread() { return {threadId: "team-thread", status: "idle", entries: [
+      {kind: "userMessage", text: "# original", displayText: "# displayed", html: "<h1>displayed</h1>"},
+      {kind: "userMessage", text: "coordination", communication: {kind: "team", from: senderLabel, to: "member"}},
+      {kind: "commandExecution", summary: "command"},
+      {kind: "error", text: "turn failed", communication: {kind: "team"}},
+    ]}; },
+  }, capabilities: {pending: false, queueRead: false, send: false, queue: false,
+    interrupt: false, settings: false, respond: false, eventStream: false}});
+  await new Promise(resolve => setImmediate(resolve));
+  const teamFilter = teamRoot.descendants().find(el => el.attributes["aria-label"] === "Transcript filter");
+  const transcriptList = teamRoot.descendants().find(el => el.name === "ol");
+  const teamEntry = transcriptList.children.find(el => el.attributes.class === "codex-entry codex-entry-team");
+  assert.equal(teamEntry.children[0].children[0].textContent, `${senderLabel} → member`);
+  assert.equal(teamEntry.children[0].children[0].innerHTML, undefined, "labels must never become HTML");
+  assert.equal(transcriptList.children[0].children[1].innerHTML, "<h1>displayed</h1>");
+  transcriptList.scrollTop = 45;
+  for (const [value, count] of [["messages", 2], ["team", 2], ["activity", 2], ["all", 4]]) {
+    teamFilter.value = value; teamFilter.listeners.get("change")();
+    assert.equal(transcriptList.children.length, count);
+    assert(transcriptList.children.some(el => el.attributes.class === "codex-entry codex-entry-error"));
+  }
+  assert.equal(transcriptList.scrollTop, 45);
+  assert(transcriptList.children.includes(teamEntry), "filter changes preserve message nodes");
+  assert.equal(teamRoot.descendants().find(el => el.attributes.class === "codex-history-controls").hidden, true,
+    "successful legacy fallback is silent");
+  disposeTeam();
+
+  const citationToken = "\ue200cite\ue202fixture\ue201", citationPrefix = "Příliš 🐈 ";
+  const citationStart = Buffer.byteLength(citationPrefix);
+  const citationEntry = {kind: "agentMessage", turnStatus: "completed", text: citationPrefix + citationToken + " done",
+    citations: [{start: citationStart, end: citationStart + Buffer.byteLength(citationToken),
+      sources: [{url: "https://example.com/source", title: 'Source "title"', number: 1}]}]};
+  const citationOriginal = JSON.stringify(citationEntry);
+  const citationRoot = new FakeElement("main");
+  const disposeCitations = mountConversation(citationRoot, {id: "citations", client: {
+    async thread() { return {threadId: "citation-thread", status: "idle", entries: [
+      citationEntry,
+      {...citationEntry, html: '<p>Host <a href="https://example.com/source">[1]</a></p>'},
+      {...citationEntry, kind: "userMessage", displayText: "decorated user", html: "<p>decorated user</p>"},
+      {...citationEntry, kind: "mcpToolCall", summary: "Typed activity", activity: {status: "completed"}, html: "<p>unused</p>"},
+    ]}; },
+  }, capabilities: {pending: false, queueRead: false, send: false, queue: false,
+    interrupt: false, settings: false, respond: false, eventStream: false}});
+  await new Promise(resolve => setImmediate(resolve));
+  const citationRows = citationRoot.descendants().find(el => el.name === "ol").children;
+  const fallback = citationRows[0].children[1];
+  assert.equal(fallback.name, "pre");
+  assert.equal(fallback.children.find(el => el.name === "a").attributes.href, "https://example.com/source");
+  assert.equal(fallback.children.find(el => el.name === "a").attributes.title, 'Source "title"');
+  assert.equal(citationRows[1].children[1].innerHTML, '<p>Host <a href="https://example.com/source">[1]</a></p>');
+  assert.equal(citationRows[2].children[1].innerHTML, "<p>decorated user</p>");
+  assert.equal(citationRows[3].children[1].attributes.class, "codex-typed-activity");
+  for (const kind of ["agentMessage", "reasoning", "plan"]) {
+    assert.equal(transcriptEntryCopyText({...citationEntry, kind}),
+      'Příliš 🐈 [\\[1\\]](<https://example.com/source> "Source \\"title\\"") done');
+  }
+  assert.equal(transcriptEntryCopyText({...citationEntry, kind: "userMessage"}), citationEntry.text);
+  assert.equal(JSON.stringify(citationEntry), citationOriginal, "render and copy preserve raw text and UTF-8 spans");
+  disposeCitations();
+
+  // Completed citation rows still resolve after leaving the newest page, even
+  // while a filter excludes them. Filtering cannot gate history observations.
+  let citationEvents, citationNewestReads = 0, citationRepairs = 0;
+  class CitationEvents {
+    constructor() { citationEvents = this; }
+    addEventListener() {}
+    close() {}
+  }
+  const pendingCitation = {...citationEntry, turnId: "citation-turn", itemId: "pending", citationsPending: true,
+    citations: [{...citationEntry.citations[0], sources: [], unavailable: true}]};
+  const overlap = {kind: "agentMessage", turnId: "overlap", itemId: "overlap", turnStatus: "completed", text: "overlap"};
+  const repairRootCitations = new FakeElement("main");
+  const disposeRepairCitations = mountConversation(repairRootCitations, {id: "pending-citations", EventSource: CitationEvents,
+    refreshPolicy: {eventDebounceMs: 0, retryInitialMs: 30, historyRepairMs: 0, historyPageMs: 1},
+    client: {
+      eventsPath: () => "/citation-events",
+      async threadPage({cursor} = {}) {
+        if (cursor) {
+          citationRepairs++;
+          return {threadId: "pending-citations", status: "idle", hasOlder: false, olderCursor: null,
+            entries: [{...citationEntry, turnId: "citation-turn", itemId: "pending", citationsPending: false}]};
+        }
+        citationNewestReads++;
+        return {threadId: "pending-citations", status: "idle", hasOlder: true, olderCursor: "find-citation",
+          entries: citationNewestReads === 1 ? [pendingCitation, overlap] : [overlap,
+            {kind: "agentMessage", turnId: "latest", itemId: "latest", text: "newest"}]};
+      },
+    }, capabilities: {pending: false, queueRead: false, send: false, queue: false,
+      interrupt: false, settings: false, respond: false, eventStream: true}});
+  await new Promise(resolve => setImmediate(resolve));
+  const citationFilter = repairRootCitations.descendants().find(el => el.attributes["aria-label"] === "Transcript filter");
+  citationFilter.value = "team"; citationFilter.listeners.get("change")();
+  const citationList = repairRootCitations.descendants().find(el => el.name === "ol");
+  assert.equal(citationList.children.length, 0);
+  citationEvents.onmessage();
+  for (let index = 0; index < 100 && !citationRepairs; index++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(citationRepairs, 1);
+  assert.equal(citationList.children.length, 0, "repair does not change active filter");
+  assert.equal(repairRootCitations.descendants().find(el => el.attributes.class === "codex-history-controls").children[1].textContent, "",
+    "background citation repair stays quiet");
+  citationFilter.value = "all"; citationFilter.listeners.get("change")();
+  const repairedLink = citationList.descendants().find(el => el.name === "a");
+  assert.equal(repairedLink.attributes.href, "https://example.com/source");
+  assert.equal(citationList.children.length, 3);
+  disposeRepairCitations();
 
   // A late catalog must initialize an already-open editor, and stale reads
   // must not overwrite a settings acknowledgement.

@@ -27,6 +27,7 @@
 .codex-connection-status { border: 1px solid #bf8700; padding: .75rem; margin: .5rem 0; }
 .codex-connection-status button { margin-left: .5rem; }
 .codex-history-controls { display: flex; align-items: center; gap: .65rem; margin: .5rem 0; font-size: .85rem; }
+.codex-conversation-filter { margin-block: .5rem; font: inherit; font-size: .85rem; }
 .codex-history-controls[hidden], .codex-lane-status[hidden] { display: none; }
 .codex-history-controls button[hidden], .codex-lane-status button[hidden] { display: none; }
 .codex-lane-status { margin: .4rem 0; color: #bf8700; font-size: .85rem; }
@@ -54,6 +55,14 @@
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+
+.codex-entry-team {
+  border-color: light-dark(#7952b3, #bc9aee);
+  background: light-dark(#f5effd, #241c32);
+}
+.codex-entry-team .codex-entry-header { color: light-dark(#633a9a, #cfafff); }
+.codex-entry-markdown { overflow-wrap: anywhere; }
+.codex-entry-markdown > :first-child { margin-top: .5rem; }
 
 .codex-entry-footer {
   display: flex;
