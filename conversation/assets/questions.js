@@ -15,14 +15,17 @@ export function asyncQuestionReply(question, answer) {
 }
 
 const terminal = status => ["completed", "failed", "interrupted", "error"].includes(status);
+let nextViewId = 0;
+const answerText = (choice, note) => [choice, note].map(value => String(value || "").trim()).filter(Boolean).join("\n\n");
 
 // One owner for inline and pinned controls. The normal composer has its own draft
 // and delivery records; question answers still use the ordinary message endpoint.
 export function createAsyncQuestions({storage, namespace, send, acknowledge,
   canSend = () => true, randomUUID = () => globalThis.crypto.randomUUID(), onChange = () => {},
-  maxMessageBytes = 48 * 1024}) {
+  onPanelEmpty = () => {}, maxMessageBytes = 48 * 1024}) {
   let threadId = "", records = new Map(), pins = new Set();
   const views = new Set();
+  const panels = new Map();
   const key = (thread, id) => `codex-web:questions:${namespace}:${encodeURIComponent(thread)}:${encodeURIComponent(id)}`;
   const read = id => {
     try {
@@ -154,45 +157,74 @@ export function createAsyncQuestions({storage, namespace, send, acknowledge,
     pins = candidates;
     emit();
   };
+  const draftFor = record => {
+    const {choice, note, draft} = record.state;
+    // The complete string remains readable by older browsers. An older editor
+    // may change it without updating our optional structured draft fields.
+    if (typeof note === "string" && (choice === "" || (record.question.options || []).includes(choice)) &&
+        answerText(choice, note) === draft) return {choice, note};
+    return {choice: "", note: draft};
+  };
   const createView = (record, pinned) => {
     const document = globalThis.document;
     const root = document.createElement("section");
     root.className = "codex-async-question";
     root.dataset.asyncQuestionId = record.id;
     root.dataset.asyncQuestionThread = record.threadId;
-    const title = document.createElement("p"); title.className = "codex-question-title";
+    const viewId = `codex-question-${++nextViewId}`;
+    const title = document.createElement("p"); title.className = "codex-question-title"; title.id = viewId; title.tabIndex = -1;
     const actions = document.createElement("div"); actions.className = "codex-question-options";
+    actions.setAttribute("role", "radiogroup"); actions.setAttribute("aria-labelledby", viewId);
     const input = document.createElement("textarea"); input.rows = 2;
     input.setAttribute("aria-label", `Answer: ${record.question.title}`);
-    input.placeholder = "Type an answer";
+    input.placeholder = record.question.options?.length ? "Add details or write your own answer…" : "Type an answer";
     const submit = document.createElement("button"); submit.type = "button"; submit.textContent = "Send answer";
+    submit.className = "codex-question-action";
     const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.textContent = "Dismiss";
+    dismiss.className = "codex-question-action";
     dismiss.hidden = !pinned;
     const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "Retry answer";
+    retry.className = "codex-question-action";
     const status = document.createElement("p"); status.setAttribute("role", "status");
-    const buttons = (record.question.options || []).map(label => {
-      const button = document.createElement("button"); button.type = "button"; button.textContent = label;
-      button.addEventListener("click", () => { void sendAnswer(record.id, label); });
-      return button;
+    const updateDraft = (choice, note) => {
+      Object.assign(record.state, {choice, note, draft: answerText(choice, note)});
+      save(record); emit();
+    };
+    const radios = (record.question.options?.length ? [...record.question.options, ""] : []).map((choice, index) => {
+      const label = document.createElement("label"); label.className = "codex-question-option";
+      const radio = document.createElement("input"); radio.type = "radio"; radio.name = viewId; radio.value = String(index);
+      const text = document.createElement("span"); text.textContent = choice || "Other";
+      radio.addEventListener("change", () => { if (radio.checked) updateDraft(choice, draftFor(record).note); });
+      label.append(radio, text); actions.append(label);
+      return {radio, choice};
     });
-    actions.append(...buttons);
-    root.append(title, actions, input, submit, dismiss, status, retry);
-    input.addEventListener("input", () => { record.state.draft = input.value; save(record); emit(); });
-    submit.addEventListener("click", () => { void sendAnswer(record.id, input.value); });
-    retry.addEventListener("click", () => { void sendAnswer(record.id, record.state.attempt?.answer); });
-    dismiss.addEventListener("click", () => { record.state.dismissed = true; save(record); pins.delete(record.id); emit(); });
+    const footer = document.createElement("div"); footer.className = "codex-question-actions";
+    footer.append(submit, dismiss, retry);
+    root.append(title, actions, input, footer, status);
+    input.addEventListener("input", () => { updateDraft(draftFor(record).choice, input.value); });
+    submit.addEventListener("click", () => { record.pinnedAction = pinned; void sendAnswer(record.id, record.state.draft); });
+    retry.addEventListener("click", () => { record.pinnedAction = pinned; void sendAnswer(record.id, record.state.attempt?.answer); });
+    dismiss.addEventListener("click", () => { record.pinnedAction = pinned; record.state.dismissed = true; save(record); pins.delete(record.id); emit(); });
     const view = {root, update: () => {
       const answered = record.state.answer !== undefined;
       const enabled = record.threadId === threadId && canSend();
+      const draft = draftFor(record);
       title.textContent = record.question.title;
       status.textContent = answered ? `Answered: ${record.state.answer}` : record.busy ? "Sending answer…" :
-        record.error || (record.state.dismissed ? "Dismissed" : record.state.cleared ? "No longer pinned" : "Optional question");
+        record.error || (record.state.dismissed ? "Dismissed" : "");
+      status.hidden = !status.textContent;
       root.dataset.questionState = answered ? "answered" : record.busy ? "sending" : "unanswered";
-      actions.hidden = input.hidden = submit.hidden = answered || !enabled;
+      actions.hidden = answered || !enabled || !radios.length;
+      input.hidden = submit.hidden = answered || !enabled;
+      dismiss.hidden = !pinned || answered;
       dismiss.disabled = !enabled || record.busy;
-      if (input.value !== record.state.draft) input.value = record.state.draft;
+      if (input.value !== draft.note) input.value = draft.note;
       input.disabled = record.busy || Boolean(record.state.attempt);
-      for (const button of [...buttons, submit]) button.disabled = !enabled || record.busy || Boolean(record.state.attempt);
+      for (const {radio, choice} of radios) {
+        radio.checked = draft.choice === choice;
+        radio.disabled = !enabled || record.busy || Boolean(record.state.attempt);
+      }
+      submit.disabled = !enabled || record.busy || Boolean(record.state.attempt) || !record.state.draft.trim();
       retry.hidden = answered || !record.state.attempt || !enabled || record.busy;
     }};
     views.add(view); view.update(); return root;
@@ -209,12 +241,67 @@ export function createAsyncQuestions({storage, namespace, send, acknowledge,
     },
     renderPinned(container) {
       const ids = this.pending();
-      const existing = new Map([...container.children].filter(node => node.dataset.asyncQuestionThread === threadId)
-        .map(node => [node.dataset.asyncQuestionId, node]));
-      const nodes = ids.map(id => existing.get(id) || createView(records.get(id), true));
-      for (const node of [...container.children]) if (!nodes.includes(node)) node.remove();
-      nodes.forEach((node, index) => { if (container.children[index] !== node) container.insertBefore(node, container.children[index] || null); });
-      container.hidden = !nodes.length || !canSend();
+      const document = globalThis.document;
+      let panel = panels.get(container);
+      if (!panel || panel.threadId !== threadId) {
+        const toggle = document.createElement("button"); toggle.type = "button"; toggle.className = "codex-question-toggle";
+        const content = document.createElement("div"); content.id = `codex-question-panel-${++nextViewId}`;
+        content.className = "codex-question-carousel";
+        toggle.setAttribute("aria-controls", content.id);
+        const navigation = document.createElement("div"); navigation.className = "codex-question-navigation";
+        const back = document.createElement("button"); back.type = "button"; back.textContent = "Back";
+        const next = document.createElement("button"); next.type = "button"; next.textContent = "Next";
+        back.className = next.className = "codex-question-action";
+        const progress = document.createElement("span"); progress.setAttribute("role", "status");
+        navigation.append(back, progress, next);
+        const body = document.createElement("div"); body.className = "codex-question-pages";
+        content.append(navigation, body); container.replaceChildren(toggle, content);
+        panel = {threadId, toggle, content, back, next, progress, body, ids: [], currentId: "", expanded: false};
+        panels.set(container, panel);
+        toggle.addEventListener("click", () => { panel.expanded = !panel.expanded; this.renderPinned(container); });
+        const navigate = offset => {
+          const index = panel.ids.indexOf(panel.currentId) + offset;
+          if (index >= 0 && index < panel.ids.length) {
+            panel.currentId = panel.ids[index]; this.renderPinned(container);
+            panel.body.querySelector(`section:not([hidden]) .codex-question-title`)?.focus({preventScroll: true});
+          }
+        };
+        back.addEventListener("click", () => navigate(-1)); next.addEventListener("click", () => navigate(1));
+      }
+      const previousIndex = panel.ids.indexOf(panel.currentId);
+      const focus = document.activeElement;
+      const focusedQuestion = focus?.closest?.(".codex-async-question");
+      const losingQuestion = focusedQuestion && panel.body.contains(focusedQuestion) && !ids.includes(focusedQuestion.dataset.asyncQuestionId);
+      const removedAction = panel.ids.some(id => !ids.includes(id) && records.get(id)?.pinnedAction);
+      for (const id of panel.ids) if (!ids.includes(id) && records.has(id)) records.get(id).pinnedAction = false;
+      if (!ids.includes(panel.currentId)) {
+        const next = panel.ids.slice(previousIndex + 1).find(id => ids.includes(id));
+        const previous = panel.ids.slice(0, Math.max(previousIndex, 0)).reverse().find(id => ids.includes(id));
+        panel.currentId = next || previous || ids[0] || "";
+      }
+      panel.ids = ids;
+      if (!ids.length) panel.expanded = false;
+      const existing = new Map([...panel.body.children].map(node => [node.dataset.asyncQuestionId, node]));
+      for (const [id, node] of existing) if (!ids.includes(id)) node.remove();
+      for (const id of ids) {
+        const node = existing.get(id) || createView(records.get(id), true);
+        if (!existing.has(id)) panel.body.append(node);
+        node.hidden = id !== panel.currentId;
+      }
+      const index = ids.indexOf(panel.currentId);
+      panel.toggle.textContent = `${ids.length} optional ${ids.length === 1 ? "question" : "questions"} ${panel.expanded ? "· Collapse ▴" : "▾"}`;
+      panel.toggle.setAttribute("aria-expanded", String(panel.expanded));
+      panel.content.hidden = !panel.expanded;
+      panel.progress.textContent = `Question ${index + 1} of ${ids.length}`;
+      panel.back.disabled = index <= 0; panel.next.disabled = index >= ids.length - 1;
+      container.hidden = !ids.length || !canSend();
+      if (losingQuestion || removedAction && (container.contains(focus) || focus === document.body)) {
+        if (!ids.length && canSend()) onPanelEmpty();
+        else if (!container.hidden) {
+          const target = panel.expanded ? panel.body.querySelector("section:not([hidden]) .codex-question-title") : panel.toggle;
+          target?.focus({preventScroll: true});
+        }
+      }
     },
   };
 }

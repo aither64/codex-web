@@ -179,12 +179,23 @@ question and answer. Raw `text`, client message IDs and digests stay intact for
 durable-send reconciliation.
 
 The mounted UI provides controls in the original message and a panel pinned
-above the composer. Clicking a suggested option sends it immediately; typed
-answers use **Send answer**. **Dismiss** removes a question from the panel without
+above the composer. Suggested options use compact radio lists. Select an option
+and optionally add text, or choose **Other** for a custom answer. **Send answer**
+submits the selected label and text, separated by a blank line. Selecting an
+option does not send it. **Dismiss** removes a question from the panel without
 sending a message. Turn completion and accepted ordinary follow-ups also clear
 the panel. Unanswered questions remain answerable from the original message;
 answered questions show the submitted answer. Drafts survive unpinning and
 reloads in browser storage scoped to the conversation and thread.
+
+The panel starts as a narrow bar showing the pending count. Expanding it shows
+one question with Back/Next navigation. Navigation and Collapse preserve drafts
+without submitting them. Sending an answer advances to the next remaining
+question; the panel disappears when none remain. New questions do not expand it
+or move focus. Reloading or changing threads starts collapsed. Inline and panel
+controls share the same selection, text and delivery state. Browser storage
+retains the complete draft string alongside optional choice/note fields so older
+browsers can still recover it.
 
 Custom renderers use `createAsyncQuestions({storage, namespace, send,
 acknowledge, canSend, onChange})`. Feed ordered transcript entries and current
@@ -200,6 +211,9 @@ Suggestions and free text share native reply
 formatting, per-question state and retry identity across both views. Local
 storage is required before submission; uncertain delivery exposes **Retry answer**
 with the same identity. Canonical transcript replies reconcile other clients.
+Set `onPanelEmpty` to return focus to the embedding application's composer when
+the last focused question disappears. The callback does not run when focus is
+already elsewhere.
 
 Pending prompts expose an opaque `token` for each offer. Send that token with
 answers, decisions and snoozes through `RespondPrompt`; an expired offer returns
