@@ -1,10 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestStandaloneExampleUsesCurrentConversationAsset(t *testing.T) {
+	var rendered bytes.Buffer
+	if err := page.Execute(&rendered, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered.String(), `import {mountConversation} from "/codex/assets/conversation.js?v=22"`) {
+		t.Fatal("standalone page must load the current mounted conversation asset")
+	}
+}
 
 func TestStandaloneCapabilitiesCoverMountedConversation(t *testing.T) {
 	capabilities := standaloneCapabilities()

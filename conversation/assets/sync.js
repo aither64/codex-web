@@ -24,6 +24,7 @@ export function createConversationSync(options) {
   let streamOpen = !streaming, streamFailed = false, needsSync = true, readError = null;
   let lastState = "";
   let warningTimer = null, recoverySince = null;
+  let pendingInvalidationSupported = false;
 
   const publish = () => {
     const status = readError || streamFailed ?
@@ -54,6 +55,7 @@ export function createConversationSync(options) {
     old?.close();
     streamOpen = !streaming;
     heartbeatDeadline = null;
+    pendingInvalidationSupported = false;
   };
   const cancelRead = () => {
     const old = active;
@@ -161,12 +163,18 @@ export function createConversationSync(options) {
     events.addEventListener("ready", event => {
       if (!current()) return;
       try {
-        const interval = JSON.parse(event.data).heartbeatIntervalMs;
+        const ready = JSON.parse(event.data), interval = ready.heartbeatIntervalMs;
+        pendingInvalidationSupported = ready.pendingInvalidation === true;
         if (Number.isSafeInteger(interval) && interval > 0) heartbeatDeadline = interval * 2 + policy.heartbeatGraceMs;
       } catch (_) {}
       lastTraffic = now();
     });
     events.addEventListener("heartbeat", () => { if (current()) lastTraffic = now(); });
+    events.addEventListener("pending", () => {
+      if (!current() || !pendingInvalidationSupported) return;
+      lastTraffic = now();
+      options.onPendingInvalidation?.();
+    });
     events.onmessage = () => {
       if (!current()) return;
       lastTraffic = now();
@@ -217,7 +225,7 @@ export function createConversationSync(options) {
     lastWatch = at;
     watchTimer = later(watch, policy.watchMs);
   };
-  const visibility = () => { if (!hidden()) recover(false); else publish(); };
+  const visibility = () => { if (hidden()) pagehide(); else if (suspended) pageshow(); else recover(false); };
   const focus = () => recover(false);
   const online = () => recover(true);
   const offline = () => {
@@ -227,13 +235,15 @@ export function createConversationSync(options) {
   };
   const pagehide = () => {
     suspended = true;
+    dirty = true; needsSync = true;
     clear(warningTimer); warningTimer = null; recoverySince = null;
     cancelRead(); closeStream(); clearRefresh();
     clear(retryTimer); retryTimer = null;
     clear(watchTimer); watchTimer = null;
   };
   const pageshow = () => {
-    if (destroyed) return;
+    if (destroyed || hidden()) return;
+    if (!suspended) { recover(false); return; }
     suspended = false;
     lastRecovery = -Infinity;
     recover();
@@ -243,10 +253,15 @@ export function createConversationSync(options) {
     [browser, "online", online], [browser, "offline", offline],
     [browser, "pagehide", pagehide], [browser, "pageshow", pageshow]];
   for (const [target, name, callback] of listeners) target?.addEventListener?.(name, callback);
-  publish(); connect(); scheduleRefresh(0);
-  if (live) watchTimer = later(watch, policy.watchMs);
+  suspended = hidden();
+  publish();
+  if (!suspended) {
+    connect(); scheduleRefresh(0);
+    if (live) watchTimer = later(watch, policy.watchMs);
+  }
   return {
     refresh, scheduleRefresh, retry: recover,
+    get pendingInvalidationSupported() { return pendingInvalidationSupported; },
     destroy() {
       destroyed = true;
       pagehide();
