@@ -57,8 +57,16 @@ function localURL(value) {
   return parsed.pathname + parsed.search;
 }
 
-async function payload(response) {
-  const data = await response.json().catch(() => ({}));
+async function payload(response, signal, read) {
+  let data;
+  try { data = response.status === 204 ? {} : await response.json(); }
+  catch (error) {
+    signal?.throwIfAborted();
+    if (response.ok && read) throw new Error("Invalid file status response");
+    if (read && error?.name !== "SyntaxError") throw error;
+    data = {};
+  }
+  signal?.throwIfAborted();
   if (!response.ok) {
     const error = new Error(data.error || `File operation failed (${response.status})`);
     error.status = response.status;
@@ -71,12 +79,21 @@ export function createUploadClient(basePath, options = {}) {
   const base = localURL(basePath);
   if (base.includes("?") || base.endsWith("/")) throw new TypeError("Invalid upload endpoint");
   const fetchRequest = options.fetch || globalThis.fetch.bind(globalThis);
-  const request = (suffix, init = {}) => fetchRequest(base + suffix, {
-    credentials: "same-origin", signal: options.signal, ...init,
-  }).then(payload);
+  const request = async (suffix, init = {}) => {
+    const read = !init.method || init.method === "GET";
+    const deadline = read ? new AbortController() : null;
+    const timer = deadline ? setTimeout(() => deadline.abort(new Error("File status request timed out")), options.readDeadlineMs || 10_000) : null;
+    const signals = [options.signal, init.signal, deadline?.signal].filter(Boolean);
+    const signal = signals.length ? AbortSignal.any(signals) : undefined;
+    try {
+      return await payload(await fetchRequest(base + suffix, {
+        credentials: "same-origin", ...init, signal,
+      }), signal, read);
+    } finally { clearTimeout(timer); }
+  };
   const path = (id) => { if (!idPattern.test(id)) throw new TypeError("Invalid upload ID"); return `/${id}`; };
   return {
-    list: () => request(""),
+    list: (read = {}) => request("", {signal: read.signal}),
     create: (file, clientId) => request("", {method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({name: file.name, size: file.size, clientId})}),
     status: (id) => request(path(id)),
@@ -208,6 +225,8 @@ export function mountUploads(root, options) {
   let active = 0;
   let resumeEntry = null;
   let persistenceError = "";
+  let draftRevision = 0, metadataRead = null, metadataRetry = null, metadataDelay = 2000;
+  let metadataPaused = Boolean(globalThis.document?.hidden), metadataFatal = false, metadataFailed = false;
   const controllers = new Map();
   const controlsRoot = options.controlsRoot || root;
   const initiallyHidden = root.hidden;
@@ -275,9 +294,14 @@ export function mountUploads(root, options) {
   controls.append(button, picker, menu); controlsRoot.append(controls);
   notice.hidden = true; summary.hidden = true; list.hidden = true;
   if (controlsRoot !== root) root.hidden = true;
-  root.append(notice, summary, list);
+  const retryMetadata = document.createElement("button");
+  retryMetadata.type = "button"; retryMetadata.className = "quiet"; retryMetadata.textContent = "Retry file status";
+  retryMetadata.hidden = true;
+  retryMetadata.addEventListener("click", () => { void refreshMetadata(); });
+  root.append(notice, retryMetadata, summary, list);
   const ready = () => Boolean(limits) && !persistenceError && entries.every((entry) => entry.state === "ready" && !entry.error && !entry.removing);
   const save = (next = entries) => {
+    ++draftRevision;
     try {
       if (numbersChanged) {
         const value = JSON.stringify([...clipboardNumbers]);
@@ -318,6 +342,7 @@ export function mountUploads(root, options) {
     button.disabled = locked || !limits; attach.disabled = button.disabled;
     if (button.disabled) closeMenu();
     if (persistenceError) notice.textContent = persistenceError;
+    retryMetadata.hidden = !metadataFailed || metadataFatal; retryMetadata.disabled = Boolean(metadataRead);
     notice.hidden = !notice.textContent; list.hidden = entries.length === 0;
     summary.hidden = entries.length === 0;
     const total = entries.reduce((sum, entry) => sum + entry.size, 0);
@@ -463,39 +488,98 @@ export function mountUploads(root, options) {
     add(files, true);
   };
   pasteTarget?.addEventListener("paste", paste);
+  const refreshMetadata = () => {
+    if (stopped || metadataPaused || globalThis.document?.hidden || metadataFatal) return Promise.resolve();
+    if (metadataRead) return metadataRead.promise;
+    clearTimeout(metadataRetry); metadataRetry = null;
+    const cycle = {controller: new AbortController(), promise: null}, revision = draftRevision;
+    metadataRead = cycle;
+    const current = () => metadataRead === cycle && !stopped && !metadataPaused;
+    const signal = cycle.controller.signal;
+    let rejectAbort;
+    const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+    const onAbort = () => rejectAbort(signal.reason);
+    signal.addEventListener("abort", onAbort, {once: true});
+    const deadline = setTimeout(() => cycle.controller.abort(new Error("File status request timed out")), options.readDeadlineMs || 10_000);
+    cycle.promise = (async () => {
+      try {
+        const snapshot = await Promise.race([Promise.resolve().then(() => client.list({signal})), aborted]);
+        if (!current() || signal.aborted) return;
+        if (!snapshot || !Array.isArray(snapshot.files) || !snapshot.limits ||
+            !["chunkBytes", "fileBytes", "promptBytes", "files"].every(field => Number.isSafeInteger(snapshot.limits[field]) && snapshot.limits[field] > 0)) {
+          throw new Error("Invalid file status response");
+        }
+        limits = snapshot.limits;
+        for (const file of [...entries, ...snapshot.files]) reservedNames.add(file.name);
+        const available = new Map(snapshot.files.map(file => [file.id, file]));
+        // An older listing cannot undo a selection, removal or transfer receipt.
+        if (revision === draftRevision) {
+          for (const entry of entries) {
+            if (entry.running || entry.removing) continue;
+            if (entry.id && available.has(entry.id)) {
+              Object.assign(entry, available.get(entry.id)); entry.creation = "created";
+              if (entry.state === "ready") entry.error = null;
+            }
+            if (entry.id && (!available.has(entry.id) || entry.state === "deleted")) {
+              entry.state = "missing"; entry.error = "File expired or was removed. Remove it and upload again.";
+            }
+          }
+        }
+        save(); metadataFailed = false; metadataDelay = 2000; notice.textContent = "";
+      } catch (error) {
+        if (!current()) return;
+        metadataFailed = true; notice.textContent = error.message;
+        if (!persistenceError && error.status !== 401 && error.status !== 403) {
+          metadataRetry = setTimeout(() => { metadataRetry = null; void refreshMetadata(); }, metadataDelay);
+          metadataDelay = Math.min(30_000, metadataDelay * 2);
+        }
+      } finally {
+        clearTimeout(deadline); signal.removeEventListener("abort", onAbort);
+        if (metadataRead === cycle) { metadataRead = null; render(); }
+      }
+    })();
+    render(); return cycle.promise;
+  };
+  const pauseMetadata = () => {
+    metadataPaused = true; clearTimeout(metadataRetry); metadataRetry = null;
+    const old = metadataRead; metadataRead = null; old?.controller.abort();
+  };
+  const resumeMetadata = () => {
+    if (stopped || globalThis.document?.hidden) return;
+    const wasPaused = metadataPaused;
+    metadataPaused = false;
+    if (wasPaused || metadataFailed || !limits) void refreshMetadata();
+  };
+  const metadataVisibility = () => globalThis.document?.hidden ? pauseMetadata() : resumeMetadata();
+  globalThis.document?.addEventListener?.("visibilitychange", metadataVisibility);
+  globalThis.addEventListener?.("pagehide", pauseMetadata);
+  globalThis.addEventListener?.("pageshow", resumeMetadata);
   const initialized = (async () => {
     try {
       const saved = JSON.parse(storage.getItem(key) || "[]");
-      if (!Array.isArray(saved) || saved.length > 100 || saved.some((entry) => !idPattern.test(entry.clientId))) throw new Error("Stored attachment draft is invalid");
+      if (!Array.isArray(saved) || saved.length > 100 || saved.some(entry => !idPattern.test(entry.clientId))) throw new Error("Stored attachment draft is invalid");
       entries = saved;
       const numbers = JSON.parse(storage.getItem(numberKey) || "[]");
       if (!Array.isArray(numbers) || numbers.some(pair => !Array.isArray(pair) || pair.length !== 2 ||
           typeof pair[0] !== "string" || !Number.isSafeInteger(pair[1]) || pair[1] < 1)) throw new Error("Stored clipboard numbering is invalid");
       clipboardNumbers = new Map(numbers);
-      const snapshot = await client.list(); limits = snapshot.limits;
-      for (const file of [...entries, ...snapshot.files]) reservedNames.add(file.name);
-      const available = new Map(snapshot.files.map((file) => [file.id, file]));
-      for (const entry of entries) {
-        if (entry.id && available.has(entry.id)) {
-          Object.assign(entry, available.get(entry.id));
-          entry.creation = "created";
-          if (entry.state === "ready") entry.error = null;
-        }
-        if (entry.id && (!available.has(entry.id) || entry.state === "deleted")) { entry.state = "missing"; entry.error = "File expired or was removed. Remove it and upload again."; }
-      }
-      save();
-    } catch (error) { notice.textContent = error.message; }
-    render();
+    } catch (error) { metadataFatal = true; persistenceError = error.message; render(); return; }
+    await refreshMetadata();
   })();
   return {
     initialized,
+    refresh: refreshMetadata,
     ready,
     count: () => entries.length,
     ids: () => { if (!ready()) throw new Error("Wait for uploads to finish, or remove the unfinished files"); return attachmentIDs(entries.map((entry) => entry.id)); },
     clear: () => { save([]); entries = []; render(); },
     lock: (value) => { locked = value; render(); if (!value) pump(); },
     destroy: () => {
-      closeMenu(); stopped = true; controllers.forEach((controller) => controller.abort());
+      closeMenu(); pauseMetadata(); stopped = true;
+      globalThis.document?.removeEventListener?.("visibilitychange", metadataVisibility);
+      globalThis.removeEventListener?.("pagehide", pauseMetadata);
+      globalThis.removeEventListener?.("pageshow", resumeMetadata);
+      controllers.forEach((controller) => controller.abort());
       globalThis.removeEventListener("resize", positionMenu); globalThis.removeEventListener("scroll", positionMenu, true);
       dropTarget.removeEventListener("dragover", drag); dropTarget.removeEventListener("dragleave", leave); dropTarget.removeEventListener("drop", drop);
       pasteTarget?.removeEventListener("paste", paste);
