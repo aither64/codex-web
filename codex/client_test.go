@@ -3967,7 +3967,16 @@ func TestStaleDisconnectDoesNotClearReplacementConnection(t *testing.T) {
 	first := client.connection
 	firstGeneration := client.generation
 	client.connectionMu.Unlock()
+	request := questionRequest(first, firstGeneration)
+	if !client.admitPrompt(&request) {
+		t.Fatal("current request not admitted")
+	}
+	priorRevision := client.PendingRevision("thread-1")
 	client.markDisconnected(first, firstGeneration, errors.New("test replacement"))
+	resetRevision := client.PendingRevision("thread-1")
+	if resetRevision <= priorRevision || len(client.Prompts("thread-1")) != 0 {
+		t.Fatal("disconnect did not invalidate the pending projection")
+	}
 	if err := client.Ensure(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -3975,6 +3984,9 @@ func TestStaleDisconnectDoesNotClearReplacementConnection(t *testing.T) {
 	replacement := client.connection
 	client.connectionMu.Unlock()
 	client.markDisconnected(first, firstGeneration, errors.New("stale reader"))
+	if client.PendingRevision("thread-1") != resetRevision {
+		t.Fatal("retired disconnect invalidated the replacement projection")
+	}
 	client.connectionMu.Lock()
 	actual := client.connection
 	client.connectionMu.Unlock()

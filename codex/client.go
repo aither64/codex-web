@@ -795,10 +795,14 @@ type Client struct {
 	writeMu      sync.Mutex
 	nextID       atomic.Uint64
 
-	pendingMu sync.Mutex
-	pending   map[uint64]pendingCall
-	requests  map[string]PendingRequest
-	notices   map[string][]Prompt
+	pendingMu         sync.Mutex
+	pending           map[uint64]pendingCall
+	requests          map[string]PendingRequest
+	notices           map[string][]Prompt
+	pendingRevisionMu sync.Mutex
+	pendingSequence   uint64
+	pendingReset      uint64
+	pendingRevisions  map[string]uint64
 
 	subscribersMu sync.Mutex
 	subscribers   map[chan struct{}]string
@@ -1186,6 +1190,7 @@ func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, gen
 	if offer != nil {
 		if err == nil {
 			delete(c.requests, offer.ID)
+			c.bumpPendingLocked(requestThreadID(*offer))
 		}
 		c.pendingMu.Unlock()
 	}
@@ -1323,6 +1328,7 @@ func (c *Client) admitPrompt(request *PendingRequest) bool {
 	}
 	request.token = rand.Text()
 	c.requests[request.ID] = *request
+	c.bumpPendingLocked(requestThreadID(*request))
 	return true
 }
 
@@ -1357,6 +1363,8 @@ func (c *Client) claimAutoResolvableUserInput(id, threadID, token string) (Pendi
 	}
 	request.claimed = true
 	c.requests[id] = request
+	c.bumpPendingLocked(threadID)
+	c.broadcast(threadID)
 	return request, true
 }
 
@@ -1384,8 +1392,13 @@ func (c *Client) snoozeUserInput(id, threadID, token string) error {
 	if prompt.ThreadID != threadID || prompt.Kind != "userInput" {
 		return errors.New("this request does not support auto-resolution control")
 	}
+	if request.snoozed {
+		return nil
+	}
 	request.snoozed = true
 	c.requests[id] = request
+	c.bumpPendingLocked(threadID)
+	c.broadcast(threadID)
 	return nil
 }
 
@@ -1436,9 +1449,11 @@ func (c *Client) handleResolved(params json.RawMessage, generation uint64) {
 	threadID := threadIDFromParams(request.Params)
 	if request.generation == generation {
 		delete(c.requests, string(resolved.RequestID))
+		c.bumpPendingLocked(threadID)
 	}
 	c.pendingMu.Unlock()
 	c.broadcast(threadID)
+	c.prunePendingRevision(threadID)
 }
 
 func (c *Client) rejectUnsupported(request PendingRequest, cause error) {
@@ -1458,6 +1473,7 @@ func (c *Client) rejectUnsupported(request PendingRequest, cause error) {
 			notices = notices[len(notices)-20:]
 		}
 		c.notices[threadID] = notices
+		c.bumpPendingLocked(threadID)
 		c.pendingMu.Unlock()
 	}
 	var rawID any
@@ -1511,6 +1527,11 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 		}
 		delete(c.pending, id)
 	}
+	c.pendingRevisionMu.Lock()
+	c.pendingSequence++
+	c.pendingReset = c.pendingSequence
+	c.pendingRevisions = nil
+	c.pendingRevisionMu.Unlock()
 	for id, request := range c.requests {
 		if request.generation == generation {
 			delete(c.requests, id)
@@ -1581,6 +1602,7 @@ func (c *Client) removeWatch(threadID string) {
 	}
 	c.watchedMu.Unlock()
 	if removed {
+		c.prunePendingRevision(threadID)
 		c.connectionMu.Lock()
 		generation := c.generation
 		c.connectionMu.Unlock()
@@ -1752,6 +1774,7 @@ func (c *Client) recordWatchError(threadID string, err error) {
 		notices = append(notices, message)
 	}
 	c.notices[threadID] = notices
+	c.bumpPendingLocked(threadID)
 	c.pendingMu.Unlock()
 	c.broadcast(threadID)
 }
@@ -1762,11 +1785,59 @@ func (c *Client) clearWatchError(threadID string) {
 	for index := range notices {
 		if notices[index].ID == "watch:"+threadID {
 			notices = append(notices[:index], notices[index+1:]...)
+			c.bumpPendingLocked(threadID)
+			defer c.broadcast(threadID)
 			break
 		}
 	}
 	c.notices[threadID] = notices
 	c.pendingMu.Unlock()
+	c.prunePendingRevision(threadID)
+}
+
+// PendingRevision reads an in-memory invalidation token, without native RPCs or
+// durable ledger access. The value is meaningful only within this client.
+func (c *Client) PendingRevision(threadID string) uint64 {
+	c.pendingRevisionMu.Lock()
+	defer c.pendingRevisionMu.Unlock()
+	return max(c.pendingReset, c.pendingRevisions[threadID])
+}
+
+// Caller holds pendingMu. Advance before publishing the corresponding hint.
+func (c *Client) bumpPendingLocked(threadID string) {
+	c.pendingRevisionMu.Lock()
+	defer c.pendingRevisionMu.Unlock()
+	if threadID == "" {
+		return
+	}
+	c.pendingSequence++
+	if c.pendingRevisions == nil {
+		c.pendingRevisions = make(map[string]uint64)
+	}
+	c.pendingRevisions[threadID] = c.pendingSequence
+}
+
+// Tokens need live watchers or a retained pending/notice projection, just as
+// their underlying thread state does. Call without pendingMu held.
+func (c *Client) prunePendingRevision(threadID string) {
+	c.watchedMu.Lock()
+	defer c.watchedMu.Unlock()
+	if c.watched[threadID] != 0 {
+		return
+	}
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	if len(c.notices[threadID]) != 0 {
+		return
+	}
+	for _, request := range c.requests {
+		if requestThreadID(request) == threadID {
+			return
+		}
+	}
+	c.pendingRevisionMu.Lock()
+	delete(c.pendingRevisions, threadID)
+	c.pendingRevisionMu.Unlock()
 }
 
 func (c *Client) broadcast(threadID string) {
@@ -1954,6 +2025,8 @@ func (c *Client) claim(id, threadID, token string) (PendingRequest, Prompt, erro
 	}
 	request.claimed = true
 	c.requests[id] = request
+	c.bumpPendingLocked(threadID)
+	c.broadcast(threadID)
 	return request, prompt, nil
 }
 
@@ -1963,8 +2036,10 @@ func (c *Client) releaseClaim(request PendingRequest) {
 	if ok && current.generation == request.generation && current.token == request.token {
 		current.claimed = false
 		c.requests[request.ID] = current
+		c.bumpPendingLocked(requestThreadID(request))
 	}
 	c.pendingMu.Unlock()
+	c.broadcast(requestThreadID(request))
 }
 
 func (c *Client) finishResponse(ctx context.Context, request PendingRequest, result any) error {
@@ -1990,6 +2065,7 @@ func (c *Client) finishResponse(ctx context.Context, request PendingRequest, res
 		return &PromptResponseError{Code: "prompt_transport", NotSent: errors.Is(err, errConnectionChanged), Err: err}
 	}
 	c.broadcast(requestThreadID(request))
+	c.prunePendingRevision(requestThreadID(request))
 	return nil
 }
 

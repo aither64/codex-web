@@ -86,6 +86,12 @@ type TranscriptPageReader interface {
 	ReadThreadPage(context.Context, string, string) (codex.TranscriptPage, error)
 }
 
+// PendingRevisionProvider supplies an in-memory pending-control invalidation
+// token. Reading it must not perform RPCs or access durable submission state.
+type PendingRevisionProvider interface {
+	PendingRevision(threadID string) uint64
+}
+
 // PromptResponder adds request-bound responses without changing the legacy
 // Client interface used by existing embedding applications.
 type PromptResponder interface {
@@ -945,13 +951,28 @@ func (handler *Handler) events(response http.ResponseWriter, request *http.Reque
 	defer unsubscribe()
 	keepalive := time.NewTicker(heartbeatInterval)
 	defer keepalive.Stop()
-	handler.streamEvents(response, request, flusher, events, keepalive.C)
+	var revision func() uint64
+	if provider, ok := target.Client.(PendingRevisionProvider); ok && target.Capabilities.Pending {
+		revision = func() uint64 { return provider.PendingRevision(target.ThreadID) }
+	}
+	handler.streamEvents(response, request, flusher, events, keepalive.C, revision)
 }
 
-func (handler *Handler) streamEvents(response http.ResponseWriter, request *http.Request, flusher http.Flusher, events <-chan struct{}, keepalive <-chan time.Time) {
+func (handler *Handler) streamEvents(response http.ResponseWriter, request *http.Request, flusher http.Flusher, events <-chan struct{}, keepalive <-chan time.Time, revisions ...func() uint64) {
+	var revision func() uint64
+	if len(revisions) != 0 {
+		revision = revisions[0]
+	}
+	var previous uint64
+	ready := map[string]any{"heartbeatIntervalMs": heartbeatInterval.Milliseconds()}
+	if revision != nil {
+		previous = revision()
+		ready["pendingInvalidation"] = true
+	}
+	data, _ := json.Marshal(ready)
 	response.Header().Set("Content-Type", "text/event-stream")
 	response.Header().Set("X-Accel-Buffering", "no")
-	if _, err := fmt.Fprintf(response, "event: ready\ndata: {\"heartbeatIntervalMs\":%d}\n\n", heartbeatInterval.Milliseconds()); err != nil {
+	if _, err := fmt.Fprintf(response, "event: ready\ndata: %s\n\n", data); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -969,6 +990,15 @@ func (handler *Handler) streamEvents(response http.ResponseWriter, request *http
 		case _, open := <-events:
 			if !open {
 				return
+			}
+			if revision != nil {
+				current := revision()
+				if current != previous {
+					if _, err := io.WriteString(response, "event: pending\ndata: update\n\n"); err != nil {
+						return
+					}
+					previous = current
+				}
 			}
 			if _, err := io.WriteString(response, "data: update\n\n"); err != nil {
 				return

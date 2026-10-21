@@ -248,3 +248,69 @@ func TestReissuedOfferWhileAnswerWaitsForWrite(t *testing.T) {
 		t.Fatal("replacement answer was not delivered")
 	}
 }
+
+func TestPendingRevisionTracksVisibleProjectionWithoutRPC(t *testing.T) {
+	client := newTestClient("")
+	connection := &websocket.Conn{}
+	client.connection, client.generation = connection, 1
+	client.watched["thread-1"] = 1
+	first := questionRequest(connection, 1)
+	if client.PendingRevision("thread-1") != 0 {
+		t.Fatal("nonempty initial revision")
+	}
+	if !client.admitPrompt(&first) {
+		t.Fatal("admission failed")
+	}
+	// Pending projection mutation can hold pendingMu during a transport write.
+	// The SSE getter must stay independent of that transport wait.
+	client.pendingMu.Lock()
+	read := make(chan uint64, 1)
+	go func() { read <- client.PendingRevision("thread-1") }()
+	select {
+	case <-read:
+	case <-time.After(time.Second):
+		client.pendingMu.Unlock()
+		t.Fatal("pending revision blocked behind transport ownership")
+	}
+	client.pendingMu.Unlock()
+	admitted := client.PendingRevision("thread-1")
+	if admitted == 0 || client.PendingRevision("other") != 0 {
+		t.Fatal("revision not thread scoped")
+	}
+	duplicate := questionRequest(connection, 1)
+	if client.admitPrompt(&duplicate) || client.PendingRevision("thread-1") != admitted {
+		t.Fatal("duplicate invalidated projection")
+	}
+	if err := client.snoozeUserInput(first.ID, "thread-1", first.token); err != nil {
+		t.Fatal(err)
+	}
+	snoozed := client.PendingRevision("thread-1")
+	if snoozed <= admitted {
+		t.Fatal("snooze not invalidated")
+	}
+	request, _, err := client.claim(first.ID, "thread-1", first.token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := client.PendingRevision("thread-1")
+	if claimed <= snoozed || len(client.Prompts("thread-1")) != 0 {
+		t.Fatal("claim did not invalidate hidden offer")
+	}
+	client.releaseClaim(request)
+	if client.PendingRevision("thread-1") <= claimed || len(client.Prompts("thread-1")) != 1 {
+		t.Fatal("released claim not invalidated")
+	}
+	client.handleResolved(json.RawMessage(`{"requestId":"question"}`), 1)
+	if len(client.Prompts("thread-1")) != 0 || client.PendingRevision("thread-1") <= claimed {
+		t.Fatal("resolution not invalidated")
+	}
+	delete(client.watched, "thread-1")
+	client.prunePendingRevision("thread-1")
+	if len(client.pendingRevisions) != 0 {
+		t.Fatal("retired pending projection retained its token")
+	}
+	// A getter and projection changes require neither a socket nor a ledger.
+	if len(client.pending) != 0 || client.queueLedgerPath != "" && client.queueLedgerLock != nil {
+		t.Fatal("revision performed transport/ledger work")
+	}
+}

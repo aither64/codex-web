@@ -501,6 +501,20 @@ browser client exposes `activity()` for applications that enable it. A client
 without a recorder still aggregates historical boundaries and explicitly
 unclassified turn time, without subscribing or resuming the thread.
 
+Clients can implement optional `PendingRevisionProvider.PendingRevision(threadID)`
+to identify changes to the visible pending-request projection. The getter reads
+only memory; it performs no native RPC or durable ledger access. The native
+client advances the revision before broadcasting request, response, snooze,
+notice and connection changes. Revision bookkeeping retires with its watched or pending thread state;
+persisted formats remain unchanged.
+
+For an authorized Pending target with this provider, the SSE `ready` event adds
+`pendingInvalidation: true`. A changed revision emits the named `pending` event
+with `data: update`, alongside the unchanged generic update. Comparing the latest
+revision preserves invalidation when generic updates coalesce. Initial reads
+and reads after reconnect remain authoritative. Clients without the optional
+interface retain the existing stream contract.
+
 The handler also serves `assets/conversation.js`. Import
 `createConversationClient()` for the HTTP API, `createDurableSender()` for
 response-loss-safe message delivery, or `mountConversation()` for the complete
