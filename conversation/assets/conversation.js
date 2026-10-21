@@ -2,8 +2,8 @@ import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from ".
 import {citationCopyText, createCitationMessage} from "./citations.js?v=1";
 export {citationCopyText, createCitationMessage} from "./citations.js?v=1";
 export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=6";
-import {createConversationSync, renderConnectionStatus} from "./sync.js?v=2";
-export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=2";
+import {createConversationSync, renderConnectionStatus} from "./sync.js?v=3";
+export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=3";
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {createAsyncQuestions} from "./questions.js?v=3";
 export {createAsyncQuestions, asyncQuestionReply} from "./questions.js?v=3";
@@ -1180,7 +1180,8 @@ export function mountConversation(root, options) {
   let metadataRetryTimer = null, metadataRetryDelay = policy.retryInitialMs;
   let pendingRead = null, queueRead = null, pendingScope = null, queueScope = null;
   let pendingRetryTimer = null, queueRetryTimer = null;
-  let pendingRetryDelay = policy.retryInitialMs, queueRetryDelay = policy.retryInitialMs, pendingLastRead = 0;
+  let pendingRetryDelay = policy.retryInitialMs, queueRetryDelay = policy.retryInitialMs, pendingLastRead = -Infinity;
+  let pendingGeneration = 0, queueGeneration = 0, pendingRerun = false, queueRerun = false, pendingDueTimer = null, queueDueTimer = null;
   let lastSyncStatus = "", lastThreadStatus = "", destroyed = false, paused = false;
   let generation = 0, sync = null;
   let entryNodes = new Map();
@@ -1210,7 +1211,18 @@ export function mountConversation(root, options) {
   const laneRead = (timeout) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Conversation request timed out")), timeout);
-    return {signal: AbortSignal.any([abort.signal, controller.signal]), finish: () => clearTimeout(timer),
+    const signal = AbortSignal.any([abort.signal, controller.signal]);
+    let abortListener;
+    return {signal,
+      run(operation) {
+        const canceled = new Promise((_, reject) => {
+          abortListener = () => reject(signal.reason);
+          if (signal.aborted) abortListener();
+          else signal.addEventListener("abort", abortListener, {once:true});
+        });
+        return Promise.race([Promise.resolve().then(() => {signal.throwIfAborted(); return operation();}), canceled]);
+      },
+      finish() { clearTimeout(timer); if (abortListener) signal.removeEventListener("abort", abortListener); },
       cancel: () => controller.abort()};
   };
   const entryElement = (entry) => {
@@ -1341,7 +1353,7 @@ export function mountConversation(root, options) {
         metadataRetryTimer = setTimeout(() => { metadataRetryTimer = null; sync?.scheduleRefresh(0); }, metadataRetryDelay);
         metadataRetryDelay = Math.min(policy.retryMaxMs, metadataRetryDelay * 2);
       } else metadataRetryDelay = policy.retryInitialMs;
-      if (Date.now() - pendingLastRead >= policy.pendingMs) void refreshPending();
+      if (!sync?.pendingInvalidationSupported || Date.now() - pendingLastRead >= policy.pendingMs) void refreshPending();
     }
     if (submissionFailure && history.entries.some(entry => entry.kind === "userMessage" &&
         entry.clientUserMessageId === submissionFailure.attemptId &&
@@ -1352,54 +1364,85 @@ export function mountConversation(root, options) {
     renderHistoryControls();
     scheduleHistoryRepair();
   };
+  const schedulePending = () => {
+    clearTimeout(pendingDueTimer); pendingDueTimer = null;
+    if (destroyed || paused || globalThis.document?.hidden || !capabilities.pending) return;
+    pendingDueTimer = setTimeout(() => { pendingDueTimer = null; void refreshPending(); },
+      Math.max(0, policy.pendingMs - (Date.now() - pendingLastRead)));
+  };
   const refreshPending = (force = false, manual = false) => {
-    if (!capabilities.pending || destroyed || paused || globalThis.document?.hidden || pendingRead) return pendingRead || Promise.resolve();
+    if (!capabilities.pending || destroyed || paused || globalThis.document?.hidden) return Promise.resolve();
+    if (force) ++pendingGeneration;
+    if (pendingRead) { if (force) pendingRerun = true; return pendingRead; }
     if (pendingRetryTimer !== null && !force) return Promise.resolve();
-    if (pendingRetryTimer !== null) clearTimeout(pendingRetryTimer);
-    pendingRetryTimer = null;
-    const read = laneRead(policy.pendingDeadlineMs), threadId = currentThread?.threadId;
+    if (!force && sync?.pendingInvalidationSupported && Date.now() - pendingLastRead < policy.pendingMs) {
+      schedulePending(); return Promise.resolve();
+    }
+    clearTimeout(pendingRetryTimer); pendingRetryTimer = null;
+    clearTimeout(pendingDueTimer); pendingDueTimer = null;
+    const read = laneRead(policy.pendingDeadlineMs), threadId = currentThread?.threadId, generation = pendingGeneration;
     pendingScope = read;
+    const current = () => !destroyed && !paused && pendingScope === read && generation === pendingGeneration &&
+      (!threadId || currentThread?.threadId === threadId);
     pendingNotice.begin({manual});
-    pendingRead = client.pending({signal: read.signal}).then(entries => {
-      if (destroyed || (threadId && currentThread?.threadId !== threadId)) return;
+    pendingRead = read.run(() => client.pending({signal: read.signal})).then(entries => {
+      if (!current() || read.signal.aborted) return;
       if (!Array.isArray(entries)) throw new Error("Invalid pending requests");
-      renderPrompts(entries);
-      pendingNotice.success();
-      pendingLastRead = Date.now();
-      pendingRetryDelay = policy.retryInitialMs;
+      renderPrompts(entries); pendingNotice.success();
+      pendingLastRead = Date.now(); pendingRetryDelay = policy.retryInitialMs;
+      schedulePending();
     }).catch(error => {
-      if (destroyed || paused || globalThis.document?.hidden) return;
+      if (!current() || globalThis.document?.hidden) return;
       pendingStatusLabel.textContent = "Requests could not be refreshed. The last result may be out of date.";
       pendingNotice.failure(error);
       pendingRetryTimer = setTimeout(() => { pendingRetryTimer = null; void refreshPending(); }, pendingRetryDelay);
       pendingRetryDelay = Math.min(policy.retryMaxMs, pendingRetryDelay * 2);
-    }).finally(() => { read.finish(); pendingScope = null; pendingRead = null; });
+    }).finally(() => {
+      read.finish();
+      if (pendingScope !== read) return;
+      pendingScope = null; pendingRead = null;
+      if (pendingRerun) { pendingRerun = false; void refreshPending(true); }
+    });
     return pendingRead;
   };
+  const scheduleQueue = () => {
+    clearTimeout(queueDueTimer); queueDueTimer = null;
+    if (destroyed || paused || globalThis.document?.hidden || !capabilities.queueRead) return;
+    queueDueTimer = setTimeout(() => { queueDueTimer = null; void refreshQueue(); }, policy.queueMs);
+  };
   const refreshQueue = (force = false, manual = false) => {
-    if (!capabilities.queueRead || destroyed || paused || globalThis.document?.hidden || queueRead) return queueRead || Promise.resolve();
+    if (!capabilities.queueRead || destroyed || paused || globalThis.document?.hidden) return Promise.resolve();
+    if (force) ++queueGeneration;
+    if (queueRead) { if (force) queueRerun = true; return queueRead; }
     if (queueRetryTimer !== null && !force) return Promise.resolve();
-    if (queueRetryTimer !== null) clearTimeout(queueRetryTimer);
-    queueRetryTimer = null;
-    const read = laneRead(policy.queueDeadlineMs), threadId = currentThread?.threadId;
+    clearTimeout(queueRetryTimer); queueRetryTimer = null;
+    clearTimeout(queueDueTimer); queueDueTimer = null;
+    const read = laneRead(policy.queueDeadlineMs), threadId = currentThread?.threadId, generation = queueGeneration;
     queueScope = read;
+    const current = () => !destroyed && !paused && queueScope === read && generation === queueGeneration &&
+      (!threadId || currentThread?.threadId === threadId);
     queueNotice.begin({manual});
-    queueRead = Promise.resolve().then(async () => {
+    queueRead = read.run(async () => {
       if (capabilities.queue && typeof client.reconcileQueue === "function") await client.reconcileQueue({signal: read.signal});
+      if (read.signal.aborted) read.signal.throwIfAborted();
       return client.queue({signal: read.signal});
     }).then(entries => {
-      if (destroyed || (threadId && currentThread?.threadId !== threadId)) return;
+      if (!current() || read.signal.aborted) return;
       if (!Array.isArray(entries)) throw new Error("Invalid queue");
-      renderQueue(entries);
-      queueNotice.success();
-      queueRetryDelay = policy.retryInitialMs;
+      renderQueue(entries); queueNotice.success(); queueRetryDelay = policy.retryInitialMs;
+      scheduleQueue();
     }).catch(error => {
-      if (destroyed || paused || globalThis.document?.hidden) return;
+      if (!current() || globalThis.document?.hidden) return;
       queueStatusLabel.textContent = "Queued messages could not be refreshed. The last result may be out of date.";
       queueNotice.failure(error);
       queueRetryTimer = setTimeout(() => { queueRetryTimer = null; void refreshQueue(); }, queueRetryDelay);
       queueRetryDelay = Math.min(policy.retryMaxMs, queueRetryDelay * 2);
-    }).finally(() => { read.finish(); queueScope = null; queueRead = null; });
+    }).finally(() => {
+      read.finish();
+      if (queueScope !== read) return;
+      queueScope = null; queueRead = null;
+      if (queueRerun) { queueRerun = false; void refreshQueue(true); }
+    });
     return queueRead;
   };
   const runHistoryRead = async (kind, manual = kind === "older") => {
@@ -1409,20 +1452,21 @@ export function mountConversation(root, options) {
     const threadId = history.threadId, readGeneration = generation;
     const readVersion = history.repairVersion;
     const read = laneRead(policy.transcriptDeadlineMs);
-    historyRead = {...read, kind, newerKeys: new Set()}; historyError = ""; historyFailureKind = null; historyNotice.begin({manual}); renderHistoryControls();
+    const cycle = {...read, kind, newerKeys: new Set()};
+    historyRead = cycle; historyError = ""; historyFailureKind = null; historyNotice.begin({manual}); renderHistoryControls();
     try {
-      const page = await readTranscriptPage(client, {cursor, signal: read.signal, expectedThreadId: threadId});
-      if (destroyed || paused || readGeneration !== generation || history.threadId !== threadId ||
+      const page = await read.run(() => readTranscriptPage(client, {cursor, signal: read.signal, expectedThreadId: threadId}));
+      if (destroyed || paused || historyRead !== cycle || read.signal.aborted || readGeneration !== generation || history.threadId !== threadId ||
           readVersion !== history.repairVersion) return;
       const current = new Map(history.rows.map(row => [row.key, row.entry]));
       const entries = page.entries.map((entry, index) => {
         const key = transcriptEntryKey(entry, index, page.entries);
-        return historyRead.newerKeys.has(key) ? current.get(key) || entry : entry;
+        return cycle.newerKeys.has(key) ? current.get(key) || entry : entry;
       });
       renderThread({...page, entries}, () => true, kind);
       historyRetryDelay = policy.retryInitialMs; historyNotice.success();
     } catch (error) {
-      if (destroyed || paused || readGeneration !== generation || history.threadId !== threadId ||
+      if (destroyed || paused || historyRead !== cycle || readGeneration !== generation || history.threadId !== threadId ||
           readVersion !== history.repairVersion) return;
       if (error.code === "transcript_cursor_expired" || error.code === "transcript_reset_required") {
         history.invalidateCursor();
@@ -1442,7 +1486,9 @@ export function mountConversation(root, options) {
         }
       }
     } finally {
-      read.finish(); historyRead = null; historyNotice.cancel(); renderHistoryControls();
+      read.finish();
+      if (historyRead !== cycle) return;
+      historyRead = null; historyNotice.cancel(); renderHistoryControls();
       if (!historyError) scheduleHistoryRepair();
     }
   };
@@ -1464,13 +1510,20 @@ export function mountConversation(root, options) {
   retryQueue.addEventListener("click", () => { void refreshQueue(true, true); });
   const suspendLanes = () => {
     paused = true;
-    historyRead?.cancel(); pendingScope?.cancel(); queueScope?.cancel();
+    ++pendingGeneration; ++queueGeneration;
+    historyRead?.cancel(); historyRead = null; historyNotice.cancel();
+    pendingScope?.cancel(); queueScope?.cancel();
+    pendingScope = queueScope = null; pendingRead = queueRead = null;
+    pendingRerun = queueRerun = false;
+    clearTimeout(pendingDueTimer); pendingDueTimer = null;
+    clearTimeout(queueDueTimer); queueDueTimer = null;
+    pendingNotice.cancel(); queueNotice.cancel();
     for (const timer of [historyRetryTimer, metadataRetryTimer, pendingRetryTimer, queueRetryTimer]) clearTimeout(timer);
     historyRetryTimer = metadataRetryTimer = pendingRetryTimer = queueRetryTimer = null;
   };
   const onVisibility = () => {
     if (globalThis.document?.hidden) suspendLanes();
-    else { paused = false; void refreshPending(true); void refreshQueue(true); scheduleHistoryRepair(historyFailureKind ? historyRetryDelay : policy.historyPageMs); }
+    else { paused = false; renderHistoryControls(); void refreshPending(true); void refreshQueue(true); scheduleHistoryRepair(historyFailureKind ? historyRetryDelay : policy.historyPageMs); }
   };
   const onPageshow = () => { paused = false; onVisibility(); };
   globalThis.document?.addEventListener?.("visibilitychange", onVisibility);
@@ -1486,6 +1539,7 @@ export function mountConversation(root, options) {
       return {...await readTranscriptPage(client, {signal, legacy}), settingsGeneration: readGeneration};
     },
     apply: (page, {isCurrent}) => renderThread(page, isCurrent),
+    onPendingInvalidation: () => { void refreshPending(true); },
     onStateChange: state => {
       renderConnectionStatus(connectionStatus, state, () => sync.retry());
       if (state.status === "connected" && lastSyncStatus !== "connected") {
@@ -1591,12 +1645,9 @@ export function mountConversation(root, options) {
   void refresh();
   void refreshPending();
   void refreshQueue();
-  const pendingInterval = setInterval(() => { void refreshPending(); }, policy.pendingMs);
-  const queueInterval = setInterval(() => { void refreshQueue(); }, policy.queueMs);
 
   return () => {
     destroyed = true;
-    clearInterval(pendingInterval); clearInterval(queueInterval);
     suspendLanes();
     globalThis.document?.removeEventListener?.("visibilitychange", onVisibility);
     globalThis.removeEventListener?.("pagehide", suspendLanes);

@@ -255,12 +255,13 @@ test("the advertised heartbeat interval determines the stream deadline", async t
 });
 
 
-test("brief focus refresh keeps the healthy stream and stays quiet", async t => {
+test("brief hiding closes the stream and resumes one quiet replacement", async t => {
   const f = await fixture(t); f.open(); await f.clock.advance(0);
   f.browser.hidden = true; f.emit("visibilitychange"); await f.clock.advance(1000);
   f.browser.hidden = false; f.emit("visibilitychange"); f.emit("focus");
-  assert.equal(f.sources.length, 1);
-  assert.equal(f.reads.length, 1);
+  assert.equal(f.sources.length, 2);
+  assert.equal(f.sources[0].closed, true);
+  f.open();
   assert.equal(f.state().showWarning, false);
   await f.clock.advance(0);
   assert.equal(f.state().status, "connected");
@@ -283,4 +284,49 @@ test("access errors bypass the recovery grace", async t => {
   assert.equal(f.state().showWarning, true);
   const {connectionMessage} = await moduleReady;
   assert.match(connectionMessage(f.state()), /access denied/i);
+});
+
+test("fifty loaded documents release hidden streams, reads and all timers", async t => {
+  const documents = [];
+  for (let i = 0; i < 50; i++) {
+    const f = await fixture(t); f.open(); await f.clock.advance(0); documents.push(f);
+    f.browser.hidden = true; f.emit("visibilitychange");
+    assert.equal(f.sources[0].closed, true);
+    assert.equal(f.clock.timers.size, 0);
+    f.sources[0].event("message"); f.sources[0].event("error");
+    await f.clock.advance(120_000);
+    assert.equal(f.reads.length, 1);
+    assert.equal(f.sources.length, 1);
+  }
+  const foreground = documents[0];
+  foreground.browser.hidden = false;
+  for (const event of ["visibilitychange", "pageshow", "focus", "online"]) foreground.emit(event);
+  assert.equal(foreground.sources.length, 2);
+  foreground.open(); await foreground.clock.advance(0);
+  assert.equal(foreground.reads.length, 2);
+  assert.equal(foreground.state().status, "connected");
+});
+
+test("initially hidden and restored documents create only current resources", async t => {
+  const page = new Browser(); page.hidden = true;
+  const f = await fixture(t, {controller: {document: page}});
+  assert.equal(f.sources.length, 0); assert.equal(f.clock.timers.size, 0);
+  page.hidden = false; page.dispatchEvent(new Event("visibilitychange"));
+  f.open(); await f.clock.advance(0);
+  assert.equal(f.sources.length, 1); assert.equal(f.reads.length, 1);
+});
+
+test("pending invalidations require current advertised stream capability", async t => {
+  let hints = 0;
+  const f = await fixture(t, {controller: {onPendingInvalidation: () => hints++}});
+  f.open();
+  f.sources[0].event("pending"); assert.equal(hints, 0);
+  f.sources[0].event("ready", '{"heartbeatIntervalMs":20000,"pendingInvalidation":true}');
+  assert.equal(f.sync.pendingInvalidationSupported, true);
+  f.sources[0].event("pending"); assert.equal(hints, 1);
+  f.browser.hidden = true; f.emit("visibilitychange");
+  assert.equal(f.sync.pendingInvalidationSupported, false);
+  f.sources[0].event("pending"); assert.equal(hints, 1);
+  f.browser.hidden = false; f.emit("visibilitychange");
+  f.open(); assert.equal(f.sync.pendingInvalidationSupported, false);
 });

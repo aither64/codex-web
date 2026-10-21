@@ -942,7 +942,7 @@ class MemoryStorage {
       ];
       recoveryStorage.setItem("codex-web:uploads:/recovery-uploads", JSON.stringify(files));
       globalThis.fetch = async (_path, options = {}) => ({ok: true, json: async () => options.method === "DELETE" ? {} : {
-        limits: {fileBytes: 100, promptBytes: 100, files: 10}, files,
+        limits: {chunkBytes: 4, fileBytes: 100, promptBytes: 100, files: 10}, files,
       }});
       let recoveryEvents, recoveryThread = "original-thread", observedID = "", recoveryReads = 0;
       const recoveryCalls = [];
@@ -1128,6 +1128,97 @@ class MemoryStorage {
   await new Promise(resolve => setImmediate(resolve));
   unmountPaged();
 
+  // Retired control reads may settle after resume and after its replacement.
+  const originalLaneDocument = globalThis.document;
+  for (const outcome of ["resolve", "reject"]) {
+    globalThis.document = Object.assign(new EventTarget(), originalLaneDocument, {hidden:false});
+    const laneRoot = new FakeElement("main"), pendingCalls = [], queueCalls = [];
+    const deferred = calls => ({signal} = {}) => new Promise((resolve, reject) => calls.push({resolve, reject, signal}));
+    const disposeLane = mountConversation(laneRoot, {id:"lanes", client:{
+      thread: async () => ({threadId:"lanes-thread",status:"idle",entries:[]}),
+      pending:deferred(pendingCalls), queue:deferred(queueCalls),
+    }, capabilities:{send:false,queue:false,interrupt:false,settings:false,respond:false,eventStream:false},
+    refreshPolicy:{warningMs:0, eventDebounceMs:0}});
+    await new Promise(resolve => setImmediate(resolve));
+    globalThis.document.hidden = true; globalThis.document.dispatchEvent(new Event("visibilitychange"));
+    assert(pendingCalls[0].signal.aborted && queueCalls[0].signal.aborted);
+    globalThis.document.hidden = false; globalThis.document.dispatchEvent(new Event("visibilitychange"));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(pendingCalls.length,2); assert.equal(queueCalls.length,2);
+    const freshPending = {id:"fresh",params:{message:"fresh request"}};
+    pendingCalls[1].resolve([freshPending]); queueCalls[1].resolve([{id:"fresh",text:"fresh queue"}]);
+    await new Promise(resolve => setImmediate(resolve));
+    // Reconnection may invalidate a read begun before its current snapshot.
+    // Complete that one coalesced successor, never the retired pre-hide read.
+    for (let index=2; index<pendingCalls.length; index++) pendingCalls[index].resolve([freshPending]);
+    for (let index=2; index<queueCalls.length; index++) queueCalls[index].resolve([{id:"fresh",text:"fresh queue"}]);
+    await new Promise(resolve => setImmediate(resolve));
+    if (outcome === "resolve") {
+      pendingCalls[0].resolve([{id:"old",params:{message:"old request"}}]); queueCalls[0].resolve([{id:"old",text:"old queue"}]);
+    } else {
+      pendingCalls[0].reject(Error("retired failure")); queueCalls[0].reject(Error("retired failure"));
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    const texts = laneRoot.descendants().map(element => element.textContent).join(" ");
+    assert.match(texts,/fresh request/); assert.match(texts,/fresh queue/);
+    assert.doesNotMatch(texts,/old request|old queue|could not be refreshed|retired failure/);
+    disposeLane();
+  }
+  globalThis.document = originalLaneDocument;
+
+  // Typed invalidations bypass the success floor; output alone does not.
+  let controlEvents, controlPending = 0, controlSnapshots = 0, holdControl = false;
+  const controlReads = [];
+  class ControlEvents {
+    listeners = new Map();
+    constructor() {controlEvents = this;}
+    addEventListener(name, callback) {this.listeners.set(name,callback);}
+    close() {}
+  }
+  const controlRoot = new FakeElement("main");
+  const disposeControl = mountConversation(controlRoot,{id:"control-hints",client:{
+    eventsPath:()=>"/control-events",
+    thread:async()=>{controlSnapshots++;return {threadId:"control-thread",status:"idle",entries:[]};},
+    pending:async()=>{controlPending++;return holdControl ? new Promise(resolve=>controlReads.push(resolve)) : [];},
+  },EventSource:ControlEvents,capabilities:{send:false,queueRead:false,queue:false,interrupt:false,settings:false,respond:false},
+  refreshPolicy:{eventDebounceMs:0}});
+  controlEvents.onopen(); controlEvents.listeners.get("ready")({data:'{"heartbeatIntervalMs":20000,"pendingInvalidation":true}'});
+  await new Promise(resolve=>setTimeout(resolve,5));
+  const beforeOutput = controlPending, wallNow = Date.now;
+  try {
+    for(let index=0;index<200;index++) {
+      Date.now = () => wallNow() + index * 500;
+      controlEvents.onmessage(); await new Promise(resolve=>setTimeout(resolve,1));
+    }
+  } finally { Date.now = wallNow; }
+  assert(controlSnapshots>1);
+  assert.equal(controlPending,beforeOutput+6,"two hundred output hints over 100 seconds respect the 15-second success floor");
+  controlEvents.listeners.get("pending")(); await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(controlPending,beforeOutput+7,"real control invalidation must bypass the floor");
+  holdControl = true;
+  controlEvents.listeners.get("pending")(); await new Promise(resolve=>setImmediate(resolve));
+  for(let index=0;index<3;index++) controlEvents.listeners.get("pending")();
+  assert.equal(controlReads.length,1,"invalidation cannot overlap a current control read");
+  controlReads[0]([{id:"obsolete",params:{text:"obsolete control"}}]);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(controlReads.length,2,"invalidations coalesce into one successor");
+  controlReads[1]([{id:"current",params:{text:"current control"}}]);
+  await new Promise(resolve=>setImmediate(resolve));
+  const controlText = controlRoot.descendants().map(element=>element.textContent).join(" ");
+  assert.match(controlText,/current control/); assert.doesNotMatch(controlText,/obsolete control/);
+  disposeControl();
+
+  const timeoutRoot = new FakeElement("main");
+  const disposeTimeout = mountConversation(timeoutRoot,{id:"timeouts",client:{
+    thread:async()=>({threadId:"timeout-thread",status:"idle",entries:[]}),
+    pending:()=>new Promise(()=>{}),queue:()=>new Promise(()=>{}),
+  },capabilities:{send:false,queue:false,interrupt:false,settings:false,respond:false,eventStream:false},
+  refreshPolicy:{pendingDeadlineMs:5,queueDeadlineMs:5,warningMs:0,retryInitialMs:1000,eventDebounceMs:0}});
+  await new Promise(resolve=>setTimeout(resolve,40));
+  const timeoutText = timeoutRoot.descendants().map(element=>element.textContent).join(" ");
+  assert.match(timeoutText,/Requests could not be refreshed/); assert.match(timeoutText,/Queued messages could not be refreshed/);
+  disposeTimeout();
+
   // A failed automatic repair must restart after hiding during its backoff.
   const plainDocument = globalThis.document;
   globalThis.document = Object.assign(new EventTarget(), plainDocument, {hidden:false});
@@ -1167,6 +1258,53 @@ class MemoryStorage {
   await until(() => repairReads === 2);
   assert.equal(repairRoot.descendants().filter(el => el.attributes.class?.startsWith("codex-entry ")).length,3);
   disposeRepair(); globalThis.document = plainDocument;
+
+  // A retired history transport may settle after a resumed repair has started.
+  // Neither settlement may replace rows, invalidate cursors or clear that repair.
+  for (const oldFailure of [false, true]) {
+    globalThis.document = Object.assign(new EventTarget(), plainDocument, {hidden:false});
+    let historyEvents, newestHistoryReads = 0;
+    const heldHistory = [];
+    class HistoryEvents {
+      constructor() {historyEvents = this;}
+      addEventListener() {}
+      close() {}
+    }
+    const historyRoot = new FakeElement("main");
+    const disposeHistory = mountConversation(historyRoot, {id:`late-history-${oldFailure}`, EventSource:HistoryEvents,
+      client:{eventsPath:()=>"/history-events", threadPage:({cursor, signal} = {}) => {
+        if (cursor) return new Promise((resolve,reject) => heldHistory.push({cursor,signal,resolve,reject}));
+        newestHistoryReads++;
+        return Promise.resolve({threadId:"repair-thread",status:"idle",entries:[repairEntry(newestHistoryReads === 1 ? 1 : 3)],
+          hasOlder:true,olderCursor:"repair-cursor"});
+      }},refreshPolicy:{eventDebounceMs:0,historyPageMs:1,retryInitialMs:40,warningMs:0},
+      storage:new MemoryStorage(),conversationPath:`/history/${oldFailure}`,
+      capabilities:{pending:false,queueRead:false,settings:false,send:true,queue:false,interrupt:false,respond:false,eventStream:true}});
+    await until(()=>newestHistoryReads === 1);
+    const historyDraft = historyRoot.descendants().find(el=>el.name === "textarea");
+    historyDraft.value = "Retained draft";
+    historyEvents.onmessage(); await until(()=>heldHistory.length === 1);
+    const historyList = historyRoot.descendants().find(el=>el.name === "ol");
+    const retainedRows = [...historyList.children];
+    globalThis.document.hidden = true; globalThis.document.dispatchEvent(new Event("visibilitychange"));
+    assert.equal(heldHistory[0].signal.aborted,true);
+    globalThis.document.hidden = false; globalThis.document.dispatchEvent(new Event("visibilitychange"));
+    await until(()=>heldHistory.length === 2);
+    if (oldFailure) heldHistory[0].reject(Object.assign(Error("Old cursor expired"),{code:"transcript_cursor_expired"}));
+    else heldHistory[0].resolve({threadId:"repair-thread",status:"idle",entries:[repairEntry(99)],hasOlder:false});
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.deepEqual(historyList.children,retainedRows,"retired history cannot replace retained row nodes");
+    assert.equal(historyDraft.value,"Retained draft");
+    assert.equal(historyRoot.descendants().find(el=>el.attributes.class === "codex-history-controls").children[1].textContent,"");
+    assert.equal(heldHistory.length,2,"old completion cannot schedule another repair or clear its successor");
+    assert.equal(heldHistory[1].signal.aborted,false);
+    assert.equal(heldHistory[1].cursor,"repair-cursor","resume preserves paging authority");
+    heldHistory[1].resolve({threadId:"repair-thread",status:"idle",entries:[repairEntry(1),repairEntry(2)],hasOlder:false});
+    await until(()=>historyList.children.length === 3);
+    assert.doesNotMatch(historyList.descendants().map(el=>el.textContent).join(" "),/Entry 99/);
+    assert.equal(historyDraft.value,"Retained draft");
+    disposeHistory(); globalThis.document = plainDocument;
+  }
 
   const promptRoot = new FakeElement("main");
   const promptActions = [];

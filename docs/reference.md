@@ -596,6 +596,25 @@ and named `heartbeat` events every 20 seconds. The browser allows two advertised
 intervals plus five seconds before treating a stream as stale. Existing message notifications
 keep their format. Servers without this advertisement use snapshot polling.
 
+Hidden documents close their stream, cancel current snapshot reads and stop
+retry and watch timers. Returning to a visible document or restoring a page
+starts one current recovery cycle. Late responses and callbacks from retired
+cycles cannot replace data or change a newer cycle's status. These browser
+changes leave the server observer, session execution and unsent drafts intact.
+
+`createConversationSync()` also accepts `onPendingInvalidation()` and exposes
+read-only `pendingInvalidationSupported`. The getter resets when the stream
+closes and becomes true only after the current `ready` event advertises support.
+The callback runs only for a named pending hint from that current stream.
+With this capability, ordinary output respects the mounted UI's 15-second
+pending-read freshness budget. Actual pending hints, local responses, manual
+retry and reconnection force a fresh read. Invalidations during a current read
+coalesce into one successor, and the older result cannot restore stale controls.
+Without the capability, generic updates retain pending refresh behavior.
+A due timer also refreshes controls when output stops. Pending and queue panels
+retain their last rows while hidden and start fresh reads when restored. Current
+deadline failures still show the normal retry notice.
+
 GET client methods accept an optional `{signal}` and have a 35-second request
 deadline. `reconcileQueue({signal})` also accepts cancellation; other mutation
 methods retain their existing behavior. Cancellation of a request does not

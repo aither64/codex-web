@@ -30,7 +30,7 @@ var page = template.Must(template.New("page").Parse(`<!doctype html>
 <body>
   <main id="conversation"></main>
   <script type="module">
-    import {mountConversation} from "/codex/assets/conversation.js";
+    import {mountConversation} from "/codex/assets/conversation.js?v=21";
     mountConversation(document.querySelector("#conversation"), {
 	  id: "current",
     });
