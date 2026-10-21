@@ -1,7 +1,7 @@
-import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=6";
+import {attachmentIDs, sameAttachments, mountUploads, renderAttachments} from "./uploads.js?v=7";
 import {citationCopyText, createCitationMessage} from "./citations.js?v=1";
 export {citationCopyText, createCitationMessage} from "./citations.js?v=1";
-export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=6";
+export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createUploadClient} from "./uploads.js?v=7";
 import {createConversationSync, renderConnectionStatus} from "./sync.js?v=3";
 export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=3";
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";

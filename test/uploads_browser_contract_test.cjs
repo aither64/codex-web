@@ -139,7 +139,7 @@ async function uploadComposer(t, options = {}) {
   const events = new EventTarget();
   for (const [key, value] of Object.entries({
     addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events),
-    document: {createElement: () => new Element(), createElementNS: () => new Element()},
+    document: Object.assign(new EventTarget(), {hidden:false, createElement: () => new Element(), createElementNS: () => new Element()}),
   })) {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, key);
     Object.defineProperty(globalThis, key, {value, configurable: true});
@@ -197,6 +197,8 @@ async function uploadComposer(t, options = {}) {
   };
   return {
     client, calls, files, changes, card, click, cards, storage,
+    refresh: () => upload.refresh(),
+    page: globalThis.document, events,
     summary: () => root.children.find((child) => child.className === 'codex-upload-summary'),
     notice: () => root.children.find((child) => child.className === 'codex-upload-notice'),
     lock: (value) => upload.lock(value), clear: () => upload.clear(),
@@ -658,4 +660,102 @@ test('numbering storage failures prevent upload creation and submission', async 
   composer.paste([zeroFile('image.png')]);
   await eventually(() => composer.ready());
   assert.deepEqual(composer.saved().map(file => file.name), ['image-1.png', 'image-2.png']);
+});
+
+test('failed metadata read recovers empty composer without replaying writes', async t => {
+  let reads = 0;
+  const composer = await uploadComposer(t, {client:{list:async()=>{
+    if (++reads === 1) throw Error('Temporary metadata failure');
+    return {limits,files:[]};
+  }}});
+  assert.equal(composer.ready(),false); assert.match(composer.notice().textContent,/Temporary/);
+  await composer.refresh();
+  assert.equal(composer.ready(),true); assert.equal(composer.changes.at(-1).ready,true);
+  assert.equal(composer.notice().textContent,'');
+  assert.deepEqual(composer.calls,{create:[],remove:[],append:[]});
+});
+
+test('metadata cancellation retires old ownership before real visible resume', async t => {
+  const reads=[];
+  const composer = await uploadComposer(t);
+  composer.client.list=({signal})=>new Promise((resolve,reject)=>reads.push({signal,resolve,reject}));
+  const old = composer.refresh(); await new Promise(resolve=>setImmediate(resolve));
+  composer.page.hidden=true; composer.page.dispatchEvent(new Event('visibilitychange'));
+  assert.equal(reads[0].signal.aborted,true);
+  composer.page.hidden=false; composer.page.dispatchEvent(new Event('visibilitychange'));
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(reads.length,2);
+  const same = composer.refresh();
+  reads[0].resolve({limits,files:[{id,name:'obsolete.txt',state:'ready'}]});
+  await old;
+  assert.equal(composer.refresh(),same,'old finally cannot release the replacement');
+  reads[1].resolve({limits,files:[]}); await same;
+  assert.equal(composer.ready(),true); assert.equal(composer.count(),0);
+  assert.deepEqual(composer.calls,{create:[],remove:[],append:[]});
+});
+
+test('metadata response cannot restore a removed selection or stale transfer status', async t => {
+  const selected={id,clientId:id,name:'selected.txt',size:1,state:'ready'};
+  const composer=await uploadComposer(t,{saved:[selected],files:[selected]});
+  let release;
+  composer.client.list=()=>new Promise(resolve=>{release=resolve;});
+  const read=composer.refresh(); await new Promise(resolve=>setImmediate(resolve));
+  composer.clear();
+  release({limits,files:[{...selected,state:'uploading'}]}); await read;
+  assert.equal(composer.count(),0); assert.equal(composer.ready(),true);
+  assert.deepEqual(composer.saved(),[]);
+});
+
+test('metadata GET preserves body abort and rejects malformed successful JSON', async t => {
+  const {createUploadClient}=await modules;
+  const abort=new AbortController();
+  const client=createUploadClient('/files',{fetch:async(_url,{signal})=>({ok:true,status:200,
+    json:()=>new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}))})});
+  const read=client.list({signal:abort.signal}); await new Promise(resolve=>setImmediate(resolve));
+  abort.abort(new Error('retired metadata')); await assert.rejects(read,/retired metadata/);
+  const malformed=createUploadClient('/files',{fetch:async()=>({ok:true,status:200,json:async()=>{throw new SyntaxError('bad');}})});
+  await assert.rejects(malformed.list(),/Invalid file status response/);
+});
+
+test('automatic metadata backoff retries only reads and restores readiness', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  let reads=0;
+  const composer=await uploadComposer(t,{client:{list:async()=>{
+    if(++reads===1) throw Error('transient read');
+    return {limits,files:[]};
+  }}});
+  assert.equal(reads,1); assert.equal(composer.ready(),false);
+  t.mock.timers.tick(1999); await new Promise(resolve=>setImmediate(resolve)); assert.equal(reads,1);
+  t.mock.timers.tick(1); await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(reads,2); assert.equal(composer.ready(),true);
+  assert.deepEqual(composer.calls,{create:[],remove:[],append:[]});
+});
+
+test('hung metadata reaches its deadline and releases the read for recovery', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const composer=await uploadComposer(t);
+  let release, signal;
+  composer.client.list=options=>new Promise(resolve=>{release=resolve;signal=options.signal;});
+  const read=composer.refresh(); await new Promise(resolve=>setImmediate(resolve));
+  t.mock.timers.tick(10_000); await read;
+  assert.equal(signal.aborted,true); assert.match(composer.notice().textContent,/File status request timed out/);
+  composer.client.list=async()=>({limits,files:[]});
+  await composer.refresh();
+  release({limits:null,files:[]}); await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(composer.ready(),true); assert.equal(composer.notice().textContent,'');
+  assert.deepEqual(composer.calls,{create:[],remove:[],append:[]});
+});
+
+test('metadata storage failure stays visible without automatic retries', async t => {
+  t.mock.timers.enable({apis:['setTimeout']});
+  const composer=await uploadComposer(t);
+  let reads=0;
+  composer.client.list=async()=>{reads++;return {limits,files:[]};};
+  composer.failWrites(true); await composer.refresh();
+  assert.equal(composer.ready(),false); assert.match(composer.notice().textContent,/Storage write failed/);
+  t.mock.timers.tick(30_000); await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(reads,1,'storage failure cannot loop as transient metadata failure');
+  composer.failWrites(false); await composer.refresh();
+  assert.equal(reads,2); assert.equal(composer.ready(),true);
+  assert.deepEqual(composer.calls,{create:[],remove:[],append:[]});
 });

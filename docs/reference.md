@@ -680,6 +680,20 @@ selection. Hosts may use 404 for a temporarily unavailable scope. Browser storag
 must confirm the updated draft before the card disappears; an already deleted
 file cannot become ready again while its card awaits local removal.
 
+`createUploadClient().list({signal})` accepts cancellation. Metadata GETs have a
+ten-second deadline and preserve body-read cancellation; malformed successful
+JSON is an error. File writes retain their existing outcome and retry rules.
+
+`mountUploads()` loads metadata with one current read and capped retry backoff.
+**Retry file status** retries a failed read. Hiding the document cancels only
+metadata reads and their retry timer; returning to a visible document or
+restoring the page starts a fresh read. The last selection and transfer receipts
+remain intact, and an older listing cannot undo a newer selection, removal or
+transfer result. A successful retry updates composer readiness without reloading,
+including when no files are selected. Draft-storage and configuration failures
+remain visible and do not trigger write retries. Metadata recovery never repeats
+upload creation, chunks, completion, deletion or message submission.
+
 Upload names are untrusted display metadata. Render them as text, serialize
 prompt references as JSON, and derive storage paths from application-generated
 identities. Download responses use MIME filename encoding and attachment
