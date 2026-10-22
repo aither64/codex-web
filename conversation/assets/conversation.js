@@ -5,6 +5,8 @@ export {attachmentIDs, sameAttachments, mountUploads, renderAttachments, createU
 import {createConversationSync, renderConnectionStatus} from "./sync.js?v=3";
 export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=3";
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
+import {mountRetryControls} from "./retry.js?v=1";
+export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
 import {createAsyncQuestions} from "./questions.js?v=3";
 export {createAsyncQuestions, asyncQuestionReply} from "./questions.js?v=3";
 export {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
@@ -280,6 +282,9 @@ export function createConversationClient(options) {
     thread: (options) => read("thread", options),
     threadPage: ({cursor, signal} = {}) => read(cursor ? `thread/page?cursor=${encodeURIComponent(cursor)}` : "thread/page", {signal}),
     activity: (options) => read("activity", options),
+    retry: (options) => read("retry", options),
+    setRetryEnabled: (enabled) => request("retry/enabled", {method: "POST", body: JSON.stringify({enabled})}),
+    cancelRetry: () => request("retry/cancel", {method: "POST", body: "{}"}),
     pending: async (options) => (await read("pending", options)) || [],
     models: async (options) => (await read("models", options)) || [],
     modes: async (options) => (await read("collaboration-modes", options)) || [],
@@ -905,6 +910,7 @@ export function mountConversation(root, options) {
     settings: true,
     respond: true,
     eventStream: true,
+    retry: false,
     ...(options?.capabilities || {}),
   };
   if (!capabilities.read) throw new TypeError("the mounted conversation requires read capability");
@@ -1014,6 +1020,8 @@ export function mountConversation(root, options) {
   const children = [status, connectionStatus];
   if (capabilities.settings) children.push(settingsBar, settingsDialog);
   children.push(filter, historyControls, transcript);
+  const retryControls = capabilities.retry ? createElement("section", {"aria-label": "Automatic retries"}) : null;
+  if (retryControls) children.push(retryControls);
   if (capabilities.pending) children.push(pendingStatus, prompts);
   const dock = createElement("div", {class: "codex-conversation-dock"});
   dock.append(optionalQuestions);
@@ -1021,6 +1029,7 @@ export function mountConversation(root, options) {
   if (capabilities.send || capabilities.queue || capabilities.interrupt) dock.append(form);
   children.push(dock);
   root.replaceChildren(...children);
+  const retryUI = retryControls ? mountRetryControls(retryControls, {client}) : null;
   let uploads = null;
   if (options?.uploadBasePath && (capabilities.send || capabilities.queue)) {
     const uploadRoot = document.createElement("div");
@@ -1654,6 +1663,7 @@ export function mountConversation(root, options) {
     globalThis.removeEventListener?.("pagehide", suspendLanes);
     globalThis.removeEventListener?.("pageshow", onPageshow);
     uploads?.destroy();
+    retryUI?.destroy();
     historyNotice.destroy(); pendingNotice.destroy(); queueNotice.destroy();
     abort.abort();
     sync.destroy();

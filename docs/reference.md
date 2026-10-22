@@ -613,6 +613,44 @@ pending send is acknowledged only after a matching message is observed in the
 retained transcript, including an older page; a partial newest page cannot
 prove that the message is absent.
 
+### Optional automatic retry controls
+
+An embedding application can supply `Target.Retry RetryProvider` and grant
+`Capabilities.Retry`. The required `Client` interface is unchanged. The trusted
+resolver selects the provider and thread on every request. `GET retry` reads
+state; `POST retry/enabled` accepts only `{ "enabled": bool }`; `POST retry/cancel`
+accepts an empty object. POST uses the existing exact-origin checks, body bounds
+and common mutation lock. The provider owns authorization, durable preferences,
+cancellation and scheduling; a status read must not start work.
+
+`RetryStatus` contains `enabled`, `class`, `phase`, `attempt`, `nextAttemptAtMs`,
+`serverNowMs`, `cyberUsed`, `cyberLimit` and `reason`. Classes are empty,
+`capacity` or `cybersecurity`. Phases are `idle`, `scheduled`, `submitting`,
+`reconciling`, `running`, `cancelled`, `exhausted` or `blocked`. Times are Unix
+milliseconds; no deadline is JSON null. `attempt` counts automatic submissions
+in this chain. `cyberUsed` counts possible submissions in the rolling window,
+including uncertain outcomes; `cyberLimit` is 30. Reasons must be safe public
+text within 1024 bytes. Responses contain no sockets, options or routing data.
+
+Set browser `capabilities.retry: true` to mount Auto retry, status/countdown and
+Cancel retry below the transcript. The default is false, preserving existing
+embeddings. An absent provider/capability hides the optional controls. Custom
+interfaces can use `mountRetryControls(element, {client})` and
+`retryStatusText(state, serverNowMs)`. The returned controller has `refresh()`
+and `destroy()`. `createConversationClient()` adds `retry()`,
+`setRetryEnabled(enabled)` and `cancelRetry()`.
+
+Countdowns use the server deadline and elapsed browser monotonic time after
+receipt, so clock skew does not change the displayed delay. Visible controls
+poll state and refresh on focus/restoration. Hidden/unmounted controls cancel
+reads and timers. The browser never dispatches a continuation. Lost mutation
+replies trigger a status read rather than another automatic write. Cancel retry
+stops future attempts in the current chain without disabling the preference;
+disabling also cancels it. Neither operation can retract a request already sent.
+Use the existing Stop control to interrupt a running turn. Re-enabling must
+consume the current failure as a baseline instead of reviving it. These semantics
+are enforced by the application provider, independently of an open browser tab.
+
 `submissionFailurePresentation(error)` returns `{message, uncertain}` for inline
 delivery errors. Only explicit `error.notSent === true` establishes an unsent
 message. Transport failures, HTTP 502/503/504, aborts and unknown errors remain

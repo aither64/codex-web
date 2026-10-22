@@ -142,3 +142,7 @@
 .codex-activity-details, .codex-activity-agents details { margin-top: 0.5rem; }
 .codex-typed-activity summary { cursor: pointer; }
 .codex-activity-links, .codex-activity-agents { padding-left: 1.25rem; }
+.codex-retry-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem; padding: .5rem; }
+.codex-retry-controls[hidden] { display: none; }
+.codex-retry-controls label { display: inline-flex; align-items: center; gap: .35rem; }
+.codex-retry-controls [role="status"] { flex: 1 1 18rem; }
