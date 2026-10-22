@@ -19,24 +19,9 @@ import (
 // The native fixture uses a private home and a loopback Responses provider.
 // It never reads the operator's credentials or addresses a managed session.
 func TestPinnedCodexRecoveryRemainsColdUntilActivation(t *testing.T) {
-	binary := os.Getenv("CODEX_WEB_TEST_BINARY")
-	if binary == "" {
-		t.Skip("CODEX_WEB_TEST_BINARY is not configured")
-	}
-	root, err := os.MkdirTemp("/tmp", "codex-recovery-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(root) })
-	home, cwd := filepath.Join(root, "home"), filepath.Join(root, "work")
-	for _, dir := range []string{home, cwd} {
-		if err := os.Mkdir(dir, 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
 	var hits atomic.Int64
 	entered, release := make(chan struct{}, 16), make(chan struct{})
-	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fixture := newRecoveryIntegrationHarness(t, "thread_unload_delay_secs = 0\n[features]\ngoals = true\n", "", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/responses" {
 			w.WriteHeader(404)
 			return
@@ -58,55 +43,8 @@ func TestPinnedCodexRecoveryRemainsColdUntilActivation(t *testing.T) {
 		event(map[string]any{"type": "response.output_item.done", "item": map[string]any{"type": "message", "role": "assistant", "id": "answer-" + id, "phase": "final_answer", "content": []any{map[string]any{"type": "output_text", "text": "Fixture request completed."}}}})
 		event(map[string]any{"type": "response.completed", "response": map[string]any{"id": id, "usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}})
 	}))
-	t.Cleanup(provider.Close)
-	configuration := "model_provider = \"fixture\"\nmodel = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\nthread_unload_delay_secs = 0\n[features]\ngoals = true\n[model_providers.fixture]\nname = \"Synthetic recovery fixture\"\nbase_url = " + strconv.Quote(provider.URL+"/v1") + "\nwire_api = \"responses\"\nrequires_openai_auth = false\n"
-	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(configuration), 0600); err != nil {
-		t.Fatal(err)
-	}
-	socket := filepath.Join(root, "app.sock")
-	var command *exec.Cmd
-	log, err := os.Create(filepath.Join(root, "native.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { log.Close() })
-	t.Cleanup(func() {
-		if t.Failed() {
-			data, _ := os.ReadFile(log.Name())
-			if len(data) > 16384 {
-				data = data[len(data)-16384:]
-			}
-			t.Logf("private native log: %s", data)
-		}
-	})
-	stop := func() {
-		if command != nil {
-			_ = command.Process.Kill()
-			_ = command.Wait()
-			command = nil
-		}
-	}
-	t.Cleanup(stop)
-	start := func() {
-		_ = os.Remove(socket)
-		command = exec.Command(binary, "app-server", "--strict-config", "--listen", "unix://"+socket)
-		command.Dir = cwd
-		command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "CODEX_HOME=" + home, "XDG_CONFIG_HOME=" + home, "XDG_STATE_HOME=" + home, "XDG_CACHE_HOME=" + home, "RUST_LOG=error"}
-		command.Stdout, command.Stderr = log, log
-		if err := command.Start(); err != nil {
-			t.Fatal(err)
-		}
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			if info, err := os.Stat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("native socket did not appear")
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-	}
+	root, cwd, socket := fixture.root, fixture.cwd, fixture.socket
+	start, stop := fixture.start, fixture.stop
 	var allowed atomic.Bool
 	allowed.Store(true)
 	newClient := func() *Client {
@@ -288,5 +226,92 @@ func TestPinnedCodexRecoveryRemainsColdUntilActivation(t *testing.T) {
 	queue, err := client.ListQueue(ctx, threads[1])
 	if err != nil || len(queue) != 1 {
 		t.Fatal("root activation consumed member queue", queue, err)
+	}
+}
+
+// Shared persistent-thread fixture. Its native process, local provider and
+// durable state are private to the test; no operator home or API key is used.
+type recoveryIntegrationHarness struct {
+	t                               *testing.T
+	root, home, cwd, socket, binary string
+	command                         *exec.Cmd
+	log                             *os.File
+}
+
+func newRecoveryIntegrationHarness(t *testing.T, settings, providerSettings string, handler http.Handler) *recoveryIntegrationHarness {
+	t.Helper()
+	binary := os.Getenv("CODEX_WEB_TEST_BINARY")
+	if binary == "" {
+		t.Skip("CODEX_WEB_TEST_BINARY is not configured")
+	}
+	root, err := os.MkdirTemp("/tmp", "codex-recovery-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	h := &recoveryIntegrationHarness{t: t, root: root, home: filepath.Join(root, "home"), cwd: filepath.Join(root, "work"), socket: filepath.Join(root, "app.sock"), binary: binary}
+	for _, dir := range []string{h.home, h.cwd} {
+		if err := os.Mkdir(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	provider := httptest.NewServer(handler)
+	t.Cleanup(provider.Close)
+	configuration := "model_provider = \"fixture\"\nmodel = \"gpt-5.5\"\nmodel_reasoning_effort = \"low\"\n" + settings + "[model_providers.fixture]\nname = \"Synthetic recovery fixture\"\nbase_url = " + strconv.Quote(provider.URL+"/v1") + "\nwire_api = \"responses\"\nrequires_openai_auth = false\n" + providerSettings
+	if err := os.WriteFile(filepath.Join(h.home, "config.toml"), []byte(configuration), 0600); err != nil {
+		t.Fatal(err)
+	}
+	h.log, err = os.Create(filepath.Join(root, "native.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { h.log.Close() })
+	t.Cleanup(func() {
+		if t.Failed() {
+			data, _ := os.ReadFile(h.log.Name())
+			if len(data) > 16384 {
+				data = data[len(data)-16384:]
+			}
+			t.Logf("private native log: %s", data)
+		}
+	})
+	t.Cleanup(h.stop)
+	return h
+}
+
+func (h *recoveryIntegrationHarness) environment() []string {
+	return []string{"PATH=" + os.Getenv("PATH"), "HOME=" + h.home, "CODEX_HOME=" + h.home, "XDG_CONFIG_HOME=" + h.home, "XDG_STATE_HOME=" + h.home, "XDG_CACHE_HOME=" + h.home, "RUST_LOG=error"}
+}
+
+func (h *recoveryIntegrationHarness) start() {
+	h.t.Helper()
+	_ = os.Remove(h.socket)
+	h.command = exec.Command(h.binary, "app-server", "--strict-config", "--listen", "unix://"+h.socket)
+	h.command.Dir = h.cwd
+	h.command.Env = h.environment()
+	h.command.Stdout, h.command.Stderr = h.log, h.log
+	if err := h.command.Start(); err != nil {
+		h.t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if info, err := os.Stat(h.socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+			h.t.Logf("private native started: pid=%d strict-config socket ready", h.command.Process.Pid)
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatal("native socket did not appear")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (h *recoveryIntegrationHarness) stop() {
+	if h.command != nil {
+		pid := h.command.Process.Pid
+		_ = h.command.Process.Kill()
+		err := h.command.Wait()
+		h.t.Logf("private native stopped: pid=%d wait=%v", pid, err)
+		h.command = nil
 	}
 }
