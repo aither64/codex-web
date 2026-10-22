@@ -143,21 +143,11 @@ func collaborationModeFromRollout(path string) (string, error) {
 // approximate turn times when their records are outside this suffix.
 func readRolloutMetadata(path string, wanted map[transcriptItemKey]bool) (rolloutMetadata, error) {
 	result := rolloutMetadata{itemTimes: make(map[transcriptItemKey]itemTimestamps)}
-	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return result, errors.New("thread/read returned an invalid rollout path")
-	}
-	file, err := os.Open(path)
+	file, info, err := openRolloutFile(path)
 	if err != nil {
-		return result, fmt.Errorf("open Codex thread rollout: %w", err)
+		return result, err
 	}
 	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return result, fmt.Errorf("inspect Codex thread rollout: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return result, errors.New("Codex thread rollout is not a regular file")
-	}
 	offset := int64(0)
 	if info.Size() > readLimit {
 		offset = info.Size() - readLimit
@@ -181,8 +171,7 @@ func readRolloutMetadata(path string, wanted map[transcriptItemKey]bool) (rollou
 			return result, fmt.Errorf("read Codex thread rollout tail: %w", err)
 		}
 	}
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), readLimit)
+	scanner := rolloutRecordScanner(reader, false)
 	for scanner.Scan() {
 		var entry struct {
 			Type      string `json:"type"`
@@ -231,4 +220,35 @@ func readRolloutMetadata(path string, wanted map[transcriptItemKey]bool) (rollou
 		return result, fmt.Errorf("scan Codex thread rollout: %w", err)
 	}
 	return result, nil
+}
+
+// All rollout projections share this trusted local-file boundary. Callers get
+// the path only from a verified native thread read, never browser input.
+func openRolloutFile(path string) (*os.File, os.FileInfo, error) {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, nil, errors.New("thread/read returned an invalid rollout path")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open Codex thread rollout: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		file.Close()
+		return nil, nil, errors.New("Codex thread rollout is not a regular file")
+	}
+	return file, info, nil
+}
+
+func rolloutRecordScanner(reader io.Reader, complete bool) *bufio.Scanner {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), readLimit)
+	if complete {
+		scanner.Split(completeRolloutRecord)
+	}
+	return scanner
 }

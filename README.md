@@ -13,7 +13,8 @@ It includes:
 - a capability-checked HTTP handler for transcripts, messages, queued work,
   settings, questions, approvals, and interruption;
 - browser modules for a complete conversation UI or a custom interface;
-- durable message delivery, activity timing, and optional prompt attachments.
+- durable message delivery, activity timing, and optional prompt attachments;
+- exact failed-turn/context observations and idle-only continuation primitives.
 
 The package does not decide who may access a conversation. Your application
 maps its own opaque conversation ID to the trusted Codex thread, working

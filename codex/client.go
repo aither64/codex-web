@@ -3048,6 +3048,10 @@ func (c *Client) RequireSubmissionAttemptsKnown(ctx context.Context, threadID st
 }
 
 func (c *Client) requireSubmissionAttempts(ctx context.Context, threadID string, allowQueued bool) error {
+	return c.requireSubmissionAttemptsExcept(ctx, threadID, allowQueued, "")
+}
+
+func (c *Client) requireSubmissionAttemptsExcept(ctx context.Context, threadID string, allowQueued bool, ownPreparedID string) error {
 	deletionCount, err := queueLedgerTransaction(c, func() (int, error) { return len(c.queueDeletions[threadID]), nil })
 	if err != nil {
 		return err
@@ -3067,6 +3071,9 @@ func (c *Client) requireSubmissionAttempts(ctx context.Context, threadID string,
 		}
 		unresolved := 0
 		for clientID, attempt := range c.sendAttempts[threadID] {
+			if ownPreparedID != "" && clientID == ownPreparedID && attempt.State == "prepared" {
+				continue
+			}
 			// A prepared send may have been delegated to the native queue. Its
 			// exact queue identity is proved below, retaining options and context
 			// in the unchanged ledger without inventing a turn receipt.

@@ -136,6 +136,85 @@ options identity; zero-option activity never writes `optionsDigest`, retaining
 schema-3 reader and rollback compatibility. Existing methods remain exact
 zero-option wrappers.
 
+### Failed turns and exact execution context
+
+`ReadTurnState(ctx, threadID)` reads the native thread status and one latest
+turn without resuming the thread. Empty history has empty turn fields. Only a
+latest `failed` turn with a structured error supplies `TerminalFailure`, whose
+`Code` preserves the native string discriminator and whose `Message` is display
+text. Unknown or object-valued codes never acquire meaning through text matching.
+Intermediate errors and `willRetry` notifications do not prove terminal failure.
+The generated Codex 0.163.0 schema defines `serverOverloaded` and `cyberPolicy`;
+the embedding application chooses its retry policy.
+
+`TurnState.IsLoadedFailedTurn(expectedTurnID)` returns true only when
+`expectedTurnID` is nonempty and matches the latest failed turn, and the raw
+native status is `idle` or `systemError`. Codex 0.163.0 can retain `systemError`
+after a terminal failure until the next turn starts. `TurnState.Status`
+preserves that value. The predicate does not classify the failure or prove
+settings, authority, queue or pending-request conditions. Cold, active, unknown
+and missing statuses, or a different or nonfailed latest turn, return false.
+
+`ContinueFailedTurn(ctx, threadID, text, stableID, actionContext,
+expectedFailedTurnID, options)` starts one visible, nonempty continuation turn.
+It first reconciles an exact accepted/submitting ledger identity, even after
+new work has changed the thread. A fresh submission requires an already-loaded
+thread with no active turn (`idle` or `systemError`), that exact latest failed
+turn, no pending requests, an empty native queue and no other unresolved
+submission. It never resumes, steers, starts a
+queue, updates settings or reapplies policy. Resume could release saved queues
+or goals, so it cannot be used to repair a failed continuation preflight.
+
+The application must prove the failed turn's effective settings and unchanged
+loaded instructions, MCP binding, execution policy, provider and collaboration
+mode. Explicit model, effort and additional context accompany `turn/start`;
+`ThreadPolicy` participates in the immutable ledger identity without being
+reapplied. Bind the expected failed turn and settings-provenance digest into a
+unique action context. Retain the exact context, text, stable ID and options
+across restart and reconciliation. Missing proof keeps the task manual.
+
+Submission uses the existing schema-3 ledger. An atomic prepared-to-submitting
+claim grants only one cooperating same-ID caller permission to send. Uncertain
+outcomes retain `UnknownSendOutcomeError` and can only reconcile the same ID;
+absence from a history read does not authorize another submission. Native
+acceptance can precede visibility in paginated history. A missing input during
+reconciliation keeps a submitting attempt uncertain. Reconciliation must keep
+the same immutable identity and must not issue a new submission. A preflight
+that loses admission can leave a prepared attempt, which the owner may retire
+with `DiscardPreparedSendWithOptions` after proving it was never submitted.
+
+The per-client queue mutex serializes local sends and queue mutations. Every
+managed writer must additionally hold the application's shared admission fence
+across the entire dispatch. The native `turn/start` protocol has no expected-turn
+compare-and-start field. In Codex 0.163.0, a direct `turn/start` can join an
+active regular turn and apply supplied settings overrides. `SendReceipt.Steered`
+describes the client's chosen RPC path; false does not prove that native
+declined implicit steering. This library provides no atomic exclusion or
+unchanged-settings guarantee against unmanaged direct native writers.
+Continuation does not replay original input or tools, and cannot guarantee
+exactly-once external effects from an interrupted task.
+
+`ReadTurnContext(ctx, threadID, turnID)` supplies trusted Go callers with the
+exact execution context from a native Codex 0.163.0 rollout. It verifies the
+native session identity and canonical directory, matches `turn_id`, and returns
+model, effort, collaboration mode, approval/sandbox policy, approval reviewer
+and optional permission profile. Policy JSON uses the native snake-case layout,
+including `danger-full-access`, and is validated against supported pinned shapes.
+This projection excludes prompts, developer instructions, provider and MCP data;
+it is not an HTTP endpoint or a complete source of authorization.
+
+The reader shares the rollout-file boundary and record scanner used for display
+metadata. It scans a fixed file snapshot with cancellation and a 64 MiB record
+limit, so a long turn's context can be found before the display suffix. Memory
+is bounded by one record. Missing, conflicting, incomplete, unsupported,
+replaced, truncated or concurrently changing context fails closed. A partial
+append or changing file may become readable on a later observation. Foreign
+inherited contexts before the target session's metadata cannot prove execution.
+Consumers must correlate the exact managed message ID/content with that turn
+and combine this context with their saved authorized loaded binding. Enqueue-time
+defaults and queue disappearance alone cannot prove execution settings. Native
+format compatibility must be checked when changing the deployed Codex version.
+
 `Client.CompactAcceptedSendOptions(contextPrefix)` removes stored original
 `TurnOptions` only from accepted send attempts whose application-owned action
 context starts with that nonempty prefix. It keeps each message digest, action

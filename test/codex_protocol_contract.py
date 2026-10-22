@@ -343,6 +343,11 @@ call_pattern = re.compile(
     r'\b(?:Request|historyRequest|requestConnected|requestConnectedGeneration|requestOn|request)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
     re.DOTALL,
 )
+client_requests.extend([
+    request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
+    request("thread/turns/list", {"threadId": "thread-1", "limit": 1, "sortDirection": "desc", "itemsView": "notLoaded"}),
+    request("turn/start", {"threadId": "thread-1", "input": text_input, "clientUserMessageId": "stable-retry", "model": "gpt-6.1-sol", "effort": "xhigh"}),
+])
 implemented_calls = Counter(call_pattern.findall(client_source))
 covered_calls = Counter(message["method"] for message in client_requests)
 if implemented_calls != covered_calls:
@@ -609,6 +614,10 @@ thread = {
     "updatedAt": 1,
 }
 turn = {"id": "turn-1", "items": [], "status": "completed"}
+for failure_code in ("serverOverloaded", "cyberPolicy"):
+    failed_turn = {**turn, "status": "failed", "error": {"message": "synthetic terminal failure", "codexErrorInfo": failure_code}}
+    validate("v2/ThreadTurnsListResponse.json", {"data": [failed_turn], "nextCursor": None}, "exact terminal failure " + failure_code)
+    require_declared_property("v2/ThreadTurnsListResponse.json", "TurnError", "codexErrorInfo", "terminal failure discriminator")
 command_item = {
     "id": "item-command",
     "type": "commandExecution",
@@ -707,6 +716,25 @@ validate(
     "thread/loaded/list pagination params",
 )
 validate("v2/ThreadReadResponse.json", {"thread": thread}, "thread/read result")
+# Retry admission depends on the exact raw native loaded-status vocabulary.
+# systemError is a status flag, separate from the latest turn's failure code.
+status_schema = json.loads((SCHEMA_DIR / "v2/ThreadReadResponse.json").read_text())
+status_variants = status_schema["definitions"]["ThreadStatus"]["oneOf"]
+status_types = [variant["properties"]["type"]["enum"] for variant in status_variants]
+if sorted(status_types) != [["active"], ["idle"], ["notLoaded"], ["systemError"]]:
+    raise SystemExit(f"native ThreadStatus variants changed: {status_types}")
+active_status = next(v for v in status_variants if v["properties"]["type"]["enum"] == ["active"])
+if "activeFlags" not in active_status["required"]:
+    raise SystemExit("native active ThreadStatus no longer requires activeFlags")
+active_flags = status_schema["definitions"]["ThreadActiveFlag"]["enum"]
+if sorted(active_flags) != ["waitingOnApproval", "waitingOnUserInput"]:
+    raise SystemExit(f"native active flags changed: {active_flags}")
+for raw_status in [
+    {"type": "notLoaded"}, {"type": "idle"}, {"type": "systemError"},
+    {"type": "active", "activeFlags": []},
+    {"type": "active", "activeFlags": active_flags},
+]:
+    validate("v2/ThreadReadResponse.json", {"thread": {**thread, "status": raw_status}}, "raw thread status " + raw_status["type"])
 validate(
     "v2/ThreadTurnsListResponse.json",
     {"data": [transcript_turn]},
