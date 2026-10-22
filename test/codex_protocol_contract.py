@@ -962,6 +962,40 @@ validate("ServerNotification.json", {"method": "turn/started", "params": early_s
 validate("v2/TurnCompletedNotification.json", finished, "ephemeral successful completion")
 require_fields("v2/TurnCompletedNotification.json", finished,
                [("threadId",), ("turn", "id"), ("turn", "status"), ("turn", "items")], "ephemeral successful completion")
+utility_error = {"message": "synthetic provider failure", "codexErrorInfo": "serverOverloaded"}
+for will_retry in (True, False):
+    error_notification = {"threadId": "utility-thread", "turnId": "utility-turn",
+                          "willRetry": will_retry, "error": utility_error}
+    validate("v2/ErrorNotification.json", error_notification, "ephemeral native retry disposition")
+    validate("ServerNotification.json", {"method": "error", "params": error_notification}, "ephemeral error notification")
+    require_fields("v2/ErrorNotification.json", error_notification,
+                   [("threadId",), ("turnId",), ("willRetry",), ("error",), ("error", "message")],
+                   "ephemeral retry identity and disposition")
+error_schema = json.loads((SCHEMA_DIR / "v2/ErrorNotification.json").read_text())
+if error_schema["properties"]["willRetry"] != {"type": "boolean"}:
+    raise SystemExit("ephemeral willRetry must be boolean")
+info_variants = error_schema["definitions"]["CodexErrorInfo"]["anyOf"]
+for kind in ("serverOverloaded", "internalServerError"):
+    if not any(kind in variant.get("enum", []) for variant in info_variants):
+        raise SystemExit(f"ephemeral transient error classification missing: {kind}")
+for kind in ("httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts"):
+    variant = next((variant["properties"][kind] for variant in info_variants if kind in variant.get("properties", {})), None)
+    if variant is None or variant.get("properties", {}).get("httpStatusCode", {}).get("format") != "uint16":
+        raise SystemExit(f"ephemeral transport classification differs: {kind}")
+    for status in (None, 408, 500, 502, 503, 504, 401, 429):
+        failure = {"message": "synthetic provider failure", "codexErrorInfo": {kind: {"httpStatusCode": status}}}
+        validate("v2/ErrorNotification.json", {"threadId": "utility-thread", "turnId": "utility-turn", "willRetry": False, "error": failure},
+                 "ephemeral typed terminal error")
+        for terminal_status in ("failed", "interrupted"):
+            validate("v2/TurnCompletedNotification.json", {"threadId": "utility-thread", "turn": {
+                "id": "utility-turn", "status": terminal_status, "items": [], "error": failure,
+            }}, "ephemeral stopped execution proof")
+# Optional classifications remain optional; unknown variants are valid but never
+# acquire fresh-retry eligibility merely because the schema is open-ended.
+for failure in ({"message": "synthetic"}, {"message": "synthetic", "codexErrorInfo": None},
+                {"message": "synthetic", "codexErrorInfo": {"futureError": {}}}):
+    validate("v2/ErrorNotification.json", {"threadId": "utility-thread", "turnId": "utility-turn", "willRetry": True, "error": failure},
+             "ephemeral optional or future classification")
 utility_catalog = "/private/package/codex-models.json"
 validate("v2/ConfigReadResponse.json", {
     "config": {"model_catalog_json": utility_catalog, "mcp_servers": {"literal.name": {"command": "synthetic"}}},

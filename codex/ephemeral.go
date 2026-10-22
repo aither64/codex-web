@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,23 @@ var (
 	ErrEphemeralProtocol  = errors.New("ephemeral utility protocol failed")
 	ErrEphemeralServer    = errors.New("ephemeral utility server failed")
 )
+
+// CanRetryEphemeralTurn reports whether a failed utility call proved a transient
+// failure, stopped execution and successful cleanup. It does not start a retry
+// or supply a new deadline. Bare error categories do not carry this proof.
+func CanRetryEphemeralTurn(err error) bool {
+	var failure *ephemeralRetryError
+	return errors.As(err, &failure) && failure != nil && failure.retryable &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+type ephemeralRetryError struct {
+	category  error
+	retryable bool
+}
+
+func (e *ephemeralRetryError) Error() string { return e.category.Error() }
+func (e *ephemeralRetryError) Unwrap() error { return e.category }
 
 // EphemeralInstructionFileContent is the exact private file content required by
 // RunEphemeralTurn. The pinned server loads both instruction files even when
@@ -114,6 +132,7 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 	private.ephemeral = sink
 	var generation uint64
 	var threadID, turnID string
+	var threadIssued, dialTransient bool
 	defer func() {
 		// Cancellation cannot extend the original deadline. Cleanup does not run in
 		// a detached goroutine and never reconnects a lost private connection.
@@ -123,6 +142,7 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 		}
 		cleanup, stop := context.WithDeadline(context.WithoutCancel(ctx), cleanupDeadline)
 		defer stop()
+		cleanupOK := !threadIssued
 		if generation != 0 && threadID != "" && cleanup.Err() == nil {
 			if ownedTurn := sink.cleanupTurn(generation, threadID, turnID); err != nil && ownedTurn != "" {
 				_ = private.requestConnectedGeneration(cleanup, generation, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": ownedTurn}, nil)
@@ -131,7 +151,8 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 				Status string `json:"status"`
 			}
 			cleanupErr := private.requestConnectedGeneration(cleanup, generation, "thread/unsubscribe", map[string]any{"threadId": threadID}, &unsubscribe)
-			if err == nil && (cleanupErr != nil || (unsubscribe.Status != "unsubscribed" && unsubscribe.Status != "notSubscribed" && unsubscribe.Status != "notLoaded")) {
+			cleanupOK = cleanupErr == nil && (unsubscribe.Status == "unsubscribed" || unsubscribe.Status == "notSubscribed" || unsubscribe.Status == "notLoaded")
+			if err == nil && !cleanupOK {
 				result, err = EphemeralTurnResult{}, ErrEphemeralServer
 			}
 		}
@@ -140,9 +161,13 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 				result, err = EphemeralTurnResult{}, failed
 			}
 		}
+		retryable := cleanupOK && errors.Is(err, ErrEphemeralServer) &&
+			(dialTransient || sink.canRetry(generation, threadID, turnID))
 		private.Close()
 		if ctx.Err() != nil {
 			result, err = EphemeralTurnResult{}, ctx.Err()
+		} else if retryable {
+			err = &ephemeralRetryError{category: err, retryable: true}
 		}
 	}()
 	failure := func(category error) error {
@@ -157,7 +182,12 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 		}
 		return category
 	}
-	if private.Ensure(inference) != nil {
+	if connectErr := private.Ensure(inference); connectErr != nil {
+		// Only a typed dial failure qualifies before any thread/start is issued.
+		// Initialization refusals, missing sockets and arbitrary messages do not.
+		var dial *net.OpError
+		dialTransient = errors.As(connectErr, &dial) && dial.Op == "dial" &&
+			(errors.Is(dial, syscall.ECONNREFUSED) || errors.Is(dial, syscall.ECONNRESET) || errors.Is(dial, syscall.ETIMEDOUT))
 		return result, failure(ErrEphemeralServer)
 	}
 	private.connectionMu.Lock()
@@ -255,6 +285,7 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 	if opts.ModelProvider != "" {
 		startParams["modelProvider"] = opts.ModelProvider
 	}
+	threadIssued = true
 	if private.requestConnectedGeneration(inference, generation, "thread/start", startParams, &started) != nil {
 		return result, failure(ErrEphemeralServer)
 	}
@@ -642,10 +673,14 @@ type ephemeralSink struct {
 	eventCount, bytes  int
 	finalID, finalText string
 	completed          bool
+	terminalFailure    bool
+	transient          bool
+	settled            bool
 }
 
 func (s *ephemeralSink) fail(err error) {
 	s.mu.Lock()
+	s.transient = false
 	if s.err == nil {
 		s.err = err
 		s.cancel()
@@ -738,10 +773,6 @@ func (s *ephemeralSink) handle(c *Client, connection *websocket.Conn, generation
 		s.fail(ErrEphemeralIsolation)
 		return true
 	}
-	if message.Method == "error" {
-		s.fail(ErrEphemeralServer)
-		return true
-	}
 	// One issued turn on this new private thread may identify itself before its
 	// RPC response. Such an ID authorizes interruption only, never success.
 	if message.Method == "turn/started" || message.Method == "turn/completed" || message.Method == "item/started" || message.Method == "item/completed" {
@@ -772,11 +803,11 @@ func (s *ephemeralSink) handle(c *Client, connection *websocket.Conn, generation
 			return true
 		}
 	}
-	if message.Method != "item/completed" && message.Method != "turn/completed" {
+	if message.Method != "item/completed" && message.Method != "turn/completed" && message.Method != "error" {
 		return true
 	}
 	s.mu.Lock()
-	if s.err == nil {
+	if !s.rejectErrorLocked(message) && s.err == nil {
 		if s.threadID == "" || s.turnID == "" {
 			if len(s.events) >= 32 {
 				s.err = ErrEphemeralProtocol
@@ -834,6 +865,9 @@ func (s *ephemeralSink) cleanupTurn(generation uint64, threadID, responseTurnID 
 	if s.cleanupAmbiguous || !s.turnIssued || s.generation != generation || s.threadID != threadID {
 		return ""
 	}
+	if s.settled && s.turnID != "" {
+		return ""
+	}
 	if responseTurnID != "" {
 		if s.cleanupTurnID != "" && s.cleanupTurnID != responseTurnID {
 			return ""
@@ -841,6 +875,42 @@ func (s *ephemeralSink) cleanupTurn(generation uint64, threadID, responseTurnID 
 		return responseTurnID
 	}
 	return s.cleanupTurnID
+}
+
+func (s *ephemeralSink) canRetry(generation uint64, threadID, turnID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transient && s.terminalFailure && s.settled && !s.cleanupAmbiguous &&
+		s.generation == generation && s.threadID == threadID && s.turnID == turnID && turnID != ""
+}
+
+func (s *ephemeralSink) rejectErrorLocked(message rpcMessage) bool {
+	if message.Method != "error" || (!s.settled && s.validErrorLocked(message)) {
+		return false
+	}
+	// Apply this before the error short circuit in both delivery and replay:
+	// terminal failure cannot hide later contradictory or malformed evidence.
+	s.transient = false
+	s.err = ErrEphemeralProtocol
+	s.cancel()
+	return true
+}
+
+// Error notifications never establish turn ownership. Validate early messages
+// now, then consume them only after the exact start response binds the turn.
+func (s *ephemeralSink) validErrorLocked(message rpcMessage) bool {
+	params, ok := ephemeralObject(message.Params)
+	threadID, threadOK := params["threadId"].(string)
+	turnID, turnOK := params["turnId"].(string)
+	_, retryOK := params["willRetry"].(bool)
+	_, errorOK := ephemeralTurnError(params["error"])
+	identityOK := threadOK && turnOK && ephemeralID(threadID) && ephemeralID(turnID) && s.turnIssued &&
+		threadID == s.threadID && (s.turnID == "" || turnID == s.turnID) &&
+		(s.cleanupTurnID == "" || turnID == s.cleanupTurnID)
+	if !identityOK {
+		s.cleanupAmbiguous = true
+	}
+	return ok && identityOK && retryOK && errorOK
 }
 
 func (s *ephemeralSink) noteCleanupIdentityLocked(message rpcMessage) {
@@ -877,13 +947,27 @@ func (s *ephemeralSink) noteCleanupIdentityLocked(message rpcMessage) {
 }
 
 func (s *ephemeralSink) consumeLocked(message rpcMessage) {
-	if s.err != nil {
+	if s.rejectErrorLocked(message) || s.err != nil {
 		return
 	}
 	params, ok := ephemeralObject(message.Params)
 	bad := func(category error) { s.err = category; s.cancel() }
 	if !ok || params["threadId"] != s.threadID {
 		bad(ErrEphemeralProtocol)
+		return
+	}
+	if message.Method == "error" {
+		if params["willRetry"] == true {
+			return
+		}
+		transient, _ := ephemeralTurnError(params["error"])
+		if s.terminalFailure {
+			transient = transient && s.transient
+		}
+		s.terminalFailure, s.transient = true, transient
+		if !transient {
+			bad(ErrEphemeralServer)
+		}
 		return
 	}
 	if message.Method == "item/completed" {
@@ -903,10 +987,6 @@ func (s *ephemeralSink) consumeLocked(message rpcMessage) {
 			bad(ErrEphemeralProtocol)
 			return
 		}
-		if turn["status"] != "completed" {
-			bad(ErrEphemeralServer)
-			return
-		}
 		items, ok := turn["items"].([]any)
 		if !ok {
 			bad(ErrEphemeralProtocol)
@@ -919,12 +999,116 @@ func (s *ephemeralSink) consumeLocked(message rpcMessage) {
 				return
 			}
 			s.itemLocked(item)
+			if s.err != nil {
+				return
+			}
+		}
+		switch turn["status"] {
+		case "failed", "interrupted":
+			transient := false
+			if failure := turn["error"]; failure != nil {
+				var valid bool
+				transient, valid = ephemeralTurnError(failure)
+				if !valid {
+					bad(ErrEphemeralProtocol)
+					return
+				}
+				if s.terminalFailure {
+					transient = transient && s.transient
+				}
+			} else if s.terminalFailure {
+				transient = s.transient
+			}
+			s.terminalFailure, s.transient, s.settled = true, transient, true
+			bad(ErrEphemeralServer)
+			return
+		case "completed":
+			s.settled = true
+			if s.terminalFailure {
+				s.transient = false
+				bad(ErrEphemeralServer)
+				return
+			}
+		default:
+			bad(ErrEphemeralProtocol)
+			return
 		}
 		if s.completed {
 			bad(ErrEphemeralProtocol)
 			return
 		}
 		s.completed = true
+	}
+}
+
+// Decode only the pinned public error shape. Unknown classifications are valid
+// but conservative; diagnostics never enter error metadata or text matching.
+func ephemeralTurnError(value any) (transient, valid bool) {
+	failure, ok := value.(map[string]any)
+	if !ok {
+		return false, false
+	}
+	if _, ok := failure["message"].(string); !ok {
+		return false, false
+	}
+	if details := failure["additionalDetails"]; details != nil {
+		if _, ok := details.(string); !ok {
+			return false, false
+		}
+	}
+	if details := failure["misalignment"]; details != nil {
+		misalignment, ok := details.(map[string]any)
+		if !ok {
+			return false, false
+		}
+		for _, key := range []string{"detailedExplanation", "errorType", "reviewTarget"} {
+			if value := misalignment[key]; value != nil {
+				if _, ok := value.(string); !ok {
+					return false, false
+				}
+			}
+		}
+		if steer := misalignment["steer"]; steer != nil {
+			object, ok := steer.(map[string]any)
+			if !ok {
+				return false, false
+			}
+			if _, ok := object["message"].(string); !ok {
+				return false, false
+			}
+		}
+	}
+	switch info := failure["codexErrorInfo"].(type) {
+	case nil:
+		return false, true
+	case string:
+		return info == "serverOverloaded" || info == "internalServerError", true
+	case map[string]any:
+		for _, key := range []string{"httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts"} {
+			value, exists := info[key]
+			if !exists {
+				continue
+			}
+			fields, ok := value.(map[string]any)
+			if !ok || len(info) != 1 {
+				return false, false
+			}
+			if status := fields["httpStatusCode"]; status != nil {
+				number, ok := status.(json.Number)
+				if !ok {
+					return false, false
+				}
+				code, err := number.Int64()
+				if err != nil || code < 0 || code > 65535 {
+					return false, false
+				}
+				return code == 408 || code == 500 || code == 502 || code == 503 || code == 504, true
+			}
+			return key != "responseTooManyFailedAttempts", true
+		}
+		return false, true
+	default:
+		return false, false
 	}
 }
 func (s *ephemeralSink) itemLocked(item map[string]any) {

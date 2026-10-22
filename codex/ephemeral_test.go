@@ -54,15 +54,17 @@ func ephemeralTestOptions(t *testing.T) EphemeralTurnOptions {
 }
 
 type ephemeralFake struct {
-	mu           sync.Mutex
-	calls        []map[string]any
-	config       any
-	requirements any
-	models       any
-	start        func(map[string]any)
-	turn         func(*websocket.Conn, map[string]any) error
-	stopAt       string
-	delayAt      string
+	mu                sync.Mutex
+	calls             []map[string]any
+	config            any
+	requirements      any
+	models            any
+	unsubscribe       any
+	beforeUnsubscribe func(*websocket.Conn) error
+	start             func(map[string]any)
+	turn              func(*websocket.Conn, map[string]any) error
+	stopAt            string
+	delayAt           string
 }
 
 func (f *ephemeralFake) snapshot() []map[string]any {
@@ -131,7 +133,15 @@ func (f *ephemeralFake) serve(t *testing.T) string {
 			case "turn/interrupt":
 				result = map[string]any{}
 			case "thread/unsubscribe":
+				if f.beforeUnsubscribe != nil {
+					if err := f.beforeUnsubscribe(connection); err != nil {
+						return err
+					}
+				}
 				result = map[string]any{"status": "unsubscribed"}
+				if f.unsubscribe != nil {
+					result = f.unsubscribe
+				}
 			case "account/rateLimits/read":
 				result = map[string]any{"rateLimits": map[string]any{}}
 			default:
