@@ -146,3 +146,55 @@
 .codex-retry-controls[hidden] { display: none; }
 .codex-retry-controls label { display: inline-flex; align-items: center; gap: .35rem; }
 .codex-retry-controls [role="status"] { flex: 1 1 18rem; }
+.codex-retry-activity[hidden] { display: none !important; }
+.codex-retry-activity { margin: 0; min-width: 0; }
+.codex-retry-activity-notice {
+  display: grid;
+  gap: .5rem;
+  margin: .75rem 0 0;
+  padding: .8rem 1rem;
+  border: 1px solid var(--codex-border, light-dark(#ccd2da, #414b59));
+  border-left: 3px solid var(--codex-accent, light-dark(#547aa5, #86add8));
+  border-radius: .5rem;
+  background: var(--codex-surface, light-dark(#f7f9fb, #1b222c));
+  color: inherit;
+  font: inherit;
+  font-size: .875rem;
+  overflow-wrap: anywhere;
+}
+.codex-retry-activity-title { font-weight: 600; }
+.codex-retry-activity-metrics, .codex-retry-activity-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .4rem 1rem;
+}
+.codex-retry-activity-metrics { color: var(--codex-muted, light-dark(#53647a, #a8b7ca)); }
+.codex-retry-activity-actions { gap: .5rem; }
+.codex-retry-activity-actions button {
+  min-height: 2rem;
+  padding: .3rem .65rem;
+  border: 1px solid var(--codex-border, light-dark(#ccd2da, #414b59));
+  border-radius: .35rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.codex-retry-activity-actions button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.codex-retry-activity-actions button:disabled { opacity: .6; cursor: default; }
+.codex-retry-activity-actions button[hidden], .codex-retry-activity-notice [hidden] { display: none !important; }
+.codex-retry-activity-announcement {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+@media (max-width: 480px) {
+  .codex-retry-activity-notice { padding: .7rem .75rem; }
+  .codex-retry-activity-metrics { gap: .3rem .75rem; }
+  .codex-retry-activity-actions button { min-height: 2.5rem; }
+}

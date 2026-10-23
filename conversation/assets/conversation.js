@@ -7,6 +7,7 @@ export {createConversationSync, renderConnectionStatus, connectionMessage} from 
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {mountRetryControls} from "./retry.js?v=1";
 export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
+export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=1";
 import {createAsyncQuestions} from "./questions.js?v=3";
 export {createAsyncQuestions, asyncQuestionReply} from "./questions.js?v=3";
 export {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
@@ -285,6 +286,9 @@ export function createConversationClient(options) {
     retry: (options) => read("retry", options),
     setRetryEnabled: (enabled) => request("retry/enabled", {method: "POST", body: JSON.stringify({enabled})}),
     cancelRetry: () => request("retry/cancel", {method: "POST", body: "{}"}),
+    retryActivity: (options) => read("retry/activity", options),
+    retryNow: (token) => request("retry/now", {method: "POST", body: JSON.stringify({token})}),
+    stopRetry: (token) => request("retry/stop", {method: "POST", body: JSON.stringify({token})}),
     pending: async (options) => (await read("pending", options)) || [],
     models: async (options) => (await read("models", options)) || [],
     modes: async (options) => (await read("collaboration-modes", options)) || [],

@@ -111,6 +111,7 @@ The handler serves `conversation.js`, `conversation.css`, and, when enabled,
 the upload assets below its base path. Import one of these browser APIs:
 
 - `mountConversation()` for the complete framework-free conversation UI;
+- `mountRetryActivity()` for an optional retry-chain notice in a custom transcript;
 - `createConversationClient()` for the HTTP API;
 - `createDurableSender()` for retry-safe message submission;
 - `createConversationSync()` for a custom synchronized interface.

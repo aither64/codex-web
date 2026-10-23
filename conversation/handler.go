@@ -35,23 +35,24 @@ var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var pageCursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32}$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
-//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js assets/questions.js assets/citations.js assets/retry.js
+//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js assets/questions.js assets/citations.js assets/retry.js assets/retry_activity.js
 var assetFiles embed.FS
 
 // Capabilities grants an opaque conversation ID access to individual
 // operations. Applications should grant only the operations their own policy
 // allows for the current request.
 type Capabilities struct {
-	Read        bool
-	Pending     bool
-	QueueRead   bool
-	Send        bool
-	Queue       bool
-	Interrupt   bool
-	Settings    bool
-	Respond     bool
-	EventStream bool
-	Retry       bool
+	Read          bool
+	Pending       bool
+	QueueRead     bool
+	Send          bool
+	Queue         bool
+	Interrupt     bool
+	Settings      bool
+	Respond       bool
+	EventStream   bool
+	Retry         bool
+	RetryActivity bool
 }
 
 // Client is the App Server behavior used by Handler. *codex.Client implements
@@ -121,6 +122,7 @@ type Target struct {
 	ModelCatalog        func(context.Context) ([]codex.Model, error)
 	Activity            ActivityProvider
 	Retry               RetryProvider
+	RetryActivity       RetryActivityProvider
 	ThreadID            string
 	Directory           string
 	Capabilities        Capabilities
@@ -368,6 +370,8 @@ func (handler *Handler) serveOperation(
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	ctx := request.Context()
 	switch operation {
+	case "retry/activity", "retry/now", "retry/stop":
+		handler.retryActivity(response, request, target, operation)
 	case "retry", "retry/enabled", "retry/cancel":
 		handler.retry(response, request, target, operation)
 	case "thread/page":

@@ -667,6 +667,72 @@ Use the existing Stop control to interrupt a running turn. Re-enabling must
 consume the current failure as a baseline instead of reviving it. These semantics
 are enforced by the application provider, independently of an open browser tab.
 
+### Optional retry activity notice
+
+`Target.RetryActivity RetryActivityProvider` and `Capabilities.RetryActivity`
+enable a separate optional activity API. The required `Client` interface and
+the existing `RetryProvider` controls remain unchanged. The trusted resolver
+selects the provider and thread for every request. `GET retry/activity` reads
+the current or latest chain; `POST retry/now` and `POST retry/stop` each accept
+only `{ "token": "..." }`. POST retains exact-origin checks, payload bounds
+and the common mutation lock. Tokens compare server-owned action identities;
+they grant no authorization. The provider owns admission, durable cancellation
+and scheduling. Reads must not start work. Retry now accelerates the saved
+scheduled attempt; Stop retrying stops this chain without changing preferences
+or interrupting a running turn. Neither action retracts an accepted request.
+
+`RetryActivityStatus` contains `serverNowMs` and a nullable `activity`. Null means
+there is no notice. Activity contains `chainKey`, `class`, `phase`,
+`confirmedStarts`, `unconfirmed`, `countQuality`, `startedAtMs`, `elapsedMs`,
+`timingQuality`, `finishedAtMs`, `nextAttemptAtMs`, `outcome`, `reason`,
+`retryNowToken` and `stopToken`. Classes are `capacity` or `cybersecurity`;
+phases are `scheduled`, `submitting`, `reconciling`, `running` or `terminal`.
+Terminal outcomes are `success`, `stopped`, `exhausted`, `superseded` or
+`blocked`. Times are Unix milliseconds and elapsed time is milliseconds.
+Metrics are nonnegative safe JSON integers. An unavailable count is null;
+unavailable timing has null start and elapsed values. Quality is `exact`,
+`partial` or `unavailable`. `confirmedStarts` counts confirmed native starts,
+while `unconfirmed` separately records zero or one uncertain submission.
+Preparation, polls and clicks are not confirmed starts. Missing historical
+metrics must remain partial or unavailable. Terminal elapsed time is frozen.
+Reasons must be safe public text within 1024 UTF-8 bytes; raw native data,
+prompts and execution options do not belong in this DTO. Opaque chain keys and
+action tokens contain 1 to 256 ASCII letters, digits, underscores or hyphens.
+An empty action token means that control is unavailable.
+
+Provider errors use `RetryActivityError{Code: ...}` with `RetryActionStale` or
+`RetryReloadRequired` (HTTP 409), or `RetryActivityUnavailable` (HTTP 503).
+Unknown provider failures return a fixed unavailable response without exposing
+their diagnostics. Stale actions require a fresh observation; reload-required
+responses require a page reload. Clients must never fall back to Send.
+
+`createConversationClient()` supplies `retryActivity()`, `retryNow(token)` and
+`stopRetry(token)`. Mount `mountRetryActivity(footer, {client, conversationKey})`
+explicitly; the returned controller provides `refresh()` and `destroy()`.
+The footer belongs inside the application's transcript viewport, after its
+message list and above the composer. The renderer owns only footer children;
+the host retains message rendering, scrolling and anchors. Include
+`conversation.css`. A hidden or dismissed notice reserves no height or margin.
+The legacy `mountConversation()` retry controls are configured separately.
+
+The notice retains confirmed counts and elapsed time during a running retry,
+shows an uncertain start separately, and labels partial or unavailable metrics.
+Countdown and exact active elapsed time use server observations plus monotonic
+browser time. Terminal elapsed time stays frozen. Countdown ticks do not create
+submissions or repeated screen-reader announcements. Visible notices poll and
+refresh on focus/restoration; hidden pages suspend reads and timers. Refreshes
+coalesce, and destroyed controllers ignore late responses. A lost action reply
+triggers a read without repeating the POST. Destroy the controller before
+mounting a different conversation.
+
+Dismissal is browser-local, keyed by the exact conversation and chain pair.
+Each dismissed result remains hidden independently, including after another
+chain is dismissed or an older observation arrives. Reload preserves dismissal
+when localStorage is available. If storage fails, dismissal still works for
+this page, including conversation remounts. A new chain or different
+conversation remains independent.
+Dismissal performs no backend operation or preference change.
+
 `submissionFailurePresentation(error)` returns `{message, uncertain}` for inline
 delivery errors. Only explicit `error.notSent === true` establishes an unsent
 message. Transport failures, HTTP 502/503/504, aborts and unknown errors remain
