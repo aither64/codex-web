@@ -579,6 +579,7 @@ class MemoryStorage {
       }
     }
     addEventListener(name, listener) { this.listeners.set(name, listener); }
+    click() { if (!this.disabled) this.listeners.get("click")?.(); }
     showModal() { this.open = true; }
     close() { this.open = false; this.listeners.get("close")?.(); }
     descendants() { return [this, ...this.children.flatMap((child) => child.descendants())]; }
@@ -1274,6 +1275,25 @@ class MemoryStorage {
     globalThis.document = pendingClockDocument; Date.now = pendingClockNow;
     globalThis.setTimeout = pendingClockLater; globalThis.clearTimeout = pendingClockClear;
   }
+
+  // The pending JSON editor uses the same action for Enter and button clicks.
+  const keyboardRoot = new FakeElement("main"), keyboardResponses = [];
+  let releaseKeyboard;
+  const disposeKeyboard = mountConversation(keyboardRoot,{id:"answer-keys",client:{
+    thread:async()=>({threadId:"answer-thread",status:"active",entries:[]}),
+    pending:async()=>[{id:"request",kind:"userInput",token:"exact-offer",questions:[{id:"required"},{id:"optional"}]}],
+    respond:(id,value)=>{keyboardResponses.push({id,value});return new Promise(resolve=>{releaseKeyboard=resolve;});},
+  },capabilities:{send:false,queueRead:false,queue:false,interrupt:false,settings:false,respond:true,eventStream:false}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const answerJSON=keyboardRoot.descendants().find(node=>node.attributes["aria-label"]==="Answers as JSON");
+  const answerButton=keyboardRoot.descendants().find(node=>node.textContent==="Submit answers");
+  const answerKey=extra=>{let prevented=false;answerJSON.listeners.get("keydown")({key:"Enter",...extra,preventDefault(){prevented=true;}});return prevented;};
+  answerJSON.value="invalid json";assert.equal(answerKey(),true);assert.equal(keyboardResponses.length,0,"JSON validation still owns submission");
+  const completeAnswers={required:{answers:["Answer"]},optional:{answers:[]}};answerJSON.value=JSON.stringify(completeAnswers);
+  assert.equal(answerKey({shiftKey:true}),false);assert.equal(answerKey({repeat:true}),true);assert.equal(keyboardResponses.length,0);
+  answerKey();assert.deepEqual(keyboardResponses,[{id:"request",value:{token:"exact-offer",answers:completeAnswers}}]);
+  answerKey({repeat:true});assert.equal(keyboardResponses.length,1);releaseKeyboard();await new Promise(resolve=>setImmediate(resolve));
+  answerButton.click();assert.equal(keyboardResponses.length,2,"button path is unchanged");releaseKeyboard();await new Promise(resolve=>setImmediate(resolve));disposeKeyboard();
 
   const timeoutRoot = new FakeElement("main");
   const disposeTimeout = mountConversation(timeoutRoot,{id:"timeouts",client:{

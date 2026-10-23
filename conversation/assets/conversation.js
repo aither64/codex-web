@@ -8,8 +8,8 @@ import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {mountRetryControls} from "./retry.js?v=1";
 export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
 export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=1";
-import {createAsyncQuestions} from "./questions.js?v=3";
-export {createAsyncQuestions, asyncQuestionReply} from "./questions.js?v=3";
+import {createAsyncQuestions, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
+export {createAsyncQuestions, asyncQuestionReply, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
 export {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 
 const defaultLabels = {
@@ -1151,6 +1151,7 @@ export function mountConversation(root, options) {
             status.textContent = error.message;
           }
         });
+        bindQuestionAnswerKeyboard(answer, submit);
         item.append(answer, submit);
         if (Number(entry.autoResolutionAtMs) > 0) {
           const snooze = createElement("button", {type: "button"}, "Snooze");

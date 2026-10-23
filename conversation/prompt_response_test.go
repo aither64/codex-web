@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/aither64/codex-web/codex"
@@ -18,6 +19,38 @@ type boundPromptClient struct {
 	response codex.PromptResponse
 	thread   string
 	err      error
+}
+
+func TestBoundPromptHTTPMultiQuestionAnswerContract(t *testing.T) {
+	for _, test := range []struct {
+		name, payload string
+		status        int
+	}{
+		{"complete with unanswered optional", `"answers":{"required":{"answers":["First","Details"]},"optional":{"answers":[]}}`, 200},
+		{"mixed action", `"answers":{"required":{"answers":["First"]}},"decision":"accept"`, 400},
+		{"malformed answer", `"answers":{"required":{"answers":"First"}}`, 400},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &boundPromptClient{}
+			handler := &Handler{maxBodyBytes: defaultMaxBodyBytes, logger: log.New(&bytes.Buffer{}, "", 0)}
+			request := httptest.NewRequest("POST", "/respond", bytes.NewBufferString(`{"id":"questions","token":"same-offer",`+test.payload+`}`))
+			response := httptest.NewRecorder()
+			handler.respond(response, request, Target{Client: client, ThreadID: "trusted-thread", Capabilities: Capabilities{Respond: true}})
+			if response.Code != test.status {
+				t.Fatalf("response: %d %s", response.Code, response.Body)
+			}
+			if test.status != 200 {
+				if client.response.ID != "" {
+					t.Fatal("invalid answers reached responder")
+				}
+				return
+			}
+			expected := map[string]map[string][]string{"required": {"answers": {"First", "Details"}}, "optional": {"answers": {}}}
+			if client.thread != "trusted-thread" || client.response.Token != "same-offer" || !reflect.DeepEqual(client.response.Answers, expected) {
+				t.Fatalf("changed answer tuple: %#v", client)
+			}
+		})
+	}
 }
 
 func (c *boundPromptClient) RespondPrompt(_ context.Context, thread string, response codex.PromptResponse) error {

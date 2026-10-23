@@ -18,6 +18,21 @@ const terminal = status => ["completed", "failed", "interrupted", "error"].inclu
 let nextViewId = 0;
 const answerText = (choice, note) => [choice, note].map(value => String(value || "").trim()).filter(Boolean).join("\n\n");
 
+// Activate the owning action so keyboard answers retain its validation and
+// delivery rules. Composition and modified shortcuts keep their native behavior.
+export function bindQuestionAnswerKeyboard(input, submit) {
+  let composing = false;
+  input.addEventListener("compositionstart", () => { composing = true; });
+  input.addEventListener("compositionend", () => { composing = false; });
+  input.addEventListener("keydown", event => {
+    if (event.defaultPrevented || event.key !== "Enter" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey ||
+        composing || event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    if (event.repeat || input.disabled || input.readOnly || input.hidden || submit.disabled || submit.hidden) return;
+    submit.click();
+  });
+}
+
 // One owner for inline and pinned controls. The normal composer has its own draft
 // and delivery records; question answers still use the ordinary message endpoint.
 export function createAsyncQuestions({storage, namespace, send, acknowledge,
@@ -209,6 +224,7 @@ export function createAsyncQuestions({storage, namespace, send, acknowledge,
     root.append(title, actions, input, footer, status);
     input.addEventListener("input", () => { updateDraft(draftFor(record).choice, input.value); });
     submit.addEventListener("click", () => { record.pinnedAction = pinned; void sendAnswer(record.id, record.state.draft); });
+    bindQuestionAnswerKeyboard(input, submit);
     retry.addEventListener("click", () => { record.pinnedAction = pinned; void sendAnswer(record.id, record.state.attempt?.answer); });
     dismiss.addEventListener("click", () => { record.pinnedAction = pinned; record.state.dismissed = true; save(record); pins.delete(record.id); emit(); });
     const view = {root, update: () => {

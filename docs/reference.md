@@ -278,7 +278,10 @@ above the composer. Suggested options use compact radio lists. Unedited question
 select the recommended option, or the first option when none is marked. Select
 an option and optionally add text, or choose **Other** for a custom answer. **Send answer**
 submits the selected label and text, separated by a blank line. Selecting an
-option does not send it. **Dismiss** removes a question from the panel without
+option does not send it. Enter in an answer textarea activates its existing
+submit action; Shift+Enter inserts a newline. IME composition, other modified
+shortcuts and option controls retain their normal behavior. Holding Enter does
+not submit another answer. **Dismiss** removes a question from the panel without
 sending a message. Turn completion and accepted ordinary follow-ups also clear
 the panel. Unanswered questions remain answerable from the original message;
 answered questions show the submitted answer. Drafts survive unpinning and
@@ -311,6 +314,12 @@ with the same identity. Canonical transcript replies reconcile other clients.
 Set `onPanelEmpty` to return focus to the embedding application's composer when
 the last focused question disappears. The callback does not run when focus is
 already elsewhere.
+
+Custom question textareas can use `bindQuestionAnswerKeyboard(input, submit)`
+with their owning submit button. The binding activates that button on plain
+Enter and preserves its validation and delivery path. The mounted pending-request
+JSON editor uses the same binding; JSON parsing and server answer validation
+still apply.
 
 Pending prompts expose an opaque `token` for each offer. Send that token with
 answers, decisions and snoozes through `RespondPrompt`; an expired offer returns

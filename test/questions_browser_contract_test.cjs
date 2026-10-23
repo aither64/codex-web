@@ -10,6 +10,78 @@ class Storage {
   setItem(key, value) { this.values.set(key, value); }
 }
 
+class QuestionElement extends EventTarget {
+  constructor(tag) { super(); this.tag=tag;this.children=[];this.dataset={};this.attributes={};this.value=""; }
+  setAttribute(name,value) { this.attributes[name]=String(value); }
+  removeAttribute(name) { delete this.attributes[name]; }
+  append(...nodes) { for(const node of nodes){node.remove();node.parentElement=this;this.children.push(node);} }
+  replaceChildren(...nodes) { for(const node of this.children)node.parentElement=null;this.children=[];this.append(...nodes); }
+  insertBefore(node,before) { node.remove();node.parentElement=this;const index=this.children.indexOf(before);this.children.splice(index<0?this.children.length:index,0,node); }
+  remove() { if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(node=>node!==this);this.parentElement=null; }
+  contains(node) { return this===node || this.children.some(child=>child.contains(node)); }
+  closest(selector) { return this.className===selector.slice(1)?this:this.parentElement?.closest(selector); }
+  descendants() { return [this,...this.children.flatMap(node=>node.descendants())]; }
+  querySelector(selector) {
+    if(selector==='section:not([hidden]) .codex-question-title')return this.children.find(node=>node.tag==='section'&&!node.hidden)?.querySelector('.codex-question-title');
+    return this.descendants().find(node=>node.className===selector.slice(1));
+  }
+  focus() { globalThis.document.activeElement=this; }
+  click() { if(!this.disabled)this.dispatchEvent(new Event('click')); }
+}
+const key = (input,extra={}) => {
+  const event=new Event('keydown',{cancelable:true});Object.assign(event,{key:'Enter',...extra});input.dispatchEvent(event);return event;
+};
+const settled = async () => { for(let i=0;i<12;i++)await Promise.resolve(); };
+
+test('question textarea keys preserve composition, modified shortcuts, held keys and control guards',async()=>{
+  const {bindQuestionAnswerKeyboard}=await load();const input=new QuestionElement('textarea'),submit=new QuestionElement('button');let calls=0;
+  submit.addEventListener('click',()=>calls++);bindQuestionAnswerKeyboard(input,submit);
+  input.value='Selected answer';input.selectionStart=2;input.selectionEnd=8;
+  for(const extra of [{key:'a'},{shiftKey:true},{altKey:true},{ctrlKey:true},{metaKey:true},{isComposing:true},{keyCode:229}])assert.equal(key(input,extra).defaultPrevented,false);
+  input.dispatchEvent(new Event('compositionstart'));assert.equal(key(input).defaultPrevented,false);input.dispatchEvent(new Event('compositionend'));
+  assert.equal(calls,0);assert.equal(key(input,{repeat:true}).defaultPrevented,true);assert.equal(calls,0);
+  for(const [control,property] of [[input,'disabled'],[input,'readOnly'],[input,'hidden'],[submit,'disabled'],[submit,'hidden']]){
+    control[property]=true;key(input);assert.equal(calls,0);control[property]=false;
+  }
+  const prevented=new Event('keydown',{cancelable:true});Object.assign(prevented,{key:'Enter'});prevented.preventDefault();input.dispatchEvent(prevented);assert.equal(calls,0);
+  assert.equal(key(input).defaultPrevented,true);assert.equal(calls,1);assert.equal(input.value,'Selected answer');assert.equal(input.selectionStart,2);assert.equal(input.selectionEnd,8);
+  submit.click();assert.equal(calls,2,'mouse and keyboard share the owning action');
+});
+
+test('inline and pinned Enter submit the existing optional answer once, preserving other questions and unknown recovery',async t=>{
+  const originalDocument=globalThis.document;t.after(()=>{globalThis.document=originalDocument;});
+  globalThis.document={createElement:tag=>new QuestionElement(tag),body:new QuestionElement('body')};
+  const {createAsyncQuestions}=await load();
+  for(const pinned of [false,true]) {
+    let release;const sends=[];const source=agent('keyboard-'+pinned),container=new QuestionElement('aside');
+    const controller=createAsyncQuestions({storage:new Storage(),namespace:'keyboard',randomUUID:()=> 'original-uuid',onChange:()=>{if(pinned)controller.renderPinned(container);},send:value=>{sends.push(value);return new Promise(resolve=>{release=resolve;});}});
+    controller.update(snapshot([source]));
+    if(pinned)container.children[0].click();else container.append(controller.inline(source));
+    const first=container.descendants().find(node=>node.className==='codex-async-question'),input=first.descendants().find(node=>node.tag==='textarea');
+    const radio=first.descendants().find(node=>node.type==='radio');key(radio);assert.equal(sends.length,0,'radio Enter remains untouched');
+    input.value='Extra details';input.dispatchEvent(new Event('input'));assert.equal(key(input,{shiftKey:true}).defaultPrevented,false);assert.equal(sends.length,0);
+    key(input);key(input,{repeat:true});key(input);await settled();assert.equal(sends.length,1);assert.equal(sends[0].id,'original-uuid');assert.equal(sends[0].retry,false);
+    const reply=JSON.parse(sends[0].message.split('\n')[1])[0];assert.equal(reply.answer,'One\n\nExtra details');assert.equal(reply.questionItemId,source.questions[0].id);
+    assert.equal(controller.state(source.questions[1].id).answer,undefined,'optional questions are independently answerable');
+    release();await settled();assert.equal(controller.state(source.questions[0].id).answer,'One\n\nExtra details');assert.deepEqual(controller.pending(),[source.questions[1].id]);
+    const failedSource=agent('uncertain-'+pinned);let failures=0;const uncertain=createAsyncQuestions({storage:new Storage(),namespace:'unknown',randomUUID:()=> 'uncertain-uuid',send:async()=>{failures++;throw Error('Lost reply');}});
+    uncertain.update(snapshot([failedSource]));const failedView=uncertain.inline(failedSource);const failedInput=failedView.descendants().find(node=>node.tag==='textarea');
+    key(failedInput);await settled();assert.equal(failures,1);assert.equal(failedInput.disabled,true);key(failedInput);assert.equal(failures,1,'Enter never retries an uncertain original');
+    assert.equal(uncertain.state(failedSource.questions[0].id).attempt.id,'uncertain-uuid');
+  }
+});
+
+test('optional empty free text and denied sending remain unsent while a selected option remains answerable',async t=>{
+  const originalDocument=globalThis.document;t.after(()=>{globalThis.document=originalDocument;});globalThis.document={createElement:tag=>new QuestionElement(tag)};
+  const {createAsyncQuestions}=await load();let allowed=true;const sends=[];const source=agent('free');source.questions[0].options=[];
+  const controller=createAsyncQuestions({storage:new Storage(),namespace:'free',randomUUID:()=> 'free-uuid',canSend:()=>allowed,send:async value=>sends.push(value)});controller.update(snapshot([source]));
+  const view=controller.inline(source),inputs=view.descendants().filter(node=>node.tag==='textarea');
+  key(inputs[0]);await settled();assert.equal(sends.length,0,'blank optional free text cannot send');
+  allowed=false;controller.update(snapshot([source]));inputs[0].value='Answer';inputs[0].dispatchEvent(new Event('input'));key(inputs[0]);await settled();assert.equal(sends.length,0);
+  allowed=true;controller.update(snapshot([source]));key(inputs[1]);await settled();assert.equal(sends.length,1,'selected option with no note remains a valid answer');
+  assert.equal(controller.state(source.questions[0].id).answer,undefined);
+});
+
 test("untouched drafts select the recommendation or first option without replacing saved answers", async () => {
   const {createAsyncQuestions} = await load();
   const cases = [
