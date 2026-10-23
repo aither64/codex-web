@@ -3047,6 +3047,31 @@ func (c *Client) RequireSubmissionAttemptsKnown(ctx context.Context, threadID st
 	return c.requireSubmissionAttempts(ctx, threadID, true)
 }
 
+// RequireSubmissionAttemptsKnownExceptPreparedSend excludes only an exact,
+// nonqueued prepared send while checking every other submission normally.
+// It does not authorize dispatch or any other change to the thread.
+func (c *Client) RequireSubmissionAttemptsKnownExceptPreparedSend(
+	ctx context.Context, threadID, text, clientID, actionContext string, options TurnOptions,
+) error {
+	normalized, err := normalizeTurnOptions(options)
+	if err != nil {
+		return err
+	}
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
+	prepared, err := c.isPreparedSendWithOptions(
+		threadID, text, clientID, actionContext, normalized.Digest,
+	)
+	if err != nil {
+		return err
+	}
+	if !prepared {
+		return errors.New("message has no exact unsubmitted preparation")
+	}
+	return c.requireSubmissionAttemptsExcept(ctx, threadID, true, clientID)
+}
+
 func (c *Client) requireSubmissionAttempts(ctx context.Context, threadID string, allowQueued bool) error {
 	return c.requireSubmissionAttemptsExcept(ctx, threadID, allowQueued, "")
 }
@@ -5218,6 +5243,39 @@ func (c *Client) PrepareSendWithOptions(
 	return c.recordSendAttemptWithOptions(
 		threadID, clientUserMessageID, text, context, steered, options,
 	)
+}
+
+// IsPreparedSendWithOptions reports whether the exact durable send is prepared
+// and has no queue attempt. It neither submits nor changes the preparation.
+func (c *Client) IsPreparedSendWithOptions(
+	threadID, text, clientID, actionContext string, options TurnOptions,
+) (bool, error) {
+	normalized, err := normalizeTurnOptions(options)
+	if err != nil {
+		return false, err
+	}
+	lock := c.queueUpdateLock(threadID)
+	lock.Lock()
+	defer lock.Unlock()
+	return c.isPreparedSendWithOptions(threadID, text, clientID, actionContext, normalized.Digest)
+}
+
+// The caller holds queueUpdateLock across this proof and any related checks.
+func (c *Client) isPreparedSendWithOptions(
+	threadID, text, clientID, actionContext, optionsDigest string,
+) (bool, error) {
+	return queueLedgerTransaction(c, func() (bool, error) {
+		attempt, found := c.sendAttempts[threadID][clientID]
+		if !found {
+			return false, nil
+		}
+		if attempt.Digest != queueTextDigest(text) || attempt.Context != actionContext ||
+			effectiveTurnOptionsDigest(attempt.OptionsDigest) != optionsDigest {
+			return false, errors.New("message identity was reused for another action")
+		}
+		_, queued := c.queueAttempts[threadID][clientID]
+		return attempt.State == "prepared" && !queued, nil
+	})
 }
 
 func (c *Client) SendAttempted(

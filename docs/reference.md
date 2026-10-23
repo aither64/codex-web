@@ -136,6 +136,22 @@ options identity; zero-option activity never writes `optionsDigest`, retaining
 schema-3 reader and rollback compatibility. Existing methods remain exact
 zero-option wrappers.
 
+`IsPreparedSendWithOptions` returns true only for an existing exact `prepared`
+send with no queue attempt. It checks the thread, client message ID, text,
+action context and original turn options without changing the ledger or stored
+steering intent. `SendAttemptedWithOptions` retains its existing meaning: a
+prepared record also counts as an existing attempt.
+
+`RequireSubmissionAttemptsKnownExceptPreparedSend` requires that same exact
+preparation and checks every other send, queue attempt and queue deletion under
+the existing rules. It holds the per-thread queue lock across both checks and
+excludes only the named prepared request. Missing preparation, a changed
+identity, accepted or submitting state, and a queue-owned request cannot grant
+this exception. Neither method submits, resumes, changes settings or proves
+application authority. Callers must keep their shared admission fence across
+the proof and any later capture or dispatch, preserving the original UUID,
+text, action context and options.
+
 ### Failed turns and exact execution context
 
 `ReadTurnState(ctx, threadID)` reads the native thread status and one latest
