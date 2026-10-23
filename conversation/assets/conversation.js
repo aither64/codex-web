@@ -7,7 +7,7 @@ export {createConversationSync, renderConnectionStatus, connectionMessage} from 
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {mountRetryControls} from "./retry.js?v=1";
 export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
-export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=1";
+export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=2";
 import {createAsyncQuestions, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
 export {createAsyncQuestions, asyncQuestionReply, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
 export {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";

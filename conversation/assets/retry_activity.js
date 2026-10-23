@@ -80,6 +80,7 @@ export function mountRetryActivity(root, options) {
     const node = page.createElement(tag); node.className = className; node.textContent = text; return node;
   };
   const notice = create("section", "codex-retry-activity-notice"); notice.setAttribute("aria-label", "Automatic retry");
+  const heading = create("div", "codex-retry-activity-heading");
   const title = create("strong", "codex-retry-activity-title");
   const metrics = create("div", "codex-retry-activity-metrics");
   const count = create("span", "codex-retry-activity-count"), elapsed = create("span", "codex-retry-activity-elapsed");
@@ -91,10 +92,13 @@ export function mountRetryActivity(root, options) {
   const actions = create("div", "codex-retry-activity-actions");
   const retryNow = create("button", "codex-retry-activity-now", "Retry now");
   const stop = create("button", "codex-retry-activity-stop", "Stop retrying");
-  const dismiss = create("button", "codex-retry-activity-dismiss", "Dismiss");
+  const dismiss = create("button", "codex-retry-activity-dismiss", "×");
+  dismiss.setAttribute("aria-label", "Dismiss retry notice");
+  dismiss.setAttribute("title", "Dismiss retry notice");
   for (const button of [retryNow, stop, dismiss]) button.type = "button";
-  actions.append(retryNow, stop, dismiss);
-  notice.append(title, metrics, status, uncertain, reason, actions, live);
+  heading.append(title, dismiss);
+  actions.append(retryNow, stop);
+  notice.append(heading, metrics, status, uncertain, reason, actions, live);
   root.classList.add("codex-retry-activity"); root.hidden = true; root.replaceChildren(notice);
   let state = null, observedAt = 0, stopped = false, suspended = false, busy = false, unavailable = false, reloadRequired = false;
   let tick = null, poll = null, activeRead = null, readPromise = null, generation = 0, announcementKey = "";

@@ -86,6 +86,25 @@ test('dismissal persists independently for every exact conversation and chain, i
   saved=terminal({chainKey:'chain-3'});await f.refresh();assert.equal(f.root.hidden,false);assert.equal(writes,0);
 });
 
+test('terminal dismissal is an accessible icon button in its own right heading cell',async t=>{
+  let saved=state();const calls=[];
+  const f=await fixture(t,{retryActivity:async()=>saved,retryNow:()=>calls.push('now'),stopRetry:()=>calls.push('stop')});
+  const dismiss=f.dismiss(),heading=f.node('codex-retry-activity-heading'),actions=f.node('codex-retry-activity-actions');
+  assert.equal(dismiss.tag,'button');assert.equal(dismiss.type,'button');assert.equal(dismiss.textContent,'×');
+  assert.equal(dismiss.attributes['aria-label'],'Dismiss retry notice');assert.equal(dismiss.attributes.title,'Dismiss retry notice');
+  assert.deepEqual(heading.children,[f.node('codex-retry-activity-title'),dismiss]);assert.deepEqual(actions.children,[f.now(),f.stop()]);
+  for(const phase of ['scheduled','submitting','reconciling','running']) {
+    saved=state({phase,nextAttemptAtMs:phase==='scheduled'?5015000:null,retryNowToken:phase==='scheduled'?'attempt-token':''});await f.refresh();
+    assert.equal(dismiss.hidden,true);assert.equal(f.stop().hidden,false);assert.equal(f.now().hidden,phase!=='scheduled');
+  }
+  for(const outcome of ['success','stopped','exhausted','superseded','blocked']) {
+    saved=terminal({chainKey:'chain-'+outcome,outcome});await f.refresh();assert.equal(dismiss.hidden,false);
+    assert.equal(f.now().hidden,true);assert.equal(f.stop().hidden,true);
+  }
+  dismiss.dispatchEvent(new Event('click'));assert.equal(f.root.hidden,true);await f.reload();assert.equal(f.root.hidden,true);
+  assert.deepEqual(calls,[],'dismissal never mutates backend activity');
+});
+
 test('unavailable localStorage retains all dismissals on this page',async t=>{
   let saved=terminal();const storage={getItem(){throw Error('disabled');},setItem(){throw Error('full');}};
   const f=await fixture(t,{retryActivity:async()=>saved},{storage});
