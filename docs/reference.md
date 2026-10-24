@@ -46,6 +46,25 @@ Explicit sends and activation remain the application's responsibility.
 `TransportError` distinguishes connection failures and request deadlines from
 RPC refusals and invalid responses. Applications may retry observations after a
 transport failure. A mutation still needs its durable outcome reconciliation.
+If a failed request races with caller cancellation, its error chain retains
+both causes. Cancellation alone does not establish whether input was sent.
+
+`MessageNotSentError` reports a send that never entered its mutation write, or
+received an explicit invalid-request, unknown-method or invalid-parameters
+refusal. Its saved attempt remains `prepared` and can be retried with the same
+identity and options. The client records `submitting` under the connection
+writer lock immediately before writing. Write failures and lost replies retain
+`UnknownSendOutcomeError`; missing history cannot establish non-delivery.
+Admission atomically rechecks the shared ledger, so another client that already
+claimed the same prepared attempt forces reconciliation instead of a second write.
+The ledger stays at schema 3, and older uncertain attempts keep that meaning.
+
+The conversation handler returns `message_not_sent` with `notSent: true` for
+the former and `message_delivery_unknown` with `notSent: false` for the latter.
+After validation and mutation locking, admitted sends retain the operation's
+deadline and observe server shutdown, but browser disconnection does not cancel
+dispatch or receipt recording. A lost HTTP reply can therefore be reconciled
+using the original message identity.
 
 A cold Send can enter `Queue` before activation. Its `SendReceipt` can carry
 `queuedSubmissionId` instead of a turn ID. Subsequent `SendWithOptions` and

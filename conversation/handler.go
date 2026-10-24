@@ -593,22 +593,62 @@ func (handler *Handler) send(response http.ResponseWriter, request *http.Request
 		uploadError(response, prepareErr)
 		return
 	}
+	if err := request.Context().Err(); err != nil {
+		handler.serverError(response, request, err)
+		return
+	}
+	// Validation and mutation locking used the browser context. An admitted
+	// send now owns the remaining operation budget, including receipt recording.
+	deadline, ok := request.Context().Deadline()
+	if !ok {
+		deadline = time.Now().Add(handler.operationTimeout)
+	}
+	ctx, cancel := context.WithDeadline(context.WithoutCancel(request.Context()), deadline)
+	defer cancel()
+	if handler.shutdown != nil {
+		go func() {
+			select {
+			case <-handler.shutdown:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	if body.Retry {
 		if _, err := target.Client.SendAttempted(
-			request.Context(), target.ThreadID, message, body.ClientUserMessageID, "",
+			ctx, target.ThreadID, message, body.ClientUserMessageID, "",
 		); err != nil {
 			handler.serverError(response, request, err)
 			return
 		}
 	}
 	receipt, err := target.Client.Send(
-		request.Context(), target.ThreadID, message, body.ClientUserMessageID, "",
+		ctx, target.ThreadID, message, body.ClientUserMessageID, "",
 	)
 	if err != nil {
-		handler.serverError(response, request, err)
+		handler.sendError(response, request, err)
 		return
 	}
 	writeJSON(response, http.StatusAccepted, receipt)
+}
+
+func (handler *Handler) sendError(response http.ResponseWriter, request *http.Request, err error) {
+	var unsent *codex.MessageNotSentError
+	var unknown *codex.UnknownSendOutcomeError
+	switch {
+	case errors.As(err, &unsent):
+		handler.logError(request, err)
+		writeJSON(response, http.StatusServiceUnavailable, map[string]any{
+			"error": "The message was not sent.", "code": "message_not_sent", "notSent": true,
+		})
+	case errors.As(err, &unknown):
+		handler.logError(request, err)
+		writeJSON(response, http.StatusConflict, map[string]any{
+			"error": "Message delivery could not be confirmed.", "code": "message_delivery_unknown", "notSent": false,
+		})
+	default:
+		handler.serverError(response, request, err)
+	}
 }
 
 func (handler *Handler) acknowledge(response http.ResponseWriter, request *http.Request, target Target) {

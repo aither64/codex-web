@@ -637,6 +637,13 @@ type UnknownSendOutcomeError struct {
 	Err error
 }
 
+// MessageNotSentError proves that this send did not dispatch user input. It must
+// never be used for an earlier attempt whose delivery remains uncertain.
+type MessageNotSentError struct{ Err error }
+
+func (e *MessageNotSentError) Error() string { return fmt.Sprintf("message was not sent: %v", e.Err) }
+func (e *MessageNotSentError) Unwrap() error { return e.Err }
+
 func (e *UnknownSendOutcomeError) Error() string {
 	return fmt.Sprintf("message outcome is still unknown; retry with the same browser attempt: %v", e.Err)
 }
@@ -1039,6 +1046,18 @@ func (c *Client) Close() {
 }
 
 func (c *Client) Request(ctx context.Context, method string, params any, result any) error {
+	return c.requestWithAdmission(ctx, method, params, result, nil)
+}
+
+// admit runs under the connection writer lock immediately before Write.
+func (c *Client) requestWithAdmission(ctx context.Context, method string, params any, result any, admit func() error) (requestErr error) {
+	defer func() {
+		// A disconnect may win the response race after the caller cancels.
+		// Retain both causes without changing delivery evidence or successes.
+		if cause := ctx.Err(); requestErr != nil && cause != nil && !errors.Is(requestErr, cause) {
+			requestErr = fmt.Errorf("%w: %w", requestErr, cause)
+		}
+	}()
 	if c.options.ObserverOnly {
 		switch method {
 		case "thread/read", "thread/turns/list", "thread/items/list", "thread/list":
@@ -1049,7 +1068,7 @@ func (c *Client) Request(ctx context.Context, method string, params any, result 
 	if err := c.Ensure(ctx); err != nil {
 		return err
 	}
-	return c.requestConnected(ctx, method, params, result)
+	return c.requestConnectedAdmission(ctx, 0, method, params, result, admit)
 }
 
 func (c *Client) requestConnected(ctx context.Context, method string, params any, result any) error {
@@ -1057,6 +1076,10 @@ func (c *Client) requestConnected(ctx context.Context, method string, params any
 }
 
 func (c *Client) requestConnectedGeneration(ctx context.Context, expectedGeneration uint64, method string, params any, result any) error {
+	return c.requestConnectedAdmission(ctx, expectedGeneration, method, params, result, nil)
+}
+
+func (c *Client) requestConnectedAdmission(ctx context.Context, expectedGeneration uint64, method string, params any, result any, admit func() error) error {
 	c.connectionMu.Lock()
 	connection := c.connection
 	generation := c.generation
@@ -1098,10 +1121,10 @@ func (c *Client) requestConnectedGeneration(ctx context.Context, expectedGenerat
 		return err
 	}
 	if provider == "" {
-		return c.requestOn(ctx, connection, generation, method, params, result)
+		return c.requestOnAdmission(ctx, connection, generation, method, params, result, admit)
 	}
 	var response json.RawMessage
-	if err := c.requestOn(ctx, connection, generation, method, params, &response); err != nil {
+	if err := c.requestOnAdmission(ctx, connection, generation, method, params, &response, admit); err != nil {
 		return err
 	}
 	var routing struct {
@@ -1127,6 +1150,10 @@ func (c *Client) requestOn(
 	params any,
 	result any,
 ) error {
+	return c.requestOnAdmission(ctx, connection, generation, method, params, result, nil)
+}
+
+func (c *Client) requestOnAdmission(ctx context.Context, connection *websocket.Conn, generation uint64, method string, params any, result any, admit func() error) error {
 	id := c.nextID.Add(1)
 	responseChannel := make(chan response, 1)
 	c.pendingMu.Lock()
@@ -1142,7 +1169,7 @@ func (c *Client) requestOn(
 	if err != nil {
 		return err
 	}
-	if err := c.writeOn(ctx, connection, generation, message); err != nil {
+	if err := c.writeOfferAdmission(ctx, connection, generation, message, nil, admit); err != nil {
 		return err
 	}
 	select {
@@ -1169,6 +1196,10 @@ func (c *Client) writeOn(ctx context.Context, connection *websocket.Conn, genera
 // A claim can wait behind other writes. Validate it after acquiring writeMu and
 // keep retirement/admission serialized until the response has been written.
 func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, generation uint64, data []byte, offer *PendingRequest) error {
+	return c.writeOfferAdmission(ctx, connection, generation, data, offer, nil)
+}
+
+func (c *Client) writeOfferAdmission(ctx context.Context, connection *websocket.Conn, generation uint64, data []byte, offer *PendingRequest, admit func() error) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.connectionMu.Lock()
@@ -1194,6 +1225,11 @@ func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, gen
 		return &TransportError{Err: err}
 	}
 	c.connectionMu.Unlock()
+	if admit != nil {
+		if err := admit(); err != nil {
+			return err
+		}
+	}
 	err := connection.Write(ctx, websocket.MessageText, data)
 	if offer != nil {
 		if err == nil {
@@ -2669,19 +2705,24 @@ func (c *Client) sendAttempt(
 func (c *Client) sendAttemptWithOptions(
 	threadID, clientID, text, context, optionsDigest string,
 ) (sendAttempt, bool, error) {
-	type result struct {
-		attempt sendAttempt
-		found   bool
-	}
-	value, err := queueLedgerTransaction(c, func() (result, error) {
+	value, err := c.sendStateWithOptions(threadID, clientID, text, context, optionsDigest)
+	return value.attempt, value.found, err
+}
+
+type sendState struct {
+	attempt       sendAttempt
+	found, queued bool
+}
+
+func (c *Client) sendStateWithOptions(threadID, clientID, text, context, optionsDigest string) (sendState, error) {
+	return queueLedgerTransaction(c, func() (sendState, error) {
 		attempt, ok := c.sendAttempts[threadID][clientID]
 		if ok && (attempt.Digest != queueTextDigest(text) || attempt.Context != context ||
 			effectiveTurnOptionsDigest(attempt.OptionsDigest) != optionsDigest) {
-			return result{}, errors.New("message identity was reused for another action")
+			return sendState{}, errors.New("message identity was reused for another action")
 		}
-		return result{attempt: attempt, found: ok}, nil
+		return sendState{attempt: attempt, found: ok, queued: c.queueAttempts[threadID][clientID] != ""}, nil
 	})
-	return value.attempt, value.found, err
 }
 
 func (c *Client) recordSendAttempt(
@@ -2695,6 +2736,12 @@ func (c *Client) recordSendAttempt(
 func (c *Client) recordSendAttemptWithOptions(
 	threadID, clientID, text, context string, steered bool, options TurnOptions,
 ) error {
+	return c.recordSendAttemptWithReceipt(threadID, clientID, text, context, steered, options, nil)
+}
+
+// A positively proven history receipt is recorded atomically as accepted; it
+// must never expose a prepared record that a concurrent sender could dispatch.
+func (c *Client) recordSendAttemptWithReceipt(threadID, clientID, text, context string, steered bool, options TurnOptions, receipt *SendReceipt) error {
 	normalized, err := normalizeTurnOptions(options)
 	if err != nil {
 		return err
@@ -2702,12 +2749,15 @@ func (c *Client) recordSendAttemptWithOptions(
 	optionsDigest := normalized.Digest
 	return queueLedgerAction(c, func() error {
 		digest := queueTextDigest(text)
-		if existing, ok := c.sendAttempts[threadID][clientID]; ok {
+		existing, found := c.sendAttempts[threadID][clientID]
+		if found {
 			if existing.Digest != digest || existing.Context != context || existing.Steered != steered ||
 				effectiveTurnOptionsDigest(existing.OptionsDigest) != optionsDigest {
 				return errors.New("message identity was reused for another action")
 			}
-			return nil
+			if receipt == nil {
+				return nil
+			}
 		}
 		if c.sendAttempts[threadID] == nil {
 			c.sendAttempts[threadID] = make(map[string]sendAttempt)
@@ -2720,9 +2770,23 @@ func (c *Client) recordSendAttemptWithOptions(
 			copied := cloneTurnOptions(options)
 			attempt.Options = &copied
 		}
+		if receipt != nil {
+			if receipt.ClientUserMessageID != clientID || receipt.TurnID == "" || receipt.Steered != steered ||
+				(found && existing.State == "accepted" && existing.TurnID != receipt.TurnID) {
+				return errors.New("history receipt does not match the message attempt")
+			}
+			if found && existing.State == "accepted" {
+				return nil
+			}
+			attempt.State, attempt.TurnID = "accepted", receipt.TurnID
+		}
 		c.sendAttempts[threadID][clientID] = attempt
 		if err := c.writeQueueLedgerLocked(); err != nil {
-			delete(c.sendAttempts[threadID], clientID)
+			if found {
+				c.sendAttempts[threadID][clientID] = existing
+			} else {
+				delete(c.sendAttempts[threadID], clientID)
+			}
 			if len(c.sendAttempts[threadID]) == 0 {
 				delete(c.sendAttempts, threadID)
 			}
@@ -2781,11 +2845,8 @@ func (c *Client) markSendSubmitting(threadID, clientID string) error {
 		if !ok {
 			return errors.New("prepared message attempt disappeared")
 		}
-		if attempt.State == "submitting" {
-			return nil
-		}
-		if attempt.State != "prepared" {
-			return errors.New("message attempt was already accepted")
+		if attempt.State != "prepared" || c.queueAttempts[threadID][clientID] != "" {
+			return errSendAdmissionChanged
 		}
 		attempt.State = "submitting"
 		c.sendAttempts[threadID][clientID] = attempt
@@ -5127,16 +5188,19 @@ func (c *Client) SendWithOptions(
 	if receipt, found, err := c.reconcileSend(ctx, threadID, text, clientUserMessageID, attempt); err != nil || found {
 		return receipt, err
 	}
+	refuseUnwritten := func(err error) (SendReceipt, error) {
+		return c.unwrittenSendOutcome(ctx, threadID, text, clientUserMessageID, actionContext, normalizedOptions.Digest, !attempted, err)
+	}
 	if err := c.resumeThreadWithPolicy(ctx, threadID, normalizedOptions.ThreadPolicy, normalizedOptions.ThreadPolicy != (ThreadPolicy{})); err != nil {
-		return SendReceipt{}, err
+		return refuseUnwritten(err)
 	}
 	turnID, err := c.ActiveTurnID(ctx, threadID)
 	if err != nil {
-		return SendReceipt{}, err
+		return refuseUnwritten(err)
 	}
 	steered := turnID != ""
 	if attempted && attempt.Steered != steered {
-		return SendReceipt{}, errors.New("prepared message no longer matches the thread state")
+		return refuseUnwritten(errors.New("prepared message no longer matches the thread state"))
 	}
 	input := []map[string]any{{"type": "text", "text": text}}
 	if !attempted {
@@ -5146,10 +5210,25 @@ func (c *Client) SendWithOptions(
 			return SendReceipt{}, fmt.Errorf("record message attempt before submission: %w", err)
 		}
 	}
-	if err := c.markSendSubmitting(threadID, clientUserMessageID); err != nil {
-		return SendReceipt{}, fmt.Errorf("record message attempt before submission: %w", err)
+	admitted := false
+	admit := func() error {
+		if err := c.markSendSubmitting(threadID, clientUserMessageID); err != nil {
+			return fmt.Errorf("record message attempt before submission: %w", err)
+		}
+		admitted = true
+		return nil
 	}
 	reconcile := func(requestErr error) (SendReceipt, error) {
+		if !admitted {
+			return c.unwrittenSendOutcome(ctx, threadID, text, clientUserMessageID, actionContext, normalizedOptions.Digest, false, requestErr)
+		}
+		var refusal *rpcCallError
+		if errors.As(requestErr, &refusal) && (refusal.code == -32600 || refusal.code == -32601 || refusal.code == -32602) {
+			if err := c.restoreRejectedSend(threadID, clientUserMessageID); err != nil {
+				return SendReceipt{}, &UnknownSendOutcomeError{Err: err}
+			}
+			return SendReceipt{}, &MessageNotSentError{Err: requestErr}
+		}
 		reconcileContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		receipt, found, reconcileErr := c.waitForSentByClientID(
@@ -5180,7 +5259,7 @@ func (c *Client) SendWithOptions(
 		if additionalContext := normalizedOptions.additionalContextParameter(); additionalContext != nil {
 			params["additionalContext"] = additionalContext
 		}
-		err := c.Request(ctx, "turn/steer", params, &response)
+		err := c.requestWithAdmission(ctx, "turn/steer", params, &response, admit)
 		if err != nil {
 			return reconcile(err)
 		}
@@ -5209,7 +5288,7 @@ func (c *Client) SendWithOptions(
 	if additionalContext := normalizedOptions.additionalContextParameter(); additionalContext != nil {
 		params["additionalContext"] = additionalContext
 	}
-	err = c.Request(ctx, "turn/start", params, &response)
+	err = c.requestWithAdmission(ctx, "turn/start", params, &response, admit)
 	if err != nil {
 		return reconcile(err)
 	}
@@ -5317,15 +5396,9 @@ func (c *Client) SendAttemptedWithOptions(
 	if err != nil || !found {
 		return found, err
 	}
-	if err := c.recordSendAttemptWithOptions(
-		threadID, clientUserMessageID, text, context, receipt.Steered, options,
+	if err := c.recordSendAttemptWithReceipt(
+		threadID, clientUserMessageID, text, context, receipt.Steered, options, &receipt,
 	); err != nil {
-		return false, err
-	}
-	if err := c.markSendSubmitting(threadID, clientUserMessageID); err != nil {
-		return false, err
-	}
-	if err := c.markSendAccepted(threadID, clientUserMessageID, receipt); err != nil {
 		return false, err
 	}
 	return true, nil

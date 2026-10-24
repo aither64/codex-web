@@ -103,7 +103,8 @@ export function transcriptEntryVisible(entry, filter = "all") {
 // receipts. Only an explicit server refusal establishes a definitely unsent input.
 export function submissionFailurePresentation(error) {
   const uncertain = error?.notSent !== true;
-  const detail = typeof error?.message === "string" ? error.message.trim().slice(0, 512) : "";
+  const knownDelivery = ["message_not_sent", "message_delivery_unknown"].includes(error?.code);
+  const detail = !knownDelivery && typeof error?.message === "string" ? error.message.trim().slice(0, 512) : "";
   const guidance = uncertain ? "Delivery could not be confirmed. Retry the original submission to check its status." :
     "The message was not sent. Try again.";
   return {message: detail ? `${detail} ${guidance}` : guidance, uncertain};

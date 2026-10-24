@@ -340,7 +340,7 @@ client_requests.extend([
     }),
 ])
 call_pattern = re.compile(
-    r'\b(?:Request|historyRequest|requestConnected|requestConnectedGeneration|requestOn|request)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
+    r'\b(?:Request|requestWithAdmission|historyRequest|requestConnected|requestConnectedGeneration|requestOn|request)\s*\([^)]*?"([a-z][A-Za-z]*(?:/[A-Za-z_]+)*)"',
     re.DOTALL,
 )
 client_requests.extend([
