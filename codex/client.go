@@ -1185,6 +1185,14 @@ func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, gen
 			return promptError("prompt_changed", "This question is no longer pending.")
 		}
 	}
+	// Cancellation before Write cannot invalidate other calls on this connection.
+	if err := ctx.Err(); err != nil {
+		if offer != nil {
+			c.pendingMu.Unlock()
+		}
+		c.connectionMu.Unlock()
+		return &TransportError{Err: err}
+	}
 	c.connectionMu.Unlock()
 	err := connection.Write(ctx, websocket.MessageText, data)
 	if offer != nil {
