@@ -35,7 +35,7 @@ var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var pageCursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32}$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
-//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js assets/questions.js assets/citations.js assets/retry.js assets/retry_activity.js
+//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js assets/questions.js assets/citations.js assets/retry.js assets/retry_activity.js assets/delivery_retry.js
 var assetFiles embed.FS
 
 // Capabilities grants an opaque conversation ID access to individual
@@ -639,7 +639,7 @@ func (handler *Handler) sendError(response http.ResponseWriter, request *http.Re
 	case errors.As(err, &unsent):
 		handler.logError(request, err)
 		writeJSON(response, http.StatusServiceUnavailable, map[string]any{
-			"error": "The message was not sent.", "code": "message_not_sent", "notSent": true,
+			"error": "The message was not sent.", "code": "message_not_sent", "notSent": true, "retryable":unsent.Retryable,
 		})
 	case errors.As(err, &unknown):
 		handler.logError(request, err)

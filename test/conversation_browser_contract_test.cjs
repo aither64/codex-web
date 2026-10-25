@@ -1026,6 +1026,43 @@ class MemoryStorage {
       }
       disposeRecovery();
     }
+    // A transient attachment-free attempt must never borrow uploads from a
+    // newer draft when the mounted scheduler retries it after reload.
+    const retryStorage = new MemoryStorage(), retryCalls = [];
+    const newDraftFile = {id: "da0e3d66-f923-4c79-bde5-c25c1edfd02b", clientId: "da0e3d66-f923-4c79-bde5-c25c1edfd02b", name: "new-draft.txt", size: 1, state: "ready"};
+    retryStorage.setItem("codex-web:uploads:/draft-uploads", JSON.stringify([newDraftFile]));
+    globalThis.fetch = async () => ({ok: true, json: async () => ({
+      limits: {chunkBytes: 4, fileBytes: 100, promptBytes: 100, files: 10}, files: [newDraftFile],
+    })});
+    const retryClient = {
+      eventsPath: () => "/draft-events",
+      async thread() { return {threadId: "draft-thread", status: "active", entries: []}; },
+      async message(message, id, retry, attachmentIds) {
+        retryCalls.push({message, id, retry, attachmentIds});
+        if (retryCalls.length === 1) throw Object.assign(new Error("not sent"), {code: "message_not_sent", notSent: true, retryable: true});
+        return {turnId: "accepted", clientUserMessageId: id};
+      },
+    };
+    const retained = createDurableSender({client: retryClient, id: "draft", basePath: "/codex", storage: retryStorage,
+      randomUUID: () => "dc0e3d66-f923-4c79-bde5-c25c1edfd02b"});
+    await assert.rejects(retained.send("original without attachments"));
+    const retryRoot = new UploadElement("main");
+    const disposeDraftRetry = mountConversation(retryRoot, {id: "draft", basePath: "/codex", client: retryClient,
+      EventSource: class {addEventListener() {} close() {}}, storage: retryStorage, uploadBasePath: "/draft-uploads",
+      capabilities: {pending: false, queueRead: false, queue: false, interrupt: false, settings: false, respond: false}});
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      const draft = retryRoot.descendants().find(el => el.name === "textarea");
+      draft.value = "new draft with an upload";
+      for (let i = 0; i < 100 && retryCalls.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(retryCalls.length, 2, "mounted retry must reach the client");
+      assert.equal(retryCalls[1].id, retryCalls[0].id);
+      assert.equal(retryCalls[1].message, retryCalls[0].message);
+      assert.equal(retryCalls[1].retry, true);
+      assert.deepEqual(retryCalls[1].attachmentIds, []);
+      assert.equal(draft.value, "new draft with an upload");
+      assert.deepEqual(JSON.parse(retryStorage.getItem("codex-web:uploads:/draft-uploads")).map(file => file.id), [newDraftFile.id]);
+    } finally { disposeDraftRetry(); }
   } finally {
     globalThis.document = recoveryGlobals.document;
     globalThis.fetch = recoveryGlobals.fetch;

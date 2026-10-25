@@ -6,6 +6,8 @@ import {createConversationSync, renderConnectionStatus} from "./sync.js?v=3";
 export {createConversationSync, renderConnectionStatus, connectionMessage} from "./sync.js?v=3";
 import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {mountRetryControls} from "./retry.js?v=1";
+export {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
+import {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
 export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
 export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=2";
 import {createAsyncQuestions, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
@@ -106,7 +108,7 @@ export function submissionFailurePresentation(error) {
   const knownDelivery = ["message_not_sent", "message_delivery_unknown"].includes(error?.code);
   const detail = !knownDelivery && typeof error?.message === "string" ? error.message.trim().slice(0, 512) : "";
   const guidance = uncertain ? "Delivery could not be confirmed. Retry the original submission to check its status." :
-    "The message was not sent. Try again.";
+    error?.retryable === true ? "The message was not sent. Retrying automatically." : "The message was not sent. Try again.";
   return {message: detail ? `${detail} ${guidance}` : guidance, uncertain};
 }
 
@@ -274,6 +276,7 @@ export function createConversationClient(options) {
         error.status = response.status;
         error.code = typeof payload.code === "string" ? payload.code : "";
         error.notSent = payload.notSent === true;
+		error.retryable = payload.retryable === true;
         throw error;
       }
       return payload;
@@ -797,6 +800,7 @@ function pendingAttemptStore(storage, key) {
         message: value.message,
         ...(attachments.length ? {attachmentIds: attachments} : {}),
         receipt: value.receipt && typeof value.receipt === "object" ? value.receipt : null,
+		...(value.retryable === true ? {retryable: true} : {}),
       };
     },
     encode: (attempt) => attempt,
@@ -865,7 +869,17 @@ export function createDurableSender(options) {
       }
       return entry;
     }
-    const receipt = await options.client.message(attempt.message, attempt.id, retry, attempt.attachmentIds || []);
+	delete attempt.retryable;
+	save(store, attempt);
+	let receipt;
+	try { receipt = await options.client.message(attempt.message, attempt.id, retry, attempt.attachmentIds || []); }
+	catch (error) {
+	  if (error?.code === "message_not_sent" && error?.notSent === true && error?.retryable === true) {
+	    attempt.retryable = true;
+	    save(store, attempt);
+	  }
+	  throw error;
+	}
     attempt.receipt = receipt;
     save(store, attempt);
     return receipt;
@@ -974,12 +988,13 @@ export function mountConversation(root, options) {
   const form = createElement("form", {class: "codex-conversation-form"});
   const submissionStatus = createElement("p", {class: "codex-submission-status", role: "status"});
   submissionStatus.hidden = true;
-  let submissionFailure = null;
+  let submissionFailure = null, deliveryRetries = null;
   const renderSubmissionFailure = () => {
     submissionStatus.hidden = !submissionFailure || submissionFailure.threadId !== currentThread?.threadId;
     submissionStatus.textContent = submissionFailure?.message || "";
   };
   const confirmSubmission = (action, attempt, threadId) => {
+    if (action === "send" && attempt?.id) deliveryRetries?.stop(attempt.id);
     if (!attempt?.id || submissionFailure?.conversation !== client ||
         submissionFailure.threadId !== threadId || currentThread?.threadId !== threadId ||
         submissionFailure.action !== action || submissionFailure.attemptId !== attempt.id) return;
@@ -996,6 +1011,7 @@ export function mountConversation(root, options) {
         submissionFailure.attemptId !== attempt?.id)) return;
     submissionFailure = {conversation: client, threadId, action, attemptId: attempt?.id,
       message: submissionFailurePresentation(error).message};
+    if (action === "send" && attempt?.id) deliveryRetries?.schedule(attempt.id, error);
     renderSubmissionFailure();
   };
   form.append(textarea, actions, submissionStatus);
@@ -1566,17 +1582,18 @@ export function mountConversation(root, options) {
   });
   const refresh = () => sync.refresh();
 
-  if (capabilities.send) form.addEventListener("submit", async (event) => {
-    event.preventDefault();
+  const submitSend = async (retryID = null) => {
     if (settingsSaving) return;
     send.disabled = true;
     send.textContent = labels.sending;
     const threadId = currentThread?.threadId;
     let submittedAttempt, submittedAttachments = [];
     try {
-      submittedAttachments = uploads?.ids() || [];
+      const retained = retryID ? sender.pending() : null;
+      if (retryID && retained?.id !== retryID) return;
+      submittedAttachments = retained ? retained.attachmentIds || [] : uploads?.ids() || [];
       uploads?.lock(true);
-      const submission = sender.send(textarea.value, submittedAttachments);
+      const submission = sender.send(retained?.message || textarea.value, submittedAttachments);
       submittedAttempt = sender.pending();
       await submission;
       confirmSubmission("send", submittedAttempt, threadId);
@@ -1595,7 +1612,15 @@ export function mountConversation(root, options) {
       send.disabled = uploads ? !uploads.ready() : false;
       send.textContent = labels.send;
     }
+  };
+
+  deliveryRetries = createDeliveryRetryScheduler({
+    isCurrent: id => !destroyed && sender?.pending()?.id === id,
+    canRetry: () => currentThread?.threadId && !paused && !settingsSaving && !send.disabled && !globalThis.document?.hidden && globalThis.navigator?.onLine !== false,
+    retry: id => submitSend(id),
   });
+  if (sender?.pending()?.retryable) deliveryRetries.schedule(sender.pending().id, {code: "message_not_sent", notSent: true, retryable: true});
+  if (capabilities.send) form.addEventListener("submit", async event => { event.preventDefault(); await submitSend(); });
 
   if (capabilities.settings) settingsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1664,6 +1689,7 @@ export function mountConversation(root, options) {
 
   return () => {
     destroyed = true;
+    deliveryRetries?.destroy();
     suspendLanes();
     globalThis.document?.removeEventListener?.("visibilitychange", onVisibility);
     globalThis.removeEventListener?.("pagehide", suspendLanes);
