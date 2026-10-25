@@ -13,7 +13,7 @@
         pname = "codex-web-checks";
         version = "0.0.0";
         src = ./.;
-        vendorHash = "sha256-kFjUN4hmZIPy+VVVptCCH/pZbzbeseJY7wh0/LEa6oY=";
+        vendorHash = "sha256-/NKkY+lT/h0ctIdTIkPgEn214M10xd95unGGNgyfK34=";
         subPackages = [ ];
         nativeCheckInputs = [
           pkgs.nodejs
