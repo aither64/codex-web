@@ -532,7 +532,17 @@ func integrationUtilityModel() string {
 	return "gpt-5.5"
 }
 
+const integrationPromptedInstructions = "Return the requested JSON. Use only the supplied request as data. Never use tools, read files, run commands, browse, delegate or ask questions. Return only the name JSON."
+
 func TestEphemeralProtocolIntegration(t *testing.T) {
+	runEphemeralProtocolIntegration(t, false)
+}
+
+func TestPromptedEphemeralProtocolIntegration(t *testing.T) {
+	runEphemeralProtocolIntegration(t, true)
+}
+
+func runEphemeralProtocolIntegration(t *testing.T, prompted bool) {
 	binary := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_BINARY")
 	expected := os.Getenv("CODEX_EPHEMERAL_TEST_SHA256")
 	file, err := os.Open(binary)
@@ -548,6 +558,18 @@ func TestEphemeralProtocolIntegration(t *testing.T) {
 	if len(expected) != 64 || hex.EncodeToString(digest.Sum(nil)) != expected {
 		t.Fatal("candidate differs from reviewed CODEX_EPHEMERAL_TEST_SHA256")
 	}
+	version := "codex-cli 0.163.0"
+	selector := "TestEphemeralProtocolIntegration"
+	if prompted {
+		version, selector = "codex-cli 0.164.0", "TestPromptedEphemeralProtocolIntegration"
+		if integrationUtilityModel() != "gpt-6-luna" {
+			t.Fatal("prompted native naming requires CODEX_EPHEMERAL_TEST_MODEL=gpt-6-luna")
+		}
+	}
+	probeHome := t.TempDir()
+	probe := exec.Command(binary, "--version")
+	probe.Env = []string{"HOME=" + probeHome, "CODEX_HOME=" + probeHome, "PATH=" + os.Getenv("PATH")}
+	integrationRequireVersion(t, probe, version)
 	source := os.Getenv("CODEX_EPHEMERAL_TEST_SOURCE")
 	if !filepath.IsAbs(source) {
 		t.Fatal("CODEX_EPHEMERAL_TEST_SOURCE must name the exact candidate codex-rs source")
@@ -593,7 +615,7 @@ func TestEphemeralProtocolIntegration(t *testing.T) {
 	ip := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_IP")
 	nft := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_NFT")
 	_ = integrationExecutable(t, "CODEX_EPHEMERAL_TEST_SQLITE")
-	owner, child := integrationEnterNamespace(t, "TestEphemeralProtocolIntegration")
+	owner, child := integrationEnterNamespace(t, selector)
 	if !child {
 		return
 	}
@@ -604,6 +626,7 @@ func TestEphemeralProtocolIntegration(t *testing.T) {
 		t.Fatalf("cannot configure isolated loopback: %v %s", err, output)
 	}
 	harness := newEphemeralIntegrationHarness(t, binary, nft, owner)
+	harness.prompted = prompted
 	defer harness.close()
 	harness.control(t)
 	harness.catalogControls(t)
@@ -635,8 +658,10 @@ func TestEphemeralProtocolIntegration(t *testing.T) {
 		{"request_user_input_async", "", `{"questions":[{"title":"Synthetic?","options":["Yes","No"]}]}`},
 		{"read", "skills", `{"path":"CANARY"}`},
 	}
-	for _, attack := range hostile {
-		t.Run("forbidden/"+attack.namespace+"/"+attack.name, func(t *testing.T) { harness.run(t, "forbidden", attack.namespace, attack.name+"\n"+attack.arguments) })
+	if !prompted {
+		for _, attack := range hostile {
+			t.Run("forbidden/"+attack.namespace+"/"+attack.name, func(t *testing.T) { harness.run(t, "forbidden", attack.namespace, attack.name+"\n"+attack.arguments) })
+		}
 	}
 	// Reconfiguration is between calls, never an arbitrary mid-call admin race.
 	harness.reconfigure(t, "fresh.literal.name")
@@ -689,6 +714,146 @@ func (buffer *ephemeralIntegrationStderr) String() string {
 	buffer.mu.Lock()
 	defer buffer.mu.Unlock()
 	return string(buffer.tail)
+}
+
+// Version stdout is an exact contract; native startup warnings remain separate
+// diagnostics. Drain both streams without retaining unbounded child output.
+type integrationVersionOutput struct {
+	stdout   []byte
+	stderr   ephemeralIntegrationStderr
+	tail     bool
+	seen     int
+	overflow bool
+}
+
+func (output *integrationVersionOutput) Write(data []byte) (int, error) {
+	limit := 1024
+	if output.tail {
+		limit = 8192
+	}
+	count := len(data)
+	remaining := limit - output.seen
+	if count > remaining {
+		output.overflow = true
+	}
+	output.seen += min(count, remaining)
+	if output.tail {
+		return output.stderr.Write(data)
+	}
+	output.stdout = append(output.stdout, data[:min(count, remaining)]...)
+	return count, nil
+}
+
+func integrationProbeVersion(command *exec.Cmd, expected string) (string, error) {
+	var stdout integrationVersionOutput
+	stderr := integrationVersionOutput{tail: true}
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err := command.Run()
+	exitCode := -1
+	if command.ProcessState != nil {
+		exitCode = command.ProcessState.ExitCode()
+	}
+	diagnostic := fmt.Sprintf("version probe expected=%q stdout=%q stdout_overflow=%t exit_status=%d stderr_tail=%q stderr_truncated=%t",
+		expected, stdout.stdout, stdout.overflow, exitCode, stderr.stderr.String(), stderr.overflow)
+	if err != nil {
+		return diagnostic, fmt.Errorf("version process failed: %w", err)
+	}
+	if stdout.overflow {
+		return diagnostic, errors.New("version stdout overflow")
+	}
+	if strings.TrimSpace(string(stdout.stdout)) != expected {
+		return diagnostic, errors.New("version stdout mismatch")
+	}
+	return diagnostic, nil
+}
+
+func integrationRequireVersion(t *testing.T, command *exec.Cmd, expected string) {
+	t.Helper()
+	diagnostic, err := integrationProbeVersion(command, expected)
+	t.Log(diagnostic) // Retain bounded warnings even when the version matches.
+	if err != nil {
+		t.Fatalf("native fixture contract requires %s: %v", expected, err)
+	}
+}
+
+func TestEphemeralIntegrationVersionProbe(t *testing.T) {
+	for _, version := range []string{"codex-cli 0.163.0", "codex-cli 0.164.0"} {
+		t.Run(version, func(t *testing.T) {
+			for _, test := range []struct {
+				name, diagnostic string
+				wantError        bool
+			}{
+				{"exact", "stderr_tail=\"\"", false},
+				{"warning", "stderr_tail=\"synthetic helper warning\\n\"", false},
+				{"wrong", "version stdout mismatch", true},
+				{"empty", "version stdout mismatch", true},
+				{"extra", "version stdout mismatch", true},
+				{"nonzero", "exit_status=9", true},
+				{"stdout-overflow", "stdout_overflow=true", true},
+				{"stderr-overflow", "stderr_truncated=true", false},
+				{"timeout", "exit_status=-1", true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					deadline := 5 * time.Second
+					if test.name == "timeout" {
+						deadline = 100 * time.Millisecond
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), deadline)
+					defer cancel()
+					command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestEphemeralIntegrationVersionProbeChild$")
+					command.Env = append(os.Environ(), "CODEX_VERSION_PROBE_CHILD="+test.name, "CODEX_VERSION_PROBE_EXPECTED="+version)
+					diagnostic, err := integrationProbeVersion(command, version)
+					if (err != nil) != test.wantError || !strings.Contains(diagnostic+fmt.Sprint(err), test.diagnostic) {
+						t.Fatalf("version probe result: %s: %v", diagnostic, err)
+					}
+					if len(diagnostic) > 1024+8192+512 {
+						t.Fatal("version diagnostics exceeded their bounded synthetic output")
+					}
+					if test.name == "stderr-overflow" && (!strings.Contains(diagnostic, "TAIL") || strings.Contains(diagnostic, "DISCARDED")) {
+						t.Fatal("stderr capture did not retain only the bounded tail")
+					}
+					if test.name == "timeout" && ctx.Err() != context.DeadlineExceeded {
+						t.Fatal("version probe did not honor its command deadline")
+					}
+				})
+			}
+		})
+	}
+}
+
+// Reexecute only this synthetic child, never a native Codex executable.
+func TestEphemeralIntegrationVersionProbeChild(t *testing.T) {
+	mode := os.Getenv("CODEX_VERSION_PROBE_CHILD")
+	if mode == "" {
+		return
+	}
+	version := os.Getenv("CODEX_VERSION_PROBE_EXPECTED")
+	stdout, stderr, exit := version+"\n", "", 0
+	switch mode {
+	case "exact":
+		stdout = " \t" + version + "\r\n"
+	case "warning":
+		stderr = "synthetic helper warning\n"
+	case "wrong":
+		stdout, stderr = "wrong version\n", version+"\n"
+	case "empty":
+		stdout, stderr = "", version+"\n"
+	case "extra":
+		stdout += "extra stdout\n"
+	case "nonzero":
+		exit = 9
+	case "stdout-overflow":
+		stdout = strings.Repeat(" ", 1025) + version + "\n"
+	case "stderr-overflow":
+		stderr = "DISCARDED" + strings.Repeat("s", 16384) + "TAIL"
+	case "timeout":
+		time.Sleep(30 * time.Second)
+	default:
+		os.Exit(10)
+	}
+	_, _ = io.WriteString(os.Stdout, stdout)
+	_, _ = io.WriteString(os.Stderr, stderr)
+	os.Exit(exit)
 }
 
 type ephemeralIntegrationHTTPRequest struct {
@@ -1467,6 +1632,7 @@ func TestEphemeralIntegrationTimeoutReachability(t *testing.T) {
 }
 
 type ephemeralIntegrationHarness struct {
+	prompted                                                      bool // Fixed entry-point contract; actual tools are observed for raw 0.164.
 	t                                                             *testing.T
 	binary, nft, home, project, socket, canary, canaryURL, config string
 	provider                                                      *httptest.Server
@@ -1867,18 +2033,35 @@ func (h *ephemeralIntegrationHarness) respond(w http.ResponseWriter, r *http.Req
 			h.failure = "effort substitution"
 		}
 		questionControl := mode == "server-question-control" || mode == "question-at-cancel"
-		names, toolErr := integrationToolNames(request, questionControl)
+		var names map[string]bool
+		var toolErr error
+		if !h.prompted {
+			names, toolErr = integrationToolNames(request, questionControl)
+		}
 		expectedCount := 0
 		if questionControl {
 			expectedCount = 1
 		}
-		if toolErr != nil || len(names) != expectedCount || (questionControl && !names["request_user_input"]) {
+		if h.prompted {
+			// Observe the actual native schemas. The prompted contract neither
+			// removes tools nor claims native dispatch rejection.
+			if _, ok := request["tools"].([]any); !ok {
+				h.failure = "prompted request has no inspectable tools array"
+			}
+			if generation == h.diagnosticGeneration {
+				h.toolDiagnostic = integrationPromptedToolDiagnostic(request)
+			}
+		} else if toolErr != nil || len(names) != expectedCount || (questionControl && !names["request_user_input"]) {
 			h.failure = "unexpected model-facing tool schemas"
 			if generation == h.diagnosticGeneration && h.toolDiagnostic == "" {
 				h.toolDiagnostic = integrationToolDiagnostic(request, names, toolErr, expectedCount)
 			}
 		}
-		if !integrationBaseInstructions(request) {
+		instructions := "Return the requested JSON."
+		if h.prompted {
+			instructions = integrationPromptedInstructions
+		}
+		if !integrationBaseInstructionsText(request, instructions) {
 			h.failure = "explicit base instructions missing from Direct request"
 		}
 		if request["store"] != false || request["stream"] != true {
@@ -2163,6 +2346,21 @@ func integrationToolDiagnostic(request map[string]any, names map[string]bool, fa
 	}
 }
 
+// Reuse the bounded schema projection without strict expectations or inferred
+// per-tool absence flags. Nodes retain actual tool names/types/namespaces.
+func integrationPromptedToolDiagnostic(request map[string]any) string {
+	var metadata map[string]any
+	if json.Unmarshal([]byte(integrationToolDiagnostic(request, nil, nil, 0)), &metadata) != nil {
+		return `{"Predicate":"prompted-diagnostic-unavailable"}`
+	}
+	metadata["Predicate"] = "observed-prompted-tool-schemas"
+	for _, key := range []string{"Required", "Parsed", "Clock", "Async", "Question"} {
+		delete(metadata, key)
+	}
+	data, _ := json.Marshal(metadata)
+	return string(data)
+}
+
 func integrationToolNames(request map[string]any, questionControl bool) (map[string]bool, error) {
 	names := map[string]bool{}
 	tools, ok := request["tools"].([]any)
@@ -2220,9 +2418,13 @@ func integrationToolNames(request map[string]any, questionControl bool) (map[str
 	return names, nil
 }
 
-// Codex 0.163.0 prefixes input with a BaseInstructionsFragment developer
+// Codex 0.163/0.164 prefix input with a BaseInstructionsFragment developer
 // message. Text elsewhere cannot prove this instruction role.
 func integrationBaseInstructions(request map[string]any) bool {
+	return integrationBaseInstructionsText(request, "Return the requested JSON.")
+}
+
+func integrationBaseInstructionsText(request map[string]any, expected string) bool {
 	if _, present := request["instructions"]; present {
 		return false
 	}
@@ -2239,7 +2441,7 @@ func integrationBaseInstructions(request map[string]any) bool {
 		return false
 	}
 	part, ok := content[0].(map[string]any)
-	return ok && part["type"] == "input_text" && part["text"] == "Return the requested JSON."
+	return ok && part["type"] == "input_text" && part["text"] == expected
 }
 
 func TestEphemeralIntegrationBaseInstructionShape(t *testing.T) {
@@ -2298,6 +2500,27 @@ func TestEphemeralIntegrationToolSchemaShapes(t *testing.T) {
 				t.Fatal("unexpected model-facing schema accepted")
 			}
 		})
+	}
+}
+
+func TestPromptedEphemeralIntegrationToolObservation(t *testing.T) {
+	request := map[string]any{"tools": []any{
+		map[string]any{"type": "custom", "name": "apply_patch", "description": "PRIVATE_DESCRIPTION"},
+		map[string]any{"type": "namespace", "name": "functions", "tools": []any{
+			map[string]any{"type": "function", "name": "request_permissions"},
+		}},
+	}, "input": []any{}}
+	encoded := integrationPromptedToolDiagnostic(request)
+	var observation map[string]any
+	if json.Unmarshal([]byte(encoded), &observation) != nil || observation["Predicate"] != "observed-prompted-tool-schemas" ||
+		observation["TopTools"] != float64(2) || !strings.Contains(encoded, "apply_patch") || !strings.Contains(encoded, "request_permissions") ||
+		strings.Contains(encoded, "PRIVATE_DESCRIPTION") {
+		t.Fatalf("actual prompted tools lost or private metadata leaked: %s", encoded)
+	}
+	for _, key := range []string{"Required", "Parsed", "Clock", "Async", "Question"} {
+		if _, exists := observation[key]; exists {
+			t.Fatalf("prompted observation invented a strict requirement/absence flag: %s", key)
+		}
 	}
 }
 
@@ -3032,6 +3255,9 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	if fileErr != nil || string(content) != EphemeralInstructionFileContent {
 		t.Fatal("native fixture instruction file differs from public contract")
 	}
+	if h.prompted {
+		opts.Instructions = integrationPromptedInstructions
+	}
 	opts.Input = "RAW_UTILITY_PREFIX_SENTINEL: fix runtime session naming"
 	duration := 3 * time.Second
 	if mode == "native-retry" {
@@ -3062,7 +3288,13 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	h.mu.Lock()
 	h.diagnosticCallContext, h.diagnosticCallActive = ctx, true
 	h.mu.Unlock()
-	result, err := client.RunEphemeralTurn(ctx, opts)
+	var result EphemeralTurnResult
+	var err error
+	if h.prompted {
+		result, err = client.RunPromptedEphemeralTurn(ctx, opts)
+	} else {
+		result, err = client.RunEphemeralTurn(ctx, opts)
+	}
 	h.mu.Lock()
 	h.diagnosticCallActive = false
 	h.mu.Unlock()
@@ -3075,7 +3307,7 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	evidence, _ := json.Marshal(phases)
 	t.Logf("native utility phase evidence (fixed deny baseline=%d; ordinary thread=%s): %s", h.egressDrops, h.controlThread, evidence)
 	if toolDiagnostic != "" {
-		t.Logf("native tool-schema mismatch metadata: %s", toolDiagnostic)
+		t.Logf("native tool-schema observation: %s", toolDiagnostic)
 	}
 	if ordinaryErr := <-ordinaryDone; ordinaryErr != nil {
 		t.Fatal("ordinary connection disrupted")
@@ -3310,7 +3542,14 @@ func (h *ephemeralIntegrationHarness) managedConflict(t *testing.T) {
 	defer client.Close()
 	opts := ephemeralTestOptions(t)
 	opts.ModelCatalogFile, opts.Model = h.catalog, integrationUtilityModel()
-	_, err := runEphemeralTest(t, client, opts)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var err error
+	if h.prompted {
+		_, err = client.RunPromptedEphemeralTurn(ctx, opts)
+	} else {
+		_, err = client.RunEphemeralTurn(ctx, opts)
+	}
 	if !errors.Is(err, ErrEphemeralIsolation) {
 		t.Fatalf("managed restriction not refused: %v", err)
 	}
@@ -3334,7 +3573,7 @@ type ephemeralIntegrationSQLiteDiagnostic struct {
 	Owners                                   []ephemeralIntegrationSQLiteOwner
 }
 
-// The complete current definition in pinned Codex 0.163.0
+// The shared definition in pinned Codex 0.163/0.164
 // state/logs_migrations/0002_logs_feedback_log_body.sql. This is a fixture
 // acceptance boundary, not a schema compatibility or migration mechanism.
 const integrationLogsDDL = `CREATE TABLE logs (

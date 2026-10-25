@@ -983,10 +983,23 @@ Codex build they deploy.
 
 ## Ephemeral utility turns
 
-`Client.RunEphemeralTurn(ctx, EphemeralTurnOptions)` returns
-`EphemeralTurnResult{Text: ...}` for one completed final answer. It is an additive
-Go API for trusted application callers; there is no browser route for selecting
-its socket, paths, model or restriction settings.
+`Client.RunEphemeralTurn(ctx, EphemeralTurnOptions)` provides the strict
+utility contract for Codex 0.163.0. `Client.RunPromptedEphemeralTurn(ctx,
+EphemeralTurnOptions)` provides a separate naming contract for raw Codex 0.164.0.
+Both return `EphemeralTurnResult{Text: ...}` for one completed final answer and
+share the bounded private runner, sink, fixed restrictions and cleanup/retry
+proof. These Go APIs accept trusted application inputs; no browser route selects
+their socket, paths, model or restriction settings.
+
+Native tools can remain advertised and available under the prompted contract.
+It makes no guarantee about native tool registration, tool attempts or their
+effects. Naming instructions must treat only the supplied request as data,
+prohibit tools, file reads, commands, browsing, delegation and questions, and
+require only the name JSON. Those instructions guide the model; they are not
+an enforced security boundary. Both entry points still reject interactive server
+requests and questions through their private sink. Do not give naming a workspace
+cwd, attachments or team context. The consuming runtime verifies the exact native
+executable; the strict 0.163 contract is not supported on raw 0.164.
 
 `ModelProvider` optionally selects a trusted provider ID on `thread/start`.
 The helper requires the server to confirm that provider before `turn/start`;
@@ -994,8 +1007,9 @@ a missing or different provider fails with `ErrEphemeralServer` without sending
 the prompt for inference. An empty value uses the native server's default.
 Callers with their own provider selection must resolve and pass it on each call.
 
-The supported profiles use Codex 0.163.0 and `Effort: "low"`, with either
-`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Each requires its matching
+The strict 0.163.0 profiles use `Effort: "low"`, with either
+`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted raw 0.164.0 naming supports
+only `Model: "gpt-6-luna"` and `Effort: "low"`. Each requires its matching
 immutable catalog below. Other pairs fail with `ErrEphemeralSettings` before
 connecting.
 The caller runs a dedicated utility App Server with the selected profile
@@ -1028,14 +1042,20 @@ GPT-6 Luna uses `codex/ephemeral_luna_models.json`, SHA-256
 `049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1`.
 It contains the original Luna metadata
 with `tool_mode` set to `direct`, `experimental_supported_tools` emptied and
-`use_responses_lite` set to `false`. The native request uses the standard
-Responses shape with top-level `tools: []` and no `additional_tools` input role.
-Codex 0.163.0 sends explicit base instructions as the first developer message
-in `input`, rather than a top-level `instructions` field. The native fixture
-checks that exact role, position and text independently of ordinary user input.
-These settings prevent the model profile from introducing a code executor,
-user questions or the clock tool. Catalogs are bound to their model; they cannot be
-interchanged. Normal conversation catalogs remain unchanged. GPT-5.5 availability
+`use_responses_lite` set to `false`. Full and derived catalog bytes are identical
+in Codex 0.163.0 and 0.164.0; their separate provenance records describe that
+shared content. Hash validation proves catalog content, not the native release
+or its tool-isolation behavior. Both supported releases use the standard
+Responses shape. Strict 0.163 requires top-level `tools: []` and no
+`additional_tools` input role; the prompted 0.164 fixture records actual native
+tool schemas. Both releases send explicit base
+instructions as the first developer message in `input`, rather than a top-level
+`instructions` field. The native fixture checks that exact role, position and
+text independently of ordinary user input. The derived Luna metadata removes
+the model-selected code executor, async questions and clock selection; it does
+not remove every native 0.164 tool. Catalogs are bound to their model; they
+cannot be interchanged. Normal conversation catalogs remain unchanged.
+GPT-5.5 availability
 depends on the provider; ChatGPT sign-in no longer offers it after its
 [retirement](https://developers.openai.com/codex/models/).
 Supply an immutable resource for the utility daemon's entire lifetime; resolve
@@ -1140,6 +1160,19 @@ After `willRetry: false`, a transient candidate waits for the exact owned
 `turn/completed` with failed/interrupted status before teardown can authorize
 a fresh call. An exact failed completion can also supply its own classification.
 A later successful completion cannot restore a terminally failed attempt.
+
+Once a turn has settled, contradictory or malformed turn or item events and
+interactive question metadata permanently revoke that call's retry eligibility.
+A duplicate failed completion preserves eligibility only if its validated status,
+error and item evidence agree. JSON key order and unrelated timestamps do not
+matter.
+
+The helper detaches the private connection at the matching generation, then
+closes it and waits for its reader within the original cleanup deadline. It
+validates frames already read before making the final success or retry decision.
+After a connection starts, an unexpected disconnect, missing reader or failed
+join prevents retry.
+
 An error event, interrupt acknowledgement, unsubscribe or socket close alone
 does not prove stopped execution. Lost start replies, ambiguous ownership,
 cleanup failure and cancellation/deadline expiry always prevent retry.
@@ -1162,10 +1195,17 @@ public protocol has no scoped stop/join operation for them.
 
 Native ephemeral mode omits resumable conversation storage. Codex's separate
 SQLite diagnostic logger can retain plaintext utility input and thread/turn
-identities in `logs_2.sqlite` under the configured SQLite home. The helper keeps
-that existing local logger enabled. Codex 0.163.0 prunes rows older than ten days
-at startup; this is not a guaranteed erasure deadline. Application operational
-logs and normal conversation history have separate retention contracts.
+identities in `logs_2.sqlite`. Codex 0.164.0 uses the configured SQLite home
+unless `log_dir` is explicitly configured without a managed `sqlite_home`
+requirement; in that case, diagnostic logs use `log_dir`. The helper keeps
+that local logger enabled. Codex 0.163 prunes rows older than ten days at
+startup. Codex 0.164 maintenance immediately prunes the current log database and
+any existing legacy log databases, then repeats periodically. It starts with a
+ten-day retention window and shortens that window when occupied pages exceed
+64 MiB. SQLite reuses freed pages, so this is neither a file-size
+limit nor a guaranteed erasure deadline.
+Application operational logs and normal conversation history have separate
+retention contracts.
 
 Fake-transport tests verify client behavior, not model-action isolation.
 `test/codex_protocol_contract.py` includes every literal utility call site and
@@ -1174,9 +1214,10 @@ consumed shape. Separately validate fixed restriction keys/types with
 `codex-rs/core/config.schema.json`.
 
 After mandatory independent review, the tagged
-`TestEphemeralProtocolIntegration` exercises the exact candidate with a local
-mock of the built-in OpenAI Responses provider. It retains the binary's model
-catalog and built-in provider capabilities. The mock returns HTTP 426 for valid
+`TestEphemeralProtocolIntegration` exercises strict Codex 0.163, and
+`TestPromptedEphemeralProtocolIntegration` exercises prompted raw Codex 0.164.
+Both use a local mock of the built-in OpenAI Responses provider and retain the
+binary's model catalog and built-in provider capabilities. The mock returns HTTP 426 for valid
 WebSocket upgrades, so the native server selects its supported HTTP Responses
 fallback. Plain GET remains 404; inference must reach the mock through real
 POST requests. This covers native HTTP/SSE behavior. Successful WebSocket
@@ -1184,12 +1225,14 @@ framing, continuation caching, reconnects and hostile tool delivery over
 WebSockets require separate coverage. Release verification also requires a
 positive model call using the serving instance's unchanged transport settings.
 
-The control conversation must prove sentinel/tool eligibility. The utility
-inspects actual advertised schemas and hostile dispatch, including rejected
-clock and async-question names. Separate labelled controls temporarily enable
+The control conversation must prove sentinel/tool eligibility. The strict
+fixture inspects empty advertised schemas and hostile dispatch, including
+rejected clock and async-question names. The prompted fixture records the
+actual tool schemas and does not require absent native handlers or run the
+strict hostile-dispatch assertions. Separate labelled controls temporarily enable
 actual-ID questions to verify rejection and cancellation. The fixture also
 checks early events, cancellation/disconnect and an ordinary concurrent client.
-It holds inference without tools open while dropping turn/start responses,
+It holds synthetic inference open while dropping turn/start responses,
 requiring exact interruption and actual provider cancellation. It inspects
 pinned-source goal/memory stores and persistent synthetic state, using private
 Linux user/network/mount/PID namespaces with nftables egress restricted to the
@@ -1222,15 +1265,33 @@ go test -mod=readonly -tags=codex_integration ./codex \
 ```
 
 A passing schema or fake-transport check does not authorize live use. Record the
-exact binary/profile/model identities and executed isolation evidence before
-enabling a deployment that uses this helper.
+exact binary/profile/model identities and the selected contract's executed
+acceptance evidence before enabling a deployment that uses either helper.
 
-For Luna profile acceptance, run that same native hostile-dispatch suite with
+For strict 0.163 Luna profile acceptance, run that same native hostile-dispatch
+suite with
 `CODEX_EPHEMERAL_TEST_MODEL=gpt-6-luna` and `CODEX_EPHEMERAL_TEST_CATALOG` set to
 the canonical immutable `codex/ephemeral_luna_models.json` path from the reviewed
 provider revision. The default invocation retains the original GPT-5.5 profile.
 Both runs must prove empty tool exposure and rejection of model-emitted calls;
 fake-client tests do not establish native dispatch isolation.
+
+For prompted naming, select the reviewed raw 0.164 binary/hash/source with the
+same namespace prerequisites. Set `CODEX_EPHEMERAL_TEST_MODEL=gpt-6-luna` and
+`CODEX_EPHEMERAL_TEST_CATALOG` to the canonical immutable Luna catalog. After the
+namespace ownership control passes, run:
+
+```sh
+go test -mod=readonly -tags=codex_integration ./codex \
+  -run '^TestPromptedEphemeralProtocolIntegration$' -count=1 -timeout=180s
+```
+
+This fixture checks fixed-request defenses, actual tool-schema observation,
+owned final output, native retry progress, terminal retry proof, question
+rejection, cancellation and namespace/process teardown. It does not establish
+model adherence to naming instructions with a real provider or native tool-effect
+isolation. The consuming application's positive naming canary uses its exact
+packaged child and instructions within its original naming deadline.
 
 ## Web citations
 

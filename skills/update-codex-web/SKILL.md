@@ -11,6 +11,14 @@ version, executable and source. If called directly, establish those inputs befor
 changing the compatibility contract. Do not add a binary dependency to this
 repository's flake merely to select a release.
 
+The strict `RunEphemeralTurn` contract supports Codex 0.163.0 with both existing
+model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0
+and Luna/low. The prompted contract retains the bounded runner and fixed
+defenses. Its prompt guides the model without establishing tool-effect isolation. Preserve both API
+contracts; do not relabel a prompted native pass as strict isolation evidence.
+The consuming runtime verifies the exact executable. Identical catalog bytes or
+a pathname cannot identify a native version.
+
 ## Inspect the selected release
 
 Record the exact executable's version and SHA-256, its package/source revisions
@@ -37,8 +45,9 @@ and fail-closed utility behavior.
 
 ## Refresh catalogs together
 
-The full fixture in codex/testdata/ephemeral-models.json is the unchanged source
-models-manager/models.json. Refresh its provenance and hash. Derive
+The full fixture in codex/testdata/ephemeral-models.json is the unchanged 0.163
+source models-manager/models.json. The 0.164 source is byte-identical. Retain
+one canonical resource per catalog and provenance for both releases. Derive
 codex/ephemeral_luna_models.json from that same full catalog, selecting only Luna
 and changing its tool_mode to direct, experimental_supported_tools to an empty
 list, and use_responses_lite to false. Preserve all other Luna metadata.
@@ -48,12 +57,17 @@ python3 skills/update-codex-web/scripts/refresh-catalogs.py \
   --source "$codex_source" --version "$codex_version"
 ```
 
-The helper writes both catalogs and source provenance and prints their hashes.
+For `--version 0.163.0`, the helper regenerates the strict catalogs and their
+original provenance. For `--version 0.164.0`, it verifies that both generated
+catalogs match the existing canonical resources, then writes separate prompted
+provenance without overwriting the strict resource or provenance. It prints both
+hashes. A mismatch requires compatibility inspection; do not manufacture version
+distinctions through changed metadata, copied JSON files or trusted pathnames.
 
-Update the corresponding immutable hashes in codex/ephemeral.go, tests and the
-reference. Keep the catalog's exact bytes reproducible. Preserve both supported
-model/effort pairs unless the requested upgrade explicitly changes that contract.
-Do not broaden accepted catalog contents to make an upgrade pass.
+Keep corresponding immutable hashes in codex/ephemeral.go, tests and the
+reference aligned with actual catalog content. Preserve both strict model/effort
+pairs and the fixed prompted Luna/low pair. Do not broaden accepted contents or
+change ApplyPatch metadata to make an upgrade pass.
 
 ## Verify and return evidence
 
@@ -62,11 +76,16 @@ config-policy checks before final review. Follow the caller's normal commit,
 review and publication gates; when orchestrated, return the completed committed
 changes for its combined final review before long native tests.
 
-After review, follow docs/reference.md for namespace ownership, exact-binary
-hostile-dispatch integration and both model profiles. Retain the binary hash,
-catalog identity, actual tool exposure/rejection and process teardown evidence.
-Missing prerequisites or failed isolation block release. Fake transports and
-schema checks alone do not establish native isolation.
+After review, follow docs/reference.md for namespace ownership and the native
+selector matching the supported contract. Strict 0.163 requires hostile-dispatch
+integration with both model profiles. Prompted raw 0.164 naming records actual
+tool schemas without requiring an empty list or absent registry handlers. It
+still checks fixed requests, output, retry proof, question rejection, deadlines
+and process teardown. Retain binary/source/patch/catalog identities and actual
+observations. Missing prerequisites or failed required checks block release.
+Fake transports and schemas establish neither native isolation nor real-provider
+adherence to naming instructions. The consuming runtime owns its real naming
+canary and native state/activation verification.
 
 Return the final source revision, selected Codex/source identities, catalog
 hashes, API/compatibility changes, executed checks and remaining release gates.

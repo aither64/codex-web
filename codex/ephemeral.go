@@ -92,10 +92,33 @@ type EphemeralTurnOptions struct {
 
 type EphemeralTurnResult struct{ Text string }
 
-// RunEphemeralTurn runs one bounded utility turn on a private connection. It
-// never adopts/reconnects a thread or records a submission. Operators must pause
-// naming before MCP reconfiguration; each call disables its captured MCP names.
-func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions) (result EphemeralTurnResult, err error) {
+// RunEphemeralTurn runs one strict utility turn on a private connection. Its
+// tool-isolation contract supports Codex 0.163 with the fixed immutable catalog.
+// The caller verifies the serving executable; catalog bytes do not identify a
+// native release. It never adopts/reconnects a thread or records a submission.
+func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions) (EphemeralTurnResult, error) {
+	return c.runEphemeralTurn(ctx, opts, ephemeralStrict)
+}
+
+// RunPromptedEphemeralTurn runs one bounded naming turn on a private connection
+// using gpt-6-luna/low and the fixed catalog with raw Codex 0.164. Tools may be
+// advertised or attempted: prompt instructions are guidance, not an enforced
+// tool-effect isolation boundary. The caller verifies the serving executable
+// and supplies explicit naming instructions, including the prohibition on tools.
+// Interactive requests are rejected; execution and cleanup retain the original
+// finite deadline. Operators must pause calls before MCP reconfiguration.
+func (c *Client) RunPromptedEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions) (EphemeralTurnResult, error) {
+	return c.runEphemeralTurn(ctx, opts, ephemeralPrompted)
+}
+
+type ephemeralContract uint8
+
+const (
+	ephemeralStrict ephemeralContract = iota
+	ephemeralPrompted
+)
+
+func (c *Client) runEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions, contract ephemeralContract) (result EphemeralTurnResult, err error) {
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
@@ -106,7 +129,8 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
-	if (opts.Model != "gpt-5.5" && opts.Model != "gpt-6-luna") || opts.Effort != "low" {
+	if (opts.Model != "gpt-5.5" && opts.Model != "gpt-6-luna") || opts.Effort != "low" ||
+		(contract == ephemeralPrompted && opts.Model != "gpt-6-luna") {
 		return result, ErrEphemeralSettings
 	}
 	if opts.ModelProvider != "" && (!ephemeralID(opts.ModelProvider) || strings.TrimSpace(opts.ModelProvider) != opts.ModelProvider || strings.ContainsAny(opts.ModelProvider, "\x00\r\n\t ")) {
@@ -156,17 +180,19 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 				result, err = EphemeralTurnResult{}, ErrEphemeralServer
 			}
 		}
+		joined := private.closeEphemeral(cleanup, generation)
+		if err == nil && !joined {
+			result, err = EphemeralTurnResult{}, ErrEphemeralServer
+		}
 		if err == nil {
 			if failed := sink.failure(); failed != nil {
 				result, err = EphemeralTurnResult{}, failed
 			}
 		}
-		retryable := cleanupOK && errors.Is(err, ErrEphemeralServer) &&
-			(dialTransient || sink.canRetry(generation, threadID, turnID))
-		private.Close()
 		if ctx.Err() != nil {
 			result, err = EphemeralTurnResult{}, ctx.Err()
-		} else if retryable {
+		} else if joined && cleanupOK && errors.Is(err, ErrEphemeralServer) &&
+			(dialTransient || sink.canRetry(generation, threadID, turnID)) {
 			err = &ephemeralRetryError{category: err, retryable: true}
 		}
 	}()
@@ -364,6 +390,49 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 		case <-inference.Done():
 			return EphemeralTurnResult{}, failure(ErrEphemeralProtocol)
 		}
+	}
+}
+
+type ephemeralReader struct {
+	connection *websocket.Conn
+	generation uint64
+	done       chan struct{}
+}
+
+// The exact local detach is the shutdown cutoff. Already-read frames still run
+// through the sink, and the final proof is sampled only after this reader exits.
+func (c *Client) closeEphemeral(ctx context.Context, generation uint64) bool {
+	c.connectionMu.Lock()
+	reader := c.ephemeralReader
+	noReader := c.ephemeral != nil && reader == nil && c.connection == nil && c.generation == 0 && generation == 0
+	expected := c.ephemeral != nil && !c.closed && reader != nil && reader.generation == generation &&
+		c.generation == generation && c.connection == reader.connection && c.ready == generation
+	if expected {
+		c.closed = true
+		c.detachConnectionLocked(generation, errors.New("client closed"))
+	}
+	c.connectionMu.Unlock()
+	var closeErr error
+	if reader != nil {
+		closeErr = reader.connection.CloseNow()
+	}
+	// The public close keeps its ordinary behavior. After the exact detach it
+	// sees no active connection and cannot synthesize a sink disconnect failure.
+	c.Close()
+	if expected {
+		c.broadcast("")
+	}
+	if noReader {
+		return ctx.Err() == nil
+	}
+	if reader == nil {
+		return false
+	}
+	select {
+	case <-reader.done:
+		return expected && closeErr == nil && ctx.Err() == nil
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -674,13 +743,16 @@ type ephemeralSink struct {
 	finalID, finalText string
 	completed          bool
 	terminalFailure    bool
+	terminalEvidence   [sha256.Size]byte
 	transient          bool
+	retryRevoked       bool
 	settled            bool
 }
 
 func (s *ephemeralSink) fail(err error) {
 	s.mu.Lock()
 	s.transient = false
+	s.retryRevoked = true
 	if s.err == nil {
 		s.err = err
 		s.cancel()
@@ -773,41 +845,12 @@ func (s *ephemeralSink) handle(c *Client, connection *websocket.Conn, generation
 		s.fail(ErrEphemeralIsolation)
 		return true
 	}
-	// One issued turn on this new private thread may identify itself before its
-	// RPC response. Such an ID authorizes interruption only, never success.
-	if message.Method == "turn/started" || message.Method == "turn/completed" || message.Method == "item/started" || message.Method == "item/completed" {
-		s.mu.Lock()
-		s.noteCleanupIdentityLocked(message)
-		failed := s.err != nil
-		s.mu.Unlock()
-		if failed {
-			s.signal()
-			return true
-		}
-	}
-	// Metadata-driven async questions have no JSON-RPC request ID. Reject their
-	// started/completed item immediately, even before start responses are known.
-	if message.Method == "item/started" || message.Method == "item/completed" {
-		params, ok := ephemeralObject(message.Params)
-		if !ok {
-			s.fail(ErrEphemeralProtocol)
-			return true
-		}
-		item, ok := params["item"].(map[string]any)
-		if !ok {
-			s.fail(ErrEphemeralProtocol)
-			return true
-		}
-		if item["delivery"] == "async" || item["questions"] != nil {
-			s.fail(ErrEphemeralIsolation)
-			return true
-		}
-	}
-	if message.Method != "item/completed" && message.Method != "turn/completed" && message.Method != "error" {
+	if message.Method != "item/started" && message.Method != "item/completed" &&
+		message.Method != "turn/started" && message.Method != "turn/completed" && message.Method != "error" {
 		return true
 	}
 	s.mu.Lock()
-	if !s.rejectErrorLocked(message) && s.err == nil {
+	if !s.rejectEvidenceLocked(message) && s.err == nil {
 		if s.threadID == "" || s.turnID == "" {
 			if len(s.events) >= 32 {
 				s.err = ErrEphemeralProtocol
@@ -880,8 +923,141 @@ func (s *ephemeralSink) cleanupTurn(generation uint64, threadID, responseTurnID 
 func (s *ephemeralSink) canRetry(generation uint64, threadID, turnID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.transient && s.terminalFailure && s.settled && !s.cleanupAmbiguous &&
+	return !s.retryRevoked && s.transient && s.terminalFailure && s.settled && !s.cleanupAmbiguous &&
 		s.generation == generation && s.threadID == threadID && s.turnID == turnID && turnID != ""
+}
+
+// Validate relevant evidence before prior-error shortcuts in both live delivery
+// and buffered replay. An earlier failure cannot conceal contradictory evidence.
+func (s *ephemeralSink) rejectEvidenceLocked(message rpcMessage) bool {
+	if s.rejectErrorLocked(message) {
+		return true
+	}
+	if message.Method == "error" {
+		return false
+	}
+	s.noteCleanupIdentityLocked(message)
+	bad := func(category error) bool {
+		s.retryRevoked, s.transient = true, false
+		if s.err == nil {
+			s.err = category
+			s.cancel()
+		}
+		return true
+	}
+	if s.cleanupAmbiguous {
+		return bad(ErrEphemeralProtocol)
+	}
+	params, ok := ephemeralObject(message.Params)
+	if !ok {
+		return bad(ErrEphemeralProtocol)
+	}
+	if message.Method == "item/started" || message.Method == "item/completed" {
+		item, ok := params["item"].(map[string]any)
+		if !ok {
+			return bad(ErrEphemeralProtocol)
+		}
+		if err := s.validateItemLocked(item, message.Method == "item/completed"); err != nil {
+			return bad(err)
+		}
+		return false
+	}
+	turn, ok := params["turn"].(map[string]any)
+	if !ok {
+		return bad(ErrEphemeralProtocol)
+	}
+	if message.Method == "turn/started" {
+		if s.settled {
+			return bad(ErrEphemeralProtocol)
+		}
+		return false
+	}
+	if s.completed {
+		return bad(ErrEphemeralProtocol)
+	}
+	if turn["status"] != "completed" && turn["status"] != "failed" && turn["status"] != "interrupted" {
+		return bad(ErrEphemeralProtocol)
+	}
+	if failure := turn["error"]; failure != nil {
+		if _, valid := ephemeralTurnError(failure); !valid {
+			return bad(ErrEphemeralProtocol)
+		}
+	}
+	items, ok := turn["items"].([]any)
+	if !ok {
+		return bad(ErrEphemeralProtocol)
+	}
+	for _, value := range items {
+		item, ok := value.(map[string]any)
+		if !ok {
+			return bad(ErrEphemeralProtocol)
+		}
+		if err := s.validateItemLocked(item, true); err != nil {
+			return bad(err)
+		}
+	}
+	if s.settled && s.terminalFailure && ephemeralCompletionEvidence(turn) != s.terminalEvidence {
+		return bad(ErrEphemeralProtocol)
+	}
+	return false
+}
+
+// Only consumed semantic fields identify a duplicate completion. JSON ordering,
+// optional null fields and unrelated timestamps do not change that evidence.
+func ephemeralCompletionEvidence(turn map[string]any) [sha256.Size]byte {
+	evidence := map[string]any{"status": turn["status"]}
+	if failure, ok := turn["error"].(map[string]any); ok {
+		fields := map[string]any{}
+		for _, key := range []string{"message", "codexErrorInfo", "additionalDetails", "misalignment"} {
+			if value := failure[key]; value != nil {
+				fields[key] = value
+			}
+		}
+		if info, ok := failure["codexErrorInfo"].(map[string]any); ok {
+			typed := map[string]any{}
+			for key, value := range info {
+				if detail, ok := value.(map[string]any); ok {
+					status := map[string]any{}
+					if code := detail["httpStatusCode"]; code != nil {
+						status["httpStatusCode"] = code
+					}
+					typed[key] = status
+				}
+			}
+			fields["codexErrorInfo"] = typed
+		}
+		if alignment, ok := failure["misalignment"].(map[string]any); ok {
+			details := map[string]any{}
+			for _, key := range []string{"detailedExplanation", "errorType", "reviewTarget"} {
+				if value := alignment[key]; value != nil {
+					details[key] = value
+				}
+			}
+			if steer, ok := alignment["steer"].(map[string]any); ok {
+				details["steer"] = map[string]any{"message": steer["message"]}
+			}
+			delete(fields, "misalignment")
+			if len(details) != 0 {
+				fields["misalignment"] = details
+			}
+		}
+		evidence["error"] = fields
+	}
+	items := []any{}
+	for _, value := range turn["items"].([]any) {
+		item := value.(map[string]any)
+		fields := map[string]any{"id": item["id"], "type": item["type"]}
+		if item["type"] == "agentMessage" {
+			fields["phase"] = item["phase"]
+			if item["phase"] != "commentary" {
+				fields["text"] = item["text"]
+			}
+		}
+		items = append(items, fields)
+	}
+	evidence["items"] = items
+	encoded, _ := json.Marshal(evidence) // Validated bounded JSON values only.
+	return sha256.Sum256(encoded)
 }
 
 func (s *ephemeralSink) rejectErrorLocked(message rpcMessage) bool {
@@ -891,6 +1067,7 @@ func (s *ephemeralSink) rejectErrorLocked(message rpcMessage) bool {
 	// Apply this before the error short circuit in both delivery and replay:
 	// terminal failure cannot hide later contradictory or malformed evidence.
 	s.transient = false
+	s.retryRevoked = true
 	s.err = ErrEphemeralProtocol
 	s.cancel()
 	return true
@@ -947,7 +1124,10 @@ func (s *ephemeralSink) noteCleanupIdentityLocked(message rpcMessage) {
 }
 
 func (s *ephemeralSink) consumeLocked(message rpcMessage) {
-	if s.rejectErrorLocked(message) || s.err != nil {
+	if s.rejectEvidenceLocked(message) || s.err != nil {
+		return
+	}
+	if message.Method == "turn/started" || message.Method == "item/started" {
 		return
 	}
 	params, ok := ephemeralObject(message.Params)
@@ -1020,6 +1200,7 @@ func (s *ephemeralSink) consumeLocked(message rpcMessage) {
 				transient = s.transient
 			}
 			s.terminalFailure, s.transient, s.settled = true, transient, true
+			s.terminalEvidence = ephemeralCompletionEvidence(turn)
 			bad(ErrEphemeralServer)
 			return
 		case "completed":
@@ -1111,27 +1292,36 @@ func ephemeralTurnError(value any) (transient, valid bool) {
 		return false, false
 	}
 }
-func (s *ephemeralSink) itemLocked(item map[string]any) {
-	if s.err != nil || item["type"] != "agentMessage" {
-		return
-	}
+func (s *ephemeralSink) validateItemLocked(item map[string]any, completed bool) error {
 	if item["delivery"] == "async" || item["questions"] != nil {
-		s.err = ErrEphemeralIsolation
-		s.cancel()
-		return
-	}
-	if item["phase"] == "commentary" {
-		return
+		return ErrEphemeralIsolation
 	}
 	id, idOK := item["id"].(string)
+	kind, kindOK := item["type"].(string)
+	if !idOK || !ephemeralID(id) || !kindOK || !ephemeralID(kind) {
+		return ErrEphemeralProtocol
+	}
+	if kind != "agentMessage" || !completed || item["phase"] == "commentary" {
+		return nil
+	}
 	text, textOK := item["text"].(string)
-	if item["phase"] != "final_answer" || !idOK || !ephemeralID(id) || !textOK || text == "" || len(text) > ephemeralOutputLimit || !utf8.ValidString(text) ||
-		(s.finalID != "" && (s.finalID != id || s.finalText != text)) {
-		s.err = ErrEphemeralProtocol
+	if item["phase"] != "final_answer" || !textOK || text == "" || len(text) > ephemeralOutputLimit || !utf8.ValidString(text) ||
+		(s.finalID != "" && (s.finalID != id || s.finalText != text)) || (s.settled && s.terminalFailure && s.finalID == "") {
+		return ErrEphemeralProtocol
+	}
+	return nil
+}
+
+func (s *ephemeralSink) itemLocked(item map[string]any) {
+	if err := s.validateItemLocked(item, true); err != nil {
+		s.retryRevoked, s.transient = true, false
+		s.err = err
 		s.cancel()
 		return
 	}
-	s.finalID, s.finalText = id, text
+	if s.err == nil && item["type"] == "agentMessage" && item["phase"] == "final_answer" {
+		s.finalID, s.finalText = item["id"].(string), item["text"].(string)
+	}
 }
 func (s *ephemeralSink) result() (EphemeralTurnResult, bool, error) {
 	s.mu.Lock()

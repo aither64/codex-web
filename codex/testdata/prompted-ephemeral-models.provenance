@@ -1,0 +1,10 @@
+Raw Codex 0.164.0 codex-rs/models-manager/models.json.
+Uses the unchanged canonical codex/testdata/ephemeral-models.json.
+472072 bytes; SHA-256 943ca7fe1d19ed019054158303f0dbbd80b3bef43b3aa425a71aa7cb3fb52c2b
+Luna reuses canonical codex/ephemeral_luna_models.json.
+62680 bytes; SHA-256 049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1
+Only tool_mode=direct, experimental_supported_tools=[] and
+use_responses_lite=false differ from upstream Luna metadata.
+These bytes match Codex 0.163.0; content does not prove native version
+or tool isolation. Prompted naming supports raw 0.164.0 only;
+the consuming runtime verifies the exact executable.

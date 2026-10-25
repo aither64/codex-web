@@ -372,3 +372,231 @@ func TestEphemeralErrorGenerationMismatch(t *testing.T) {
 		t.Fatal("error from foreign generation retained ownership")
 	}
 }
+
+func ephemeralCompletion(status, info string, items []any) map[string]any {
+	return map[string]any{"method": "turn/completed", "params": map[string]any{
+		"threadId": "utility-thread", "turn": map[string]any{"id": "utility-turn", "status": status, "items": items,
+			"error": map[string]any{"message": "PRIVATE_PROVIDER_DIAGNOSTIC", "codexErrorInfo": info}}}}
+}
+
+func TestEphemeralLateEvidence(t *testing.T) {
+	for _, api := range []string{"strict", "prompted"} {
+		for _, buffered := range []bool{true, false} {
+			for _, mode := range []string{
+				"success", "permanent", "different transient", "changed message", "interrupted", "in progress", "missing status",
+				"malformed error", "malformed items", "malformed item", "missing item identity", "started",
+				"async started", "async completed", "question started", "question completed", "async embedded", "question embedded",
+				"conflicting final", "equivalent duplicate", "consistent final duplicate", "ordinary transient", "native item",
+			} {
+				t.Run(fmt.Sprintf("%s/buffered=%t/%s", api, buffered, mode), func(t *testing.T) {
+					opts := ephemeralTestOptions(t)
+					fake := &ephemeralFake{}
+					if api == "prompted" {
+						opts, fake = promptedEphemeralFixture(t)
+					}
+					answer := map[string]any{"id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "first answer"}
+					items := []any{}
+					if mode == "conflicting final" || mode == "consistent final duplicate" {
+						items = []any{answer}
+					}
+					late := ephemeralCompletion("failed", "serverOverloaded", items)
+					turn := late["params"].(map[string]any)["turn"].(map[string]any)
+					item := map[string]any{"id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "first answer"}
+					switch mode {
+					case "success":
+						turn["status"], turn["items"], turn["error"] = "completed", []any{item}, nil
+					case "permanent":
+						turn["error"].(map[string]any)["codexErrorInfo"] = "unauthorized"
+					case "different transient":
+						turn["error"].(map[string]any)["codexErrorInfo"] = "internalServerError"
+					case "changed message":
+						turn["error"].(map[string]any)["message"] = "DIFFERENT_PRIVATE_DIAGNOSTIC"
+					case "interrupted":
+						turn["status"] = "interrupted"
+					case "in progress":
+						turn["status"] = "inProgress"
+					case "missing status":
+						delete(turn, "status")
+					case "malformed error":
+						turn["error"] = true
+					case "malformed items":
+						turn["items"] = false
+					case "malformed item":
+						turn["items"] = []any{true}
+					case "missing item identity":
+						delete(item, "id")
+						turn["items"] = []any{item}
+					case "started":
+						late["method"], turn["status"], turn["error"] = "turn/started", "inProgress", nil
+					case "equivalent duplicate":
+						turn["completedAtMs"] = 123
+						turn["error"].(map[string]any)["additionalDetails"] = nil
+						turn["error"].(map[string]any)["misalignment"] = nil
+					case "ordinary transient":
+						late = nil
+					default:
+						if strings.HasPrefix(mode, "async") {
+							item["delivery"] = "async"
+						}
+						if strings.HasPrefix(mode, "question") {
+							item["questions"] = []any{}
+						}
+						if mode == "conflicting final" {
+							item["text"] = "different answer"
+						}
+						if mode == "native item" {
+							item = map[string]any{"id": "native", "type": "commandExecution"}
+						}
+						if strings.HasSuffix(mode, "embedded") {
+							turn["items"] = []any{item}
+						} else {
+							method := "item/completed"
+							if strings.HasSuffix(mode, "started") {
+								method = "item/started"
+							}
+							late = map[string]any{"method": method, "params": map[string]any{"threadId": "utility-thread", "turnId": "utility-turn", "item": item}}
+						}
+					}
+					deliver := func(connection *websocket.Conn) error {
+						if late == nil {
+							return nil
+						}
+						var frame any = late
+						if mode == "equivalent duplicate" {
+							// Different key order and unrelated timestamps must not revoke proof.
+							frame = json.RawMessage(`{"params":{"turn":{"items":[],"status":"failed","completedAtMs":123,"error":{"codexErrorInfo":"serverOverloaded","misalignment":null,"message":"PRIVATE_PROVIDER_DIAGNOSTIC","additionalDetails":null},"id":"utility-turn"},"threadId":"utility-thread"},"method":"turn/completed"}`)
+						}
+						if err := writeObject(connection, frame); err != nil {
+							return err
+						}
+						// A valid frame after a contradiction must never restore eligibility.
+						return writeObject(connection, ephemeralCompletion("failed", "serverOverloaded", items))
+					}
+					fake.turn = func(connection *websocket.Conn, call map[string]any) error {
+						if !buffered {
+							if err := ephemeralTurnResponse(connection, call); err != nil {
+								return err
+							}
+						}
+						if err := ephemeralWriteError(connection, ephemeralErrorParams("serverOverloaded", false)); err != nil {
+							return err
+						}
+						if err := writeObject(connection, ephemeralCompletion("failed", "serverOverloaded", items)); err != nil {
+							return err
+						}
+						if buffered {
+							if err := deliver(connection); err != nil {
+								return err
+							}
+							return ephemeralTurnResponse(connection, call)
+						}
+						return nil
+					}
+					if !buffered {
+						fake.beforeUnsubscribe = deliver // Already bound and settled; no sleep or race assumption.
+					}
+					client := New(fake.serve(t))
+					defer client.Close()
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					defer cancel()
+					var result EphemeralTurnResult
+					var err error
+					if api == "prompted" {
+						result, err = client.RunPromptedEphemeralTurn(ctx, opts)
+					} else {
+						result, err = client.RunEphemeralTurn(ctx, opts)
+					}
+					wantRetry := mode == "ordinary transient" || mode == "equivalent duplicate" || mode == "consistent final duplicate" || mode == "native item"
+					if err == nil || result.Text != "" || CanRetryEphemeralTurn(err) != wantRetry || CanRetryEphemeralTurn(fmt.Errorf("wrapped: %w", err)) != wantRetry || strings.Contains(err.Error(), "PRIVATE") {
+						t.Fatalf("result=%#v err=%v retry=%t want=%t", result, err, CanRetryEphemeralTurn(err), wantRetry)
+					}
+					starts, interrupts := 0, 0
+					for _, call := range fake.snapshot() {
+						if call["method"] == "turn/start" {
+							starts++
+						}
+						if call["method"] == "turn/interrupt" {
+							interrupts++
+							params := call["params"].(map[string]any)
+							if !buffered || wantRetry || params["threadId"] != "utility-thread" || params["turnId"] != "utility-turn" {
+								t.Fatal("foreign or redundantly settled execution was interrupted")
+							}
+						}
+					}
+					if starts != 1 || interrupts > 1 {
+						t.Fatalf("starts=%d interrupts=%d", starts, interrupts)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestEphemeralEquivalentFailureEvidence(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sink := &ephemeralSink{cancel: cancel, changed: make(chan struct{}, 1), generation: 1,
+		threadID: "utility-thread", turnID: "utility-turn", turnIssued: true}
+	for _, raw := range []string{
+		`{"threadId":"utility-thread","turn":{"id":"utility-turn","status":"failed","items":[],"error":{"message":"private","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":null}},"misalignment":{"errorType":null,"steer":null}}}}`,
+		`{"turn":{"error":{"misalignment":{},"codexErrorInfo":{"httpConnectionFailed":{}},"message":"private"},"status":"failed","id":"utility-turn","items":[],"completedAtMs":456},"threadId":"utility-thread"}`,
+	} {
+		sink.consumeLocked(rpcMessage{Method: "turn/completed", Params: json.RawMessage(raw)})
+		if !sink.canRetry(1, "utility-thread", "utility-turn") {
+			t.Fatal("equivalent validated optional error evidence revoked retry")
+		}
+	}
+	for _, info := range []string{"internalServerError", "serverOverloaded"} {
+		value := ephemeralCompletion("failed", info, []any{})["params"]
+		raw, _ := json.Marshal(value)
+		sink.consumeLocked(rpcMessage{Method: "turn/completed", Params: raw})
+		if sink.canRetry(1, "utility-thread", "utility-turn") {
+			t.Fatal("different transient evidence restored a revoked candidate")
+		}
+	}
+}
+
+func TestEphemeralLateSuccessEvidence(t *testing.T) {
+	for _, api := range []string{"strict", "prompted"} {
+		for _, mode := range []string{"async", "failed completion", "consistent final duplicate"} {
+			t.Run(api+"/"+mode, func(t *testing.T) {
+				opts := ephemeralTestOptions(t)
+				fake := &ephemeralFake{}
+				if api == "prompted" {
+					opts, fake = promptedEphemeralFixture(t)
+				}
+				fake.beforeUnsubscribe = func(connection *websocket.Conn) error {
+					if mode == "failed completion" {
+						return writeObject(connection, ephemeralCompletion("failed", "serverOverloaded", []any{}))
+					}
+					item := map[string]any{"id": "answer", "type": "agentMessage", "phase": "final_answer", "text": `{"name":"fix runtime session names"}`}
+					if mode == "async" {
+						item["delivery"] = "async"
+					}
+					return writeObject(connection, map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "utility-thread", "turnId": "utility-turn", "item": item}})
+				}
+				client := New(fake.serve(t))
+				defer client.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				var result EphemeralTurnResult
+				var err error
+				if api == "prompted" {
+					result, err = client.RunPromptedEphemeralTurn(ctx, opts)
+				} else {
+					result, err = client.RunEphemeralTurn(ctx, opts)
+				}
+				if CanRetryEphemeralTurn(err) {
+					t.Fatal("contradictory success/failure evidence minted retry proof")
+				}
+				if mode == "consistent final duplicate" {
+					if err != nil || result.Text != `{"name":"fix runtime session names"}` {
+						t.Fatalf("consistent duplicate failed: %#v %v", result, err)
+					}
+				} else if err == nil || result.Text != "" {
+					t.Fatalf("late evidence preserved sampled success: %#v %v", result, err)
+				}
+			})
+		}
+	}
+}

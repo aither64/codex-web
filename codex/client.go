@@ -782,7 +782,8 @@ type Client struct {
 	historyPageMu     sync.Mutex
 	historyPageLimit  int
 	socket            string
-	ephemeral         *ephemeralSink // private utility only; installed before Ensure
+	ephemeral         *ephemeralSink   // private utility only; installed before Ensure
+	ephemeralReader   *ephemeralReader // connectionMu; retained until private teardown joins
 	options           ClientOptions
 	activityNamespace string
 	observer          *observerState
@@ -999,11 +1000,21 @@ func (c *Client) Ensure(ctx context.Context) error {
 	c.generation++
 	generation := c.generation
 	c.connection = connection
+	var reader *ephemeralReader
+	if c.ephemeral != nil {
+		reader = &ephemeralReader{connection: connection, generation: generation, done: make(chan struct{})}
+		c.ephemeralReader = reader
+	}
 	if c.observer != nil {
 		c.observer.connectionContext, c.observer.cancelConnection = context.WithCancel(c.observer.context)
 	}
 	c.connectionMu.Unlock()
-	go c.readLoop(connection, generation)
+	go func() {
+		if reader != nil {
+			defer close(reader.done)
+		}
+		c.readLoop(connection, generation)
+	}()
 
 	initializeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -1597,11 +1608,20 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 		c.connectionMu.Unlock()
 		return
 	}
-	c.connection = nil
-	c.ready = 0
 	if c.ephemeral != nil {
 		c.ephemeral.fail(ErrEphemeralServer)
 	}
+	c.detachConnectionLocked(generation, cause)
+	c.connectionMu.Unlock()
+	connection.CloseNow()
+	c.broadcast("")
+}
+
+// connectionMu is held by the exact-generation disconnect or private-close
+// cutoff. Both paths invalidate the same pending calls, prompts and settings.
+func (c *Client) detachConnectionLocked(generation uint64, cause error) {
+	c.connection = nil
+	c.ready = 0
 	if c.observer != nil && c.observer.cancelConnection != nil {
 		c.observer.cancelConnection()
 		c.observer.clearQueue()
@@ -1634,9 +1654,6 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 	close(c.settingsChanged)
 	c.settingsChanged = make(chan struct{})
 	c.settingsMu.Unlock()
-	c.connectionMu.Unlock()
-	connection.CloseNow()
-	c.broadcast("")
 }
 
 func (c *Client) Subscribe(ctx context.Context, threadID string) (<-chan struct{}, func(), error) {
