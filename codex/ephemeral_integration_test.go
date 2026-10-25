@@ -607,7 +607,7 @@ func TestEphemeralProtocolIntegration(t *testing.T) {
 	defer harness.close()
 	harness.control(t)
 	harness.catalogControls(t)
-	for _, name := range []string{"baseline", "static-refresh", "server-question-control", "early-events", "lost-turn", "cancel-start", "disconnect", "ambiguous", "stale", "malformed", "missing-final", "timeout-config", "timeout-model", "timeout", "question-at-cancel"} {
+	for _, name := range []string{"baseline", "native-retry", "native-terminal", "static-refresh", "server-question-control", "early-events", "lost-turn", "cancel-start", "disconnect", "ambiguous", "stale", "malformed", "missing-final", "timeout-config", "timeout-model", "timeout", "question-at-cancel"} {
 		t.Run(name, func(t *testing.T) { harness.run(t, name, "", "") })
 	}
 	t.Run("after static refresh", func(t *testing.T) { harness.run(t, "baseline", "", "") })
@@ -966,6 +966,51 @@ func TestEphemeralIntegrationHTTPFallbackResponder(t *testing.T) {
 			t.Fatal("upgrade evidence exceeded its bounds or admitted Responses")
 		}
 	})
+}
+
+func TestEphemeralIntegrationOverloadAdvice(t *testing.T) {
+	for _, mode := range []string{"native-retry", "native-terminal"} {
+		t.Run(mode, func(t *testing.T) {
+			harness := &ephemeralIntegrationHarness{mode: mode}
+			request, _ := json.Marshal(map[string]any{"model": integrationUtilityModel(), "reasoning": map[string]any{"effort": "low"},
+				"tools": []any{}, "store": false, "stream": true, "input": []any{
+					map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": "Return the requested JSON."}}},
+					map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "GLOBAL_POLICY_SENTINEL"}}},
+				}})
+			for index := 0; index < 3; index++ {
+				response := httptest.NewRecorder()
+				harness.respond(response, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(request)))
+				if response.Code != http.StatusOK || harness.failure != "" {
+					t.Fatalf("invalid native control: HTTP %d, failure %s", response.Code, harness.failure)
+				}
+				if mode == "native-retry" && index == 2 {
+					if !strings.Contains(response.Body.String(), `"type":"response.completed"`) {
+						t.Fatal("advised overload control never reaches success")
+					}
+					continue
+				}
+				var event struct {
+					Response struct {
+						Error struct {
+							Code    string            `json:"code"`
+							Headers map[string]string `json:"headers"`
+						} `json:"error"`
+					} `json:"response"`
+				}
+				_, data, _ := strings.Cut(response.Body.String(), "data: ")
+				if json.Unmarshal([]byte(strings.TrimSpace(data)), &event) != nil || event.Response.Error.Code != "server_is_overloaded" {
+					t.Fatal("control did not emit the pinned structured overload")
+				}
+				if mode == "native-retry" {
+					if len(event.Response.Error.Headers) != 1 || event.Response.Error.Headers["retry-after"] != "1" {
+						t.Fatal("native progress lacks nested integer-second retry advice")
+					}
+				} else if len(event.Response.Error.Headers) != 0 {
+					t.Fatal("terminal overload unexpectedly authorizes native retry")
+				}
+			}
+		})
+	}
 }
 
 func TestEphemeralIntegrationDiagnosticBounds(t *testing.T) {
@@ -1468,6 +1513,8 @@ type ephemeralIntegrationHarness struct {
 	interrupted                                                   bool
 	catalogConfirmed                                              bool
 	refreshDelivered                                              bool
+	nativeRetryProgress, nativeTerminalErrors, nativeFailedTurns  int
+	nativeTurnStarts                                              int
 }
 
 func newEphemeralIntegrationHarness(t *testing.T, binary, nft string, owner ephemeralIntegrationNamespaceOwner) *ephemeralIntegrationHarness {
@@ -1856,6 +1903,21 @@ func (h *ephemeralIntegrationHarness) respond(w http.ResponseWriter, r *http.Req
 	h.mu.Unlock()
 	if !control {
 		h.capturePhase(generation, "provider-inference", "request", "Responses-POST", nil, "", "")
+	}
+	if !control && (mode == "native-terminal" || mode == "native-retry" && index <= 2) {
+		// Pinned responses_error.rs maps this public SSE error code to
+		// ServerOverloaded. Unlike a bare HTTP failure it has no hidden request
+		// retry sequence, and exercises native ErrorNotification generation.
+		w.Header().Set("Content-Type", "text/event-stream")
+		failure := map[string]any{"code": "server_is_overloaded", "message": "fixture overload"}
+		if mode == "native-retry" {
+			// The pinned native overload path retries only with server advice,
+			// read from the streamed error object, not the HTTP response header.
+			failure["headers"] = map[string]string{"retry-after": "1"}
+		}
+		data, _ := json.Marshal(map[string]any{"type": "response.failed", "response": map[string]any{"id": "fixture-overload", "status": "failed", "error": failure}})
+		fmt.Fprintf(w, "event: response.failed\ndata: %s\n\n", data)
+		return
 	}
 	if mode == "lost-turn" {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -2610,6 +2672,13 @@ func (h *ephemeralIntegrationHarness) proxy(t *testing.T, mode string, generatio
 						h.mu.Unlock()
 					}
 				}
+				if message.Method == "turn/start" {
+					h.mu.Lock()
+					if generation == h.diagnosticGeneration {
+						h.nativeTurnStarts++
+					}
+					h.mu.Unlock()
+				}
 				questionError := string(message.ID) == questionID && questionID != "" && message.Error != nil
 				h.captureRPC(generation, "request", message.Method, nil, threadID, turnID)
 				mu.Unlock()
@@ -2755,6 +2824,26 @@ func (h *ephemeralIntegrationHarness) proxy(t *testing.T, mode string, generatio
 				}
 				if message.Method != "" {
 					h.captureRPC(generation, "notification", message.Method, nil, threadID, turnID)
+				}
+				if mode == "native-retry" || mode == "native-terminal" {
+					params, _ := ephemeralObject(message.Params)
+					h.mu.Lock()
+					if generation == h.diagnosticGeneration && threadID != "" && turnID != "" && params["threadId"] == threadID {
+						if message.Method == "error" && params["turnId"] == turnID {
+							if params["willRetry"] == true {
+								h.nativeRetryProgress++
+							} else if params["willRetry"] == false {
+								h.nativeTerminalErrors++
+							}
+						}
+						if message.Method == "turn/completed" {
+							turn, _ := params["turn"].(map[string]any)
+							if turn["id"] == turnID && turn["status"] == "failed" {
+								h.nativeFailedTurns++
+							}
+						}
+					}
+					h.mu.Unlock()
 				}
 				disconnect := mode == "disconnect" && method == "turn/start"
 				ambiguous := mode == "ambiguous" && message.Method == "turn/completed"
@@ -2922,6 +3011,7 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	h.interrupted = false
 	h.catalogConfirmed = false
 	h.refreshDelivered = false
+	h.nativeRetryProgress, h.nativeTerminalErrors, h.nativeFailedTurns, h.nativeTurnStarts = 0, 0, 0, 0
 	h.mu.Unlock()
 	generation := h.beginDiagnostics()
 	defer func() {
@@ -2944,6 +3034,9 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	}
 	opts.Input = "RAW_UTILITY_PREFIX_SENTINEL: fix runtime session naming"
 	duration := 3 * time.Second
+	if mode == "native-retry" {
+		duration = 10 * time.Second
+	}
 	if mode == "cancel-start" || strings.HasPrefix(mode, "timeout") || mode == "missing-final" {
 		duration = 400 * time.Millisecond
 	}
@@ -2997,6 +3090,10 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 		t.Fatal("designated native response was not withheld while this helper call was active")
 	}
 	switch mode {
+	case "native-terminal":
+		if !errors.Is(err, ErrEphemeralServer) || !CanRetryEphemeralTurn(err) || result.Text != "" {
+			t.Fatalf("native terminal overload did not prove safe fresh retry: %v", err)
+		}
 	case "server-question-control", "dynamic-catalog":
 		if !errors.Is(err, ErrEphemeralIsolation) {
 			t.Fatalf("question accepted: result=%#v error=%v", result, err)
@@ -3054,6 +3151,7 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	requests := append([]map[string]any(nil), h.requests...)
 	utilityUpgrades := h.utilityUpgrades
 	confirmed, refresh := h.catalogConfirmed, h.refreshDelivered
+	progress, terminal, failedTurns, starts, interrupted := h.nativeRetryProgress, h.nativeTerminalErrors, h.nativeFailedTurns, h.nativeTurnStarts, h.interrupted
 	h.mu.Unlock()
 	if failure != "" {
 		t.Fatal(failure)
@@ -3063,6 +3161,12 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	}
 	if mode == "static-refresh" && !refresh {
 		t.Fatal("actual ETag refresh response not delivered")
+	}
+	if mode == "native-retry" && (progress == 0 || terminal != 0 || failedTurns != 0 || starts != 1 || interrupted) {
+		t.Fatalf("native retry evidence: progress=%d terminal=%d failed=%d starts=%d interrupt=%t", progress, terminal, failedTurns, starts, interrupted)
+	}
+	if mode == "native-terminal" && (terminal != 1 || failedTurns != 1 || starts != 1 || interrupted) {
+		t.Fatalf("native terminal evidence: terminal=%d failed=%d starts=%d interrupt=%t", terminal, failedTurns, starts, interrupted)
 	}
 	if mode != "cancel-start" && mode != "timeout-config" && mode != "timeout-model" && mode != "dynamic-catalog" && len(requests) == 0 {
 		t.Fatalf("fixture did not exercise a Responses POST; %d accepted upgrades alone are not proof", utilityUpgrades)

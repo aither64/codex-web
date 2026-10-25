@@ -1059,7 +1059,7 @@ closed. No caller-supplied hash, config map or assertion bypasses this check.
 The context must have a finite deadline. Input is limited to 64 KiB;
 instructions and schema to 16 KiB each; final text to 16 KiB. Each JSON frame is
 limited to 256 KiB, the call to 256 envelopes and 1 MiB of received JSON, and
-provisional completion events to 32. JSON depth/node limits and duplicate-key
+provisional completion/error events to 32. JSON depth/node limits and duplicate-key
 rejection apply to schemas and consumed envelopes. Model discovery permits at
 most eight pages of 100 entries, with bounded nonrepeating cursors. Overflow,
 missing settings and model substitution fail the call.
@@ -1112,9 +1112,42 @@ Success requires the exact connection generation, thread and turn, successful
 unknown/missing phase is an error. Duplicate evidence for the same final item is
 accepted only when its ID/text agree. Conflicting final items fail.
 
+An owned `error` notification with boolean `willRetry: true` is native retry
+progress. The helper keeps waiting on the same turn and original deadline;
+it neither interrupts nor starts another attempt. Error notifications require
+the pinned `ErrorNotification` shape, including an error object with a string
+message and exact thread/turn identities. Early errors share the bounded
+provisional event buffer until the start response confirms identity. An error's
+IDs cannot authorize success or a fresh start. Malformed or foreign errors
+fail closed. Remote messages and diagnostic details never enter returned errors.
+
+`CanRetryEphemeralTurn(err)` reports whether a failed call carries private proof
+of a transient failure, stopped execution and successful cleanup. It follows
+caller error wrapping and preserves the existing `errors.Is` categories;
+bare `ErrEphemeralServer` and unknown errors return false. The helper itself
+still makes one call. Applications own any fresh attempt, its cap, backoff and
+original absolute deadline.
+
+Terminal retry candidates are `serverOverloaded`, `internalServerError`, and
+typed `httpConnectionFailed`, `responseStreamConnectionFailed` or
+`responseStreamDisconnected` with absent/null status or HTTP 408, 500, 502, 503
+or 504. `responseTooManyFailedAttempts` requires one of those explicit status
+codes. Permanent, quota/rate-limit and unknown classifications never qualify;
+provider message text is never used for classification. A typed temporary
+dial failure before thread creation can qualify too. A missing runtime cannot.
+
+After `willRetry: false`, a transient candidate waits for the exact owned
+`turn/completed` with failed/interrupted status before teardown can authorize
+a fresh call. An exact failed completion can also supply its own classification.
+A later successful completion cannot restore a terminally failed attempt.
+An error event, interrupt acknowledgement, unsubscribe or socket close alone
+does not prove stopped execution. Lost start replies, ambiguous ownership,
+cleanup failure and cancellation/deadline expiry always prevent retry.
+
 The helper reserves at most 250 ms within the original deadline for cleanup.
 It interrupts only an owned exact turn on failure, unsubscribes only a known
-exact thread, and always closes the private connection. After issuing its one
+exact thread, and always closes the private connection. A turn with confirmed
+completion and acknowledged start needs no interrupt. After issuing its one
 turn/start, a matching early turn or item notification may establish the turn
 ID for interruption if the response is lost. That identity cannot authorize
 success; foreign or contradictory identities prohibit interruption. Unsubscribe
