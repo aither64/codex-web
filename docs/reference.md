@@ -1152,9 +1152,14 @@ Terminal retry candidates are `serverOverloaded`, `internalServerError`, and
 typed `httpConnectionFailed`, `responseStreamConnectionFailed` or
 `responseStreamDisconnected` with absent/null status or HTTP 408, 500, 502, 503
 or 504. `responseTooManyFailedAttempts` requires one of those explicit status
-codes. Permanent, quota/rate-limit and unknown classifications never qualify;
-provider message text is never used for classification. A typed temporary
-dial failure before thread creation can qualify too. A missing runtime cannot.
+codes. Code `other` also qualifies when its message is exactly
+`stream disconnected before completion: Codex is at capacity, please try again later`.
+`IsCapacityFailure(code, message)` recognizes this exact pair and typed
+`serverOverloaded`. It does not normalize text or reclassify other permanent,
+quota/rate-limit, unknown or stream failures. Classification does not rewrite
+the raw native error, prove stopped execution or authorize a retry. A typed
+temporary dial failure before thread creation can qualify too. A missing runtime
+cannot.
 
 After `willRetry: false`, a transient candidate waits for the exact owned
 `turn/completed` with failed/interrupted status before teardown can authorize

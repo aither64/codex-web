@@ -1222,14 +1222,16 @@ func (s *ephemeralSink) consumeLocked(message rpcMessage) {
 	}
 }
 
-// Decode only the pinned public error shape. Unknown classifications are valid
-// but conservative; diagnostics never enter error metadata or text matching.
+// Decode only the pinned public error shape. Unknown classifications remain
+// conservative except the exact wrapped capacity compatibility case. Remote
+// diagnostics never enter returned error metadata or messages.
 func ephemeralTurnError(value any) (transient, valid bool) {
 	failure, ok := value.(map[string]any)
 	if !ok {
 		return false, false
 	}
-	if _, ok := failure["message"].(string); !ok {
+	message, ok := failure["message"].(string)
+	if !ok {
 		return false, false
 	}
 	if details := failure["additionalDetails"]; details != nil {
@@ -1263,7 +1265,7 @@ func ephemeralTurnError(value any) (transient, valid bool) {
 	case nil:
 		return false, true
 	case string:
-		return info == "serverOverloaded" || info == "internalServerError", true
+		return IsCapacityFailure(info, message) || info == "internalServerError", true
 	case map[string]any:
 		for _, key := range []string{"httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "responseTooManyFailedAttempts"} {
 			value, exists := info[key]
