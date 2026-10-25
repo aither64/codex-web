@@ -624,6 +624,7 @@ type queueDeletionAttempt struct {
 }
 
 type sendAttempt struct {
+	admissionID   string       // SQLite-only claim; legacy snapshots retain schema 3.
 	Digest        string       `json:"digest"`
 	State         string       `json:"state"`
 	Context       string       `json:"context,omitempty"`
@@ -639,7 +640,12 @@ type UnknownSendOutcomeError struct {
 
 // MessageNotSentError proves that this send did not dispatch user input. It must
 // never be used for an earlier attempt whose delivery remains uncertain.
-type MessageNotSentError struct{ Err error }
+type MessageNotSentError struct {
+	Err error
+	// Retryable identifies a transient admission or connection failure. Protocol
+	// refusals remain unsent but require the caller to correct the request.
+	Retryable bool
+}
 
 func (e *MessageNotSentError) Error() string { return fmt.Sprintf("message was not sent: %v", e.Err) }
 func (e *MessageNotSentError) Unwrap() error { return e.Err }
@@ -799,7 +805,7 @@ type Client struct {
 	generation   uint64
 	ready        uint64
 	closed       bool
-	writeMu      sync.Mutex
+	writeMu      contextMutex
 	nextID       atomic.Uint64
 
 	pendingMu         sync.Mutex
@@ -820,14 +826,15 @@ type Client struct {
 	settingsChanged  chan struct{}
 	settingsUpdateMu sync.Mutex
 	settingsUpdates  map[string]*sync.Mutex
-	queueMu          sync.Mutex
-	queueUpdates     map[string]*sync.Mutex
+	queueMu          contextMutex
+	queueUpdates     map[string]*contextMutex
 	queueAttempts    map[string]map[string]string
 	sendAttempts     map[string]map[string]sendAttempt
 	queueDeletions   map[string]map[string]queueDeletionAttempt
 	operations       map[string]string
 	queueLedgerPath  string
 	queueLedgerLock  *os.File
+	submission       *submissionDatabase
 
 	watchedMu         sync.Mutex
 	watched           map[string]int
@@ -843,6 +850,8 @@ type ClientInfo struct {
 }
 
 type ClientOptions struct {
+	// DeliveryObserver receives stage timings without input or instruction text.
+	DeliveryObserver func(DeliveryEvent)
 	// HistoryReader optionally isolates history I/O; its owner must close it.
 	HistoryReader         HistoryReader
 	ClientInfo            ClientInfo
@@ -857,6 +866,9 @@ type ClientOptions struct {
 	// SubmissionLedgerPath selects application-owned durable retry storage.
 	// Empty preserves the compatibility path next to the App Server socket.
 	SubmissionLedgerPath string
+	// SubmissionDatabasePath selects indexed SQLite storage. SubmissionLedgerPath
+	// and LegacySubmissionLedgerPath then name import sources, not active stores.
+	SubmissionDatabasePath string
 	// LegacySubmissionLedgerPath imports an existing ledger once, under both
 	// ledger locks. The caller must exclude writers using the predecessor path
 	// after migration, including when rolling its application back.
@@ -946,7 +958,7 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		liveItemTimes:  make(map[string]*liveTurnTimestamps),
 		threadSettings: make(map[string]cachedThreadSettings), settingsChanged: make(chan struct{}),
 		settingsUpdates: make(map[string]*sync.Mutex),
-		queueUpdates:    make(map[string]*sync.Mutex), queueAttempts: make(map[string]map[string]string),
+		queueUpdates:    make(map[string]*contextMutex), queueAttempts: make(map[string]map[string]string),
 		sendAttempts:    make(map[string]map[string]sendAttempt),
 		queueDeletions:  make(map[string]map[string]queueDeletionAttempt),
 		operations:      make(map[string]string),
@@ -1041,6 +1053,9 @@ func (c *Client) Close() {
 	if c.queueLedgerLock != nil {
 		_ = c.queueLedgerLock.Close()
 		c.queueLedgerLock = nil
+	}
+	if c.submission != nil {
+		c.submission.close()
 	}
 	c.queueMu.Unlock()
 }
@@ -1153,7 +1168,9 @@ func (c *Client) requestOn(
 	return c.requestOnAdmission(ctx, connection, generation, method, params, result, nil)
 }
 
-func (c *Client) requestOnAdmission(ctx context.Context, connection *websocket.Conn, generation uint64, method string, params any, result any, admit func() error) error {
+func (c *Client) requestOnAdmission(ctx context.Context, connection *websocket.Conn, generation uint64, method string, params any, result any, admit func() error) (requestErr error) {
+	started := time.Now()
+	defer func() { c.observeDelivery(ctx, "rpc:"+method, started, requestErr) }()
 	id := c.nextID.Add(1)
 	responseChannel := make(chan response, 1)
 	c.pendingMu.Lock()
@@ -1200,7 +1217,12 @@ func (c *Client) writeOffer(ctx context.Context, connection *websocket.Conn, gen
 }
 
 func (c *Client) writeOfferAdmission(ctx context.Context, connection *websocket.Conn, generation uint64, data []byte, offer *PendingRequest, admit func() error) error {
-	c.writeMu.Lock()
+	started := time.Now()
+	err := c.writeMu.LockContext(ctx)
+	c.observeDelivery(ctx, "writer-lock", started, err)
+	if err != nil {
+		return &TransportError{Err: err}
+	}
 	defer c.writeMu.Unlock()
 	c.connectionMu.Lock()
 	if connection == nil || c.connection != connection || c.generation != generation {
@@ -1230,7 +1252,32 @@ func (c *Client) writeOfferAdmission(ctx context.Context, connection *websocket.
 			return err
 		}
 	}
-	err := connection.Write(ctx, websocket.MessageText, data)
+	// Admission can wait for durable storage after the earlier deadline check.
+	// Nothing has reached the writer yet, so this outcome is still provably unsent.
+	if err := ctx.Err(); err != nil {
+		if offer != nil {
+			c.pendingMu.Unlock()
+		}
+		return &unwrittenWriteError{Err: &TransportError{Err: err}}
+	}
+	started = time.Now()
+	writer, err := connection.Writer(ctx, websocket.MessageText)
+	c.observeDelivery(ctx, "writer-acquisition", started, err)
+	if err != nil {
+		if offer != nil {
+			c.pendingMu.Unlock()
+		}
+		if ctx.Err() == nil {
+			c.markDisconnected(connection, generation, err)
+		}
+		return &unwrittenWriteError{Err: &TransportError{Err: err}}
+	}
+	started = time.Now()
+	_, err = writer.Write(data)
+	if err == nil {
+		err = writer.Close()
+	}
+	c.observeDelivery(ctx, "transmission", started, err)
 	if offer != nil {
 		if err == nil {
 			delete(c.requests, offer.ID)
@@ -2349,12 +2396,12 @@ func userMessageText(item map[string]any) (string, error) {
 	return inputText(inputs), nil
 }
 
-func (c *Client) queueUpdateLock(threadID string) *sync.Mutex {
+func (c *Client) queueUpdateLock(threadID string) *contextMutex {
 	c.queueMu.Lock()
 	defer c.queueMu.Unlock()
 	lock := c.queueUpdates[threadID]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &contextMutex{}
 		c.queueUpdates[threadID] = lock
 	}
 	return lock
@@ -2366,6 +2413,10 @@ func queueTextDigest(text string) string {
 }
 
 func (c *Client) loadQueueLedgerLocked() error {
+	return c.loadQueueLedgerLockedContext(context.Background())
+}
+
+func (c *Client) loadQueueLedgerLockedContext(ctx context.Context) error {
 	c.connectionMu.Lock()
 	closed := c.closed
 	c.connectionMu.Unlock()
@@ -2393,7 +2444,7 @@ func (c *Client) loadQueueLedgerLocked() error {
 		_ = lockFile.Close()
 		return errors.New("submission ledger lock must be a mode-0600 regular file")
 	}
-	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+	if err := lockSubmissionFile(ctx, int(lockFile.Fd())); err != nil {
 		_ = lockFile.Close()
 		return fmt.Errorf("lock submission ledger: %w", err)
 	}
@@ -2411,7 +2462,7 @@ func (c *Client) loadQueueLedgerLocked() error {
 				return c.failQueueLedgerLocked(lockErr)
 			}
 			defer unix.Close(fd)
-			if lockErr := unix.Flock(fd, unix.LOCK_EX); lockErr != nil {
+			if lockErr := lockSubmissionFile(ctx, fd); lockErr != nil {
 				return c.failQueueLedgerLocked(lockErr)
 			}
 			defer unix.Flock(fd, unix.LOCK_UN)
@@ -2559,14 +2610,20 @@ func (c *Client) failQueueLedgerLocked(err error) error {
 	return err
 }
 
-func queueLedgerTransaction[T any](
-	c *Client, transaction func() (T, error),
-) (T, error) {
-	c.queueMu.Lock()
+func queueLedgerTransaction[T any](c *Client, transaction func() (T, error)) (value T, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err = c.queueMu.LockContext(ctx); err != nil {
+		return value, err
+	}
 	defer c.queueMu.Unlock()
-	if err := c.loadQueueLedgerLocked(); err != nil {
-		var zero T
-		return zero, err
+	c.observeDelivery(ctx, "submission-lock", started, nil)
+	started = time.Now()
+	err = c.loadQueueLedgerLockedContext(ctx)
+	c.observeDelivery(ctx, "legacy-ledger-load", started, err)
+	if err != nil {
+		return value, err
 	}
 	defer c.releaseQueueLedgerLocked()
 	return transaction()
@@ -2590,7 +2647,12 @@ func validSendAttemptState(attempt sendAttempt) bool {
 	}
 }
 
-func (c *Client) writeQueueLedgerLocked() error {
+func (c *Client) writeQueueLedgerLocked() (writeErr error) {
+	started := time.Now()
+	defer func() { c.observeDelivery(context.Background(), "submission-write", started, writeErr) }()
+	if c.submission != nil && c.submission.conn != nil {
+		return c.writeSubmissionRecordsLocked()
+	}
 	if c.queueLedgerLock == nil {
 		return errors.New("submission ledger transaction is not active")
 	}
@@ -2654,7 +2716,7 @@ func validSubmissionDigest(digest string) bool {
 }
 
 func (c *Client) queueAttempt(threadID, clientID, text string) (bool, error) {
-	return queueLedgerTransaction(c, func() (bool, error) {
+	return submissionTransaction(c, attemptScope(threadID, clientID), func() (bool, error) {
 		digest, ok := c.queueAttempts[threadID][clientID]
 		if ok && digest != queueTextDigest(text) {
 			return false, errors.New("queued message identity was reused with different text")
@@ -2664,7 +2726,7 @@ func (c *Client) queueAttempt(threadID, clientID, text string) (bool, error) {
 }
 
 func (c *Client) recordQueueAttempt(threadID, clientID, text string) error {
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, attemptScope(threadID, clientID), func() error {
 		attempts := c.queueAttempts
 		digest := queueTextDigest(text)
 		if existing, ok := attempts[threadID][clientID]; ok {
@@ -2715,7 +2777,7 @@ type sendState struct {
 }
 
 func (c *Client) sendStateWithOptions(threadID, clientID, text, context, optionsDigest string) (sendState, error) {
-	return queueLedgerTransaction(c, func() (sendState, error) {
+	return submissionTransaction(c, attemptScope(threadID, clientID), func() (sendState, error) {
 		attempt, ok := c.sendAttempts[threadID][clientID]
 		if ok && (attempt.Digest != queueTextDigest(text) || attempt.Context != context ||
 			effectiveTurnOptionsDigest(attempt.OptionsDigest) != optionsDigest) {
@@ -2747,7 +2809,7 @@ func (c *Client) recordSendAttemptWithReceipt(threadID, clientID, text, context 
 		return err
 	}
 	optionsDigest := normalized.Digest
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, attemptScope(threadID, clientID), func() error {
 		digest := queueTextDigest(text)
 		existing, found := c.sendAttempts[threadID][clientID]
 		if found {
@@ -2820,7 +2882,7 @@ func (c *Client) OriginalSendOptions(threadID, text, clientID, actionContext str
 		options TurnOptions
 		found   bool
 	}
-	value, err := queueLedgerTransaction(c, func() (result, error) {
+	value, err := submissionTransaction(c, attemptScope(threadID, clientID), func() (result, error) {
 		attempt, found := c.sendAttempts[threadID][clientID]
 		if !found {
 			return result{}, nil
@@ -2840,27 +2902,50 @@ func (c *Client) OriginalSendOptions(threadID, text, clientID, actionContext str
 }
 
 func (c *Client) markSendSubmitting(threadID, clientID string) error {
-	return queueLedgerAction(c, func() error {
+	_, err := c.claimSendSubmission(threadID, clientID)
+	return err
+}
+
+func (c *Client) claimSendSubmission(threadID, clientID string) (string, error) {
+	return c.claimSendSubmissionIf(threadID, clientID, nil)
+}
+
+func (c *Client) claimSendSubmissionExact(threadID, clientID, text, action, optionsDigest string, steered bool) (string, error) {
+	return c.claimSendSubmissionIf(threadID, clientID, func(attempt sendAttempt) bool {
+		return attempt.Digest == queueTextDigest(text) && attempt.Context == action && effectiveTurnOptionsDigest(attempt.OptionsDigest) == optionsDigest && attempt.Steered == steered
+	})
+}
+
+func (c *Client) claimSendSubmissionIf(threadID, clientID string, matches func(sendAttempt) bool) (string, error) {
+	claim := randomActivityNamespace()
+	err := submissionAction(c, attemptScope(threadID, clientID), func() error {
 		attempt, ok := c.sendAttempts[threadID][clientID]
 		if !ok {
 			return errors.New("prepared message attempt disappeared")
 		}
+		if matches != nil && !matches(attempt) {
+			return errors.New("message identity changed before write admission")
+		}
 		if attempt.State != "prepared" || c.queueAttempts[threadID][clientID] != "" {
 			return errSendAdmissionChanged
 		}
-		attempt.State = "submitting"
+		previous := attempt
+		attempt.State, attempt.admissionID = "submitting", claim
 		c.sendAttempts[threadID][clientID] = attempt
 		if err := c.writeQueueLedgerLocked(); err != nil {
-			attempt.State = "prepared"
-			c.sendAttempts[threadID][clientID] = attempt
+			c.sendAttempts[threadID][clientID] = previous
 			return err
 		}
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
+	return claim, nil
 }
 
 func (c *Client) markSendAccepted(threadID, clientID string, receipt SendReceipt) error {
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, attemptScope(threadID, clientID), func() error {
 		attempt, ok := c.sendAttempts[threadID][clientID]
 		if !ok {
 			return errors.New("submitted message attempt disappeared")
@@ -2898,12 +2983,14 @@ func (c *Client) AcknowledgeSends(
 	ctx context.Context, threadID string, acknowledgements []SendAcknowledgement,
 ) ([]string, error) {
 	lock := c.queueUpdateLock(threadID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
 
 	digests := make(map[string]string, len(acknowledgements))
 	expectedTurns := make(map[string]string)
-	if err := queueLedgerAction(c, func() error {
+	if err := submissionAction(c, threadScope(threadID), func() error {
 		for _, acknowledgement := range acknowledgements {
 			digest := acknowledgement.Digest
 			if !validSubmissionDigest(digest) {
@@ -2956,7 +3043,7 @@ func (c *Client) AcknowledgeSends(
 		}
 	}
 
-	return queueLedgerTransaction(c, func() ([]string, error) {
+	return submissionTransaction(c, threadScope(threadID).writable(), func() ([]string, error) {
 		removed := make(map[string]sendAttempt)
 		for clientID := range proven {
 			attempt, found := c.sendAttempts[threadID][clientID]
@@ -2997,7 +3084,7 @@ func (c *Client) AcknowledgeSends(
 }
 
 func (c *Client) clearQueueAttempt(threadID, clientID string) error {
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, attemptScope(threadID, clientID), func() error {
 		attempts := c.queueAttempts[threadID]
 		digest, ok := attempts[clientID]
 		if !ok {
@@ -3025,7 +3112,7 @@ func (c *Client) queueDeletionAttempt(
 		attempt queueDeletionAttempt
 		found   bool
 	}
-	value, err := queueLedgerTransaction(c, func() (result, error) {
+	value, err := submissionTransaction(c, attemptScope(threadID, queuedSubmissionID), func() (result, error) {
 		attempt, ok := c.queueDeletions[threadID][queuedSubmissionID]
 		return result{attempt: attempt, found: ok}, nil
 	})
@@ -3035,7 +3122,7 @@ func (c *Client) queueDeletionAttempt(
 func (c *Client) recordQueueDeletionAttempt(
 	threadID string, target QueueEntry,
 ) (queueDeletionAttempt, error) {
-	return queueLedgerTransaction(c, func() (queueDeletionAttempt, error) {
+	return submissionTransaction(c, attemptScope(threadID, target.ID).writable(), func() (queueDeletionAttempt, error) {
 		attempt := queueDeletionAttempt{
 			ClientUserMessageID: target.ClientUserMessageID,
 			Digest:              queueTextDigest(target.Text),
@@ -3064,7 +3151,7 @@ func (c *Client) recordQueueDeletionAttempt(
 func (c *Client) clearQueueDeletionAndAttempt(
 	threadID, queuedSubmissionID, clientID string,
 ) error {
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, attemptScope(threadID, clientID, queuedSubmissionID), func() error {
 		deletion, deleting := c.queueDeletions[threadID][queuedSubmissionID]
 		digest, queued := c.queueAttempts[threadID][clientID]
 		send, prepared := c.sendAttempts[threadID][clientID]
@@ -3146,7 +3233,7 @@ func (c *Client) requireSubmissionAttempts(ctx context.Context, threadID string,
 }
 
 func (c *Client) requireSubmissionAttemptsExcept(ctx context.Context, threadID string, allowQueued bool, ownPreparedID string) error {
-	deletionCount, err := queueLedgerTransaction(c, func() (int, error) { return len(c.queueDeletions[threadID]), nil })
+	deletionCount, err := submissionTransaction(c, threadScope(threadID), func() (int, error) { return len(c.queueDeletions[threadID]), nil })
 	if err != nil {
 		return err
 	}
@@ -3158,7 +3245,7 @@ func (c *Client) requireSubmissionAttemptsExcept(ctx context.Context, threadID s
 		queueAttempts       map[string]string
 		unresolvedSendCount int
 	}
-	snapshot, err := queueLedgerTransaction(c, func() (resolutionSnapshot, error) {
+	snapshot, err := submissionTransaction(c, threadScope(threadID), func() (resolutionSnapshot, error) {
 		attempts := make(map[string]string, len(c.queueAttempts[threadID]))
 		for clientID, digest := range c.queueAttempts[threadID] {
 			attempts[clientID] = digest
@@ -3256,7 +3343,7 @@ func (c *Client) ThreadOperationAttempt(directory string) (string, error) {
 	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
 		return "", errors.New("thread operation directory must be canonical and absolute")
 	}
-	return queueLedgerTransaction(c, func() (string, error) {
+	return submissionTransaction(c, operationScope(directory), func() (string, error) {
 		return c.operations[directory], nil
 	})
 }
@@ -3270,7 +3357,7 @@ func (c *Client) RecordThreadOperationAttempt(directory, threadID string) error 
 	if strings.TrimSpace(threadID) == "" {
 		return errors.New("thread operation requires a thread id")
 	}
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, operationScope(directory), func() error {
 		if existing := c.operations[directory]; existing != "" {
 			if existing != threadID {
 				return errors.New("thread operation directory is already bound to another thread")
@@ -3295,7 +3382,7 @@ func (c *Client) ClearConversationAttempts(threadID, directory string) error {
 	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
 		return errors.New("conversation attempt cleanup directory must be canonical and absolute")
 	}
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, conversationScope(threadID, directory), func() error {
 		queueAttempts, queued := c.queueAttempts[threadID]
 		sendAttempts, sent := c.sendAttempts[threadID]
 		queueDeletions, deleting := c.queueDeletions[threadID]
@@ -3337,7 +3424,10 @@ func (c *Client) CompactAcceptedSendOptions(contextPrefix string) error {
 	if contextPrefix == "" {
 		return errors.New("send option compaction requires a context prefix")
 	}
-	return queueLedgerAction(c, func() error {
+	if c.options.SubmissionDatabasePath != "" {
+		return c.compactSubmissionOptions(contextPrefix)
+	}
+	return submissionAction(c, submissionScope{all: true}, func() error {
 		type savedOption struct {
 			threadID, clientID string
 			options            *TurnOptions
@@ -3376,7 +3466,7 @@ func (c *Client) ClearRetiredThreadAttempts(threadID string) error {
 	if strings.TrimSpace(threadID) == "" {
 		return errors.New("thread attempt cleanup requires a thread id")
 	}
-	return queueLedgerAction(c, func() error {
+	return submissionAction(c, threadScope(threadID), func() error {
 		queued, hasQueued := c.queueAttempts[threadID]
 		sent, hasSent := c.sendAttempts[threadID]
 		deletions, hasDeletions := c.queueDeletions[threadID]
@@ -4587,7 +4677,9 @@ func (c *Client) QueueWithPolicy(ctx context.Context, threadID, text, clientID s
 		return QueueEntry{}, err
 	}
 	lock := c.queueUpdateLock(threadID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return QueueEntry{}, err
+	}
 	defer lock.Unlock()
 	attempted, err := c.queueAttempt(threadID, clientID, text)
 	if err != nil {
@@ -4861,9 +4953,11 @@ func (c *Client) DeleteQueueEntryWithCompletion(ctx context.Context, threadID, i
 // so an application can call it under mutation authority before reading a queue.
 func (c *Client) ReconcileQueueDeletionsWithCompletion(ctx context.Context, threadID string, complete func(string) error) error {
 	lock := c.queueUpdateLock(threadID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return err
+	}
 	defer lock.Unlock()
-	attempts, err := queueLedgerTransaction(c, func() (map[string]queueDeletionAttempt, error) {
+	attempts, err := submissionTransaction(c, threadScope(threadID), func() (map[string]queueDeletionAttempt, error) {
 		result := make(map[string]queueDeletionAttempt)
 		for id, attempt := range c.queueDeletions[threadID] {
 			result[id] = attempt
@@ -5035,7 +5129,7 @@ func (c *Client) DiscardPreparedSendWithOptions(
 	lock := c.queueUpdateLock(threadID)
 	lock.Lock()
 	defer lock.Unlock()
-	return queueLedgerTransaction(c, func() (bool, error) {
+	return submissionTransaction(c, attemptScope(threadID, clientID).writable(), func() (bool, error) {
 		attempt, found := c.sendAttempts[threadID][clientID]
 		if !found {
 			return true, nil
@@ -5084,7 +5178,9 @@ func (c *Client) ReconcileSendWithOptions(
 		return SendReceipt{}, false, err
 	}
 	lock := c.queueUpdateLock(threadID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return SendReceipt{}, false, err
+	}
 	defer lock.Unlock()
 	attempt, _, err := c.sendAttemptWithOptions(
 		threadID, clientUserMessageID, text, actionContext, normalizedOptions.Digest,
@@ -5157,13 +5253,18 @@ func (c *Client) Send(
 func (c *Client) SendWithOptions(
 	ctx context.Context, threadID, text, clientUserMessageID, actionContext string,
 	options TurnOptions,
-) (SendReceipt, error) {
+) (receipt SendReceipt, err error) {
+	ctx = context.WithValue(ctx, deliveryIdentityKey{}, deliveryIdentity{threadID, clientUserMessageID})
+	started := time.Now()
+	defer func() { c.observeDelivery(ctx, "send", started, err) }()
 	normalizedOptions, err := normalizeTurnOptions(options)
 	if err != nil {
 		return SendReceipt{}, err
 	}
 	lock := c.queueUpdateLock(threadID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return SendReceipt{}, err
+	}
 	defer lock.Unlock()
 	attempt, attempted, err := c.sendAttemptWithOptions(
 		threadID, clientUserMessageID, text, actionContext, normalizedOptions.Digest,
@@ -5211,23 +5312,30 @@ func (c *Client) SendWithOptions(
 		}
 	}
 	admitted := false
+	admissionClaim := ""
 	admit := func() error {
-		if err := c.markSendSubmitting(threadID, clientUserMessageID); err != nil {
+		started := time.Now()
+		var err error
+		admissionClaim, err = c.claimSendSubmissionExact(threadID, clientUserMessageID, text, actionContext, normalizedOptions.Digest, steered)
+		if err != nil {
+			c.observeDelivery(ctx, "admission", started, err)
 			return fmt.Errorf("record message attempt before submission: %w", err)
 		}
 		admitted = true
+		c.observeDelivery(ctx, "admission", started, nil)
 		return nil
 	}
 	reconcile := func(requestErr error) (SendReceipt, error) {
 		if !admitted {
 			return c.unwrittenSendOutcome(ctx, threadID, text, clientUserMessageID, actionContext, normalizedOptions.Digest, false, requestErr)
 		}
+		var unwritten *unwrittenWriteError
+		if errors.As(requestErr, &unwritten) {
+			return c.restoreUnwrittenSendOutcome(ctx, threadID, text, clientUserMessageID, actionContext, normalizedOptions.Digest, admissionClaim, requestErr)
+		}
 		var refusal *rpcCallError
 		if errors.As(requestErr, &refusal) && (refusal.code == -32600 || refusal.code == -32601 || refusal.code == -32602) {
-			if err := c.restoreRejectedSend(threadID, clientUserMessageID); err != nil {
-				return SendReceipt{}, &UnknownSendOutcomeError{Err: err}
-			}
-			return SendReceipt{}, &MessageNotSentError{Err: requestErr}
+			return c.restoreUnwrittenSendOutcome(ctx, threadID, text, clientUserMessageID, actionContext, normalizedOptions.Digest, admissionClaim, requestErr)
 		}
 		reconcileContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -5351,7 +5459,7 @@ func (c *Client) IsPreparedSendWithOptions(
 func (c *Client) isPreparedSendWithOptions(
 	threadID, text, clientID, actionContext, optionsDigest string,
 ) (bool, error) {
-	return queueLedgerTransaction(c, func() (bool, error) {
+	return submissionTransaction(c, attemptScope(threadID, clientID), func() (bool, error) {
 		attempt, found := c.sendAttempts[threadID][clientID]
 		if !found {
 			return false, nil

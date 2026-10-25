@@ -24,7 +24,9 @@ func (c *Client) ContinueFailedTurn(
 		return SendReceipt{}, err
 	}
 	lock := c.queueUpdateLock(threadID)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return SendReceipt{}, err
+	}
 	defer lock.Unlock()
 	attempt, attempted, err := c.sendAttemptWithOptions(threadID, stableID, text, actionContext, normalized.Digest)
 	if err != nil {
@@ -69,18 +71,6 @@ func (c *Client) ContinueFailedTurn(
 	if err := c.continuationIdle(ctx, threadID, expectedFailedTurnID); err != nil {
 		return preflightFailure(err)
 	}
-	claimed, err := c.claimContinuationAttempt(threadID, stableID, text, actionContext, normalized.Digest)
-	if err != nil {
-		return SendReceipt{}, err
-	}
-	if !claimed {
-		latest, _, err := c.sendAttemptWithOptions(threadID, stableID, text, actionContext, normalized.Digest)
-		if err != nil {
-			return SendReceipt{}, err
-		}
-		receipt, _, err := c.reconcileContinuation(ctx, threadID, text, stableID, latest)
-		return receipt, err
-	}
 	params := map[string]any{"threadId": threadID, "input": []map[string]any{{"type": "text", "text": text}}, "clientUserMessageId": stableID}
 	if normalized.Model != "" {
 		params["model"] = normalized.Model
@@ -96,7 +86,22 @@ func (c *Client) ContinueFailedTurn(
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	requestErr := c.Request(ctx, "turn/start", params, &response)
+	claimed := false
+	claim := ""
+	requestErr := c.requestWithAdmission(ctx, "turn/start", params, &response, func() error {
+		var err error
+		claim, err = c.claimSendSubmissionExact(threadID, stableID, text, actionContext, normalized.Digest, false)
+		claimed = err == nil
+		return err
+	})
+	if requestErr != nil && !claimed {
+		return preflightFailure(requestErr)
+	}
+	var unwritten *unwrittenWriteError
+	var refusal *rpcCallError
+	if errors.As(requestErr, &unwritten) || (errors.As(requestErr, &refusal) && (refusal.code == -32600 || refusal.code == -32601 || refusal.code == -32602)) {
+		return c.restoreUnwrittenSendOutcome(ctx, threadID, text, stableID, actionContext, normalized.Digest, claim, requestErr)
+	}
 	if requestErr == nil && response.Turn.ID != "" {
 		return c.finishAcceptedSend(threadID, SendReceipt{TurnID: response.Turn.ID, ClientUserMessageID: stableID})
 	}
@@ -136,23 +141,11 @@ func (c *Client) continuationIdle(ctx context.Context, threadID, expected string
 }
 
 func (c *Client) claimContinuationAttempt(threadID, id, text, action, optionsDigest string) (bool, error) {
-	return queueLedgerTransaction(c, func() (bool, error) {
-		attempt, ok := c.sendAttempts[threadID][id]
-		if !ok || attempt.Digest != queueTextDigest(text) || attempt.Context != action || attempt.Steered || effectiveTurnOptionsDigest(attempt.OptionsDigest) != optionsDigest {
-			return false, errors.New("continuation attempt changed before submission")
-		}
-		if attempt.State != "prepared" {
-			return false, nil
-		}
-		attempt.State = "submitting"
-		c.sendAttempts[threadID][id] = attempt
-		if err := c.writeQueueLedgerLocked(); err != nil {
-			attempt.State = "prepared"
-			c.sendAttempts[threadID][id] = attempt
-			return false, err
-		}
-		return true, nil
-	})
+	_, err := c.claimSendSubmissionExact(threadID, id, text, action, optionsDigest, false)
+	if errors.Is(err, errSendAdmissionChanged) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (c *Client) reconcileContinuation(ctx context.Context, threadID, text, id string, attempt sendAttempt) (SendReceipt, bool, error) {

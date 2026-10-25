@@ -112,11 +112,13 @@ func testCanceledWriteKeepsSibling(t *testing.T, alreadyCanceled bool) {
 	go func() {
 		canceledResult <- client.Request(canceled, "thread/queue/list", map[string]any{"threadId": "canceled"}, nil)
 	}()
-	waitFor(t, func() bool {
-		client.pendingMu.Lock()
-		defer client.pendingMu.Unlock()
-		return len(client.pending) == 2
-	})
+	if !alreadyCanceled {
+		waitFor(t, func() bool {
+			client.pendingMu.Lock()
+			defer client.pendingMu.Unlock()
+			return len(client.pending) == 2
+		})
+	}
 	cancelRequest()
 	client.writeMu.Unlock()
 	locked = false

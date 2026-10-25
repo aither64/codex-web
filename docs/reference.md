@@ -21,6 +21,10 @@ writable persistent state independently of a connect-only or ephemeral socket
 directory. Leave it empty to retain the compatibility path beside the socket;
 all cooperating processes must select the same path.
 
+`SubmissionDatabasePath` selects indexed SQLite storage and uses those JSON
+paths as import sources. See [submission storage and delivery recovery](submission-storage.md)
+for the delivery boundary, migration journal and recovery procedure.
+
 `LegacySubmissionLedgerPath` optionally imports an existing ledger when the
 selected persistent path is absent. Import holds both ledger locks, validates
 the complete old state, and writes it atomically at the new path. The old file
@@ -53,11 +57,13 @@ both causes. Cancellation alone does not establish whether input was sent.
 received an explicit invalid-request, unknown-method or invalid-parameters
 refusal. Its saved attempt remains `prepared` and can be retried with the same
 identity and options. The client records `submitting` under the connection
-writer lock immediately before writing. Write failures and lost replies retain
+writer lock immediately before acquiring a writer. Cancellation during admission
+and failure to acquire the writer restore the prepared state before reporting
+non-delivery. Failures after writing begins and lost replies retain
 `UnknownSendOutcomeError`; missing history cannot establish non-delivery.
 Admission atomically rechecks the shared ledger, so another client that already
 claimed the same prepared attempt forces reconciliation instead of a second write.
-The ledger stays at schema 3, and older uncertain attempts keep that meaning.
+The JSON ledger stays at schema 3. Imported uncertain attempts keep that meaning.
 
 The conversation handler returns `message_not_sent` with `notSent: true` for
 the former and `message_delivery_unknown` with `notSent: false` for the latter.

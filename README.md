@@ -163,6 +163,9 @@ The [technical reference](docs/reference.md) contains the complete Go and
 browser API contract, including durable delivery, prompt responses, activity,
 uploads, compatibility, and protocol requirements.
 
+The [submission storage guide](docs/submission-storage.md) explains indexed
+receipt storage, delivery boundaries and migration from the JSON ledger.
+
 Run the packaged checks with:
 
 ```sh
