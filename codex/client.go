@@ -1086,7 +1086,7 @@ func (c *Client) requestWithAdmission(ctx context.Context, method string, params
 	}()
 	if c.options.ObserverOnly {
 		switch method {
-		case "thread/read", "thread/turns/list", "thread/items/list", "thread/list":
+		case "thread/read", "thread/turns/list", "thread/items/list", "thread/list", "thread/queue/list":
 		default:
 			return errors.New("observer client cannot mutate or answer a thread")
 		}
