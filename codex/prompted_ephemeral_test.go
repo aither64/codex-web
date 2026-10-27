@@ -31,17 +31,21 @@ func promptedEphemeralFixture(t *testing.T) (EphemeralTurnOptions, *ephemeralFak
 			"mcp_servers": map[string]any{"literal.name": map[string]any{"command": "synthetic"}}},
 			"origins": map[string]any{"model_catalog_json": map[string]any{"name": map[string]any{"type": "sessionFlags"}}}},
 		models: map[string]any{"data": []any{map[string]any{"model": opts.Model,
-			"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}}}}, "nextCursor": nil},
+			"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}, map[string]any{"reasoningEffort": "high"}}}}, "nextCursor": nil},
 	}
 	return opts, fake
 }
 
 func TestPromptedEphemeralPrivatePolicyAndProvider(t *testing.T) {
-	for _, mismatch := range []bool{false, true} {
-		t.Run(map[bool]string{false: "selected provider", true: "provider mismatch"}[mismatch], func(t *testing.T) {
+	for _, profile := range []struct {
+		effort   string
+		mismatch bool
+	}{{"low", false}, {"low", true}, {"high", false}, {"high", true}} {
+		t.Run(profile.effort+"/"+map[bool]string{false: "selected provider", true: "provider mismatch"}[profile.mismatch], func(t *testing.T) {
 			opts, fake := promptedEphemeralFixture(t)
+			opts.Effort = profile.effort
 			opts.ModelProvider = "selected-pool"
-			if mismatch {
+			if profile.mismatch {
 				fake.start = func(result map[string]any) { result["modelProvider"] = "wrong-pool" }
 			}
 			client := NewWithOptions(fake.serve(t), ClientOptions{DeveloperInstructions: "PARENT_CONTEXT_MUST_NOT_ESCAPE"})
@@ -49,14 +53,14 @@ func TestPromptedEphemeralPrivatePolicyAndProvider(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
 			result, err := client.RunPromptedEphemeralTurn(ctx, opts)
-			if mismatch {
+			if profile.mismatch {
 				if !errors.Is(err, ErrEphemeralServer) || result.Text != "" || CanRetryEphemeralTurn(err) {
 					t.Fatalf("provider substitution: %#v %v", result, err)
 				}
 			} else if err != nil || result.Text != `{"name":"fix runtime session names"}` {
 				t.Fatalf("prompted result: %#v %v", result, err)
 			}
-			starts, turns := 0, 0
+			starts, turns, unsubscribes := 0, 0, 0
 			for _, call := range fake.snapshot() {
 				encoded, _ := json.Marshal(call)
 				if strings.Contains(string(encoded), "PARENT_CONTEXT_MUST_NOT_ESCAPE") {
@@ -80,21 +84,23 @@ func TestPromptedEphemeralPrivatePolicyAndProvider(t *testing.T) {
 				case "turn/start":
 					turns++
 					input, _ := params["input"].([]any)
-					if params["model"] != opts.Model || params["effort"] != "low" || len(input) != 1 ||
+					if params["model"] != opts.Model || params["effort"] != opts.Effort || len(input) != 1 ||
 						input[0].(map[string]any)["text"] != opts.Input || !ephemeralEmptyArrays(params, "environments", "runtimeWorkspaceRoots") {
 						t.Fatal("prompted turn changed trusted input/profile")
 					}
+				case "thread/unsubscribe":
+					unsubscribes++
 				}
 			}
-			if starts != 1 || turns != map[bool]int{false: 1, true: 0}[mismatch] {
-				t.Fatalf("unexpected dispatch count: thread=%d turn=%d", starts, turns)
+			if starts != 1 || turns != map[bool]int{false: 1, true: 0}[profile.mismatch] || unsubscribes != map[bool]int{false: 1, true: 0}[profile.mismatch] {
+				t.Fatalf("unexpected dispatch count: thread=%d turn=%d unsubscribe=%d", starts, turns, unsubscribes)
 			}
 		})
 	}
 }
 
 func TestPromptedEphemeralPreconnectionBoundary(t *testing.T) {
-	for _, mode := range []string{"other model", "other effort", "catalog mismatch", "missing deadline", "cancelled", "observer"} {
+	for _, mode := range []string{"other model", "medium", "xhigh", "max", "empty effort", "catalog mismatch", "missing deadline", "cancelled", "observer"} {
 		t.Run(mode, func(t *testing.T) {
 			opts, _ := promptedEphemeralFixture(t)
 			options := ClientOptions{}
@@ -104,8 +110,10 @@ func TestPromptedEphemeralPreconnectionBoundary(t *testing.T) {
 			switch mode {
 			case "other model":
 				opts.Model = "gpt-5.5"
-			case "other effort":
-				opts.Effort = "high"
+			case "medium", "xhigh", "max":
+				opts.Effort = mode
+			case "empty effort":
+				opts.Effort = ""
 			case "catalog mismatch":
 				opts.ModelCatalogFile = ephemeralTestCatalog(t)
 				want = ErrEphemeralIsolation
@@ -125,6 +133,33 @@ func TestPromptedEphemeralPreconnectionBoundary(t *testing.T) {
 				t.Fatalf("preconnection boundary: %v want %v", err, want)
 			}
 		})
+	}
+}
+
+func TestPromptedEphemeralHighRequiresAdvertisedEffort(t *testing.T) {
+	opts, fake := promptedEphemeralFixture(t)
+	opts.Effort = "high"
+	fake.models = map[string]any{"data": []any{map[string]any{"model": opts.Model,
+		"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}}}}, "nextCursor": nil}
+	client := New(fake.serve(t))
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := client.RunPromptedEphemeralTurn(ctx, opts)
+	if !errors.Is(err, ErrEphemeralSettings) || result.Text != "" {
+		t.Fatalf("unadvertised high effort: %#v %v", result, err)
+	}
+	listed := false
+	for _, call := range fake.snapshot() {
+		if call["method"] == "model/list" {
+			listed = true
+		}
+		if call["method"] == "thread/start" || call["method"] == "turn/start" {
+			t.Fatal("unadvertised effort dispatched a thread or turn")
+		}
+	}
+	if !listed {
+		t.Fatal("effort capability was not checked against model/list")
 	}
 }
 

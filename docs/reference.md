@@ -1043,9 +1043,11 @@ Callers with their own provider selection must resolve and pass it on each call.
 
 The strict 0.163.0 profiles use `Effort: "low"`, with either
 `Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted raw 0.164.0 naming supports
-only `Model: "gpt-6-luna"` and `Effort: "low"`. Each requires its matching
-immutable catalog below. Other pairs fail with `ErrEphemeralSettings` before
-connecting.
+only `Model: "gpt-6-luna"` with `Effort: "low"` or `Effort: "high"`. Each
+requires its matching immutable catalog below. Other pairs fail with
+`ErrEphemeralSettings` before connecting. The server's `model/list` must also
+advertise the exact requested
+effort before the helper creates a thread; it never substitutes another effort.
 The caller runs a dedicated utility App Server with the selected profile
 catalog at startup. The profile must use direct tool mode. The helper cannot
 certify an arbitrary daemon. Model names and `model/list` alone do not

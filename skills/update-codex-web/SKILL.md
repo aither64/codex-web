@@ -13,8 +13,9 @@ repository's flake merely to select a release.
 
 The strict `RunEphemeralTurn` contract supports Codex 0.163.0 with both existing
 model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0
-and Luna/low. The prompted contract retains the bounded runner and fixed
-defenses. Its prompt guides the model without establishing tool-effect isolation. Preserve both API
+and Luna with low or high effort. The strict profiles remain low-only. The
+prompted contract retains the bounded runner and fixed defenses. Its prompt
+guides the model without establishing tool-effect isolation. Preserve both API
 contracts; do not relabel a prompted native pass as strict isolation evidence.
 The consuming runtime verifies the exact executable. Identical catalog bytes or
 a pathname cannot identify a native version.
@@ -66,8 +67,9 @@ distinctions through changed metadata, copied JSON files or trusted pathnames.
 
 Keep corresponding immutable hashes in codex/ephemeral.go, tests and the
 reference aligned with actual catalog content. Preserve both strict model/effort
-pairs and the fixed prompted Luna/low pair. Do not broaden accepted contents or
-change ApplyPatch metadata to make an upgrade pass.
+pairs and the prompted Luna/low and Luna/high pairs. Require `model/list` to
+advertise the requested effort before thread creation. Do not broaden accepted
+contents or change ApplyPatch metadata to make an upgrade pass.
 
 ## Verify and return evidence
 

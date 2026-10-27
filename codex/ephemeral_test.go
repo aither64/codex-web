@@ -804,7 +804,7 @@ func TestEphemeralSinkFrameAndAggregateBounds(t *testing.T) {
 }
 
 func TestEphemeralStaticProfilePreconnection(t *testing.T) {
-	for _, pair := range [][2]string{{"gpt-6.1-sol", "low"}, {"gpt-5.5", "high"}, {"gpt-5.5 ", "low"}, {"", "low"}} {
+	for _, pair := range [][2]string{{"gpt-6.1-sol", "low"}, {"gpt-5.5", "high"}, {"gpt-6-luna", "high"}, {"gpt-5.5 ", "low"}, {"", "low"}} {
 		t.Run(pair[0]+"/"+pair[1], func(t *testing.T) {
 			opts := ephemeralTestOptions(t)
 			opts.Model, opts.Effort = pair[0], pair[1]
