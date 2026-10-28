@@ -615,6 +615,60 @@ connection generation changes. Disconnecting or closing the client cancels
 queued work. The observer's ten-second RPC timeout starts after admission;
 the caller's context also bounds time spent waiting for a slot.
 
+For a volatile view of native notifications, set `ClientOptions.ObserveEvent`
+on that same `ObserverOnly` client. `ObserverEvent` carries `Kind`, `Generation`,
+`Sequence`, `ThreadID`, `Method`, `RequestID`, `Params` and `Reason`. The callback
+runs synchronously before wakeup coalescing, in read order, with detached ID and
+parameter bytes owned by that invocation. It receives server requests too, but
+never RPC result bodies. It must do bounded memory-only work: no I/O, client
+calls or recursive callbacks. No client mutex is held during the callback.
+Clients without this option keep their existing behavior; the option is ignored
+on interactive clients.
+
+Event kinds are `connected`, `notification`, `watch-established`,
+`watch-removed`, `disconnected`, `closed` and `invalid` (the corresponding
+`Observer*` constants). Sequence increases across connection generations.
+`watch-established` is emitted by the reader on the successful subscription
+reply, before waking its waiter or reading the next frame. A turn start received
+before that boundary supplies no continuous coverage. Final local watch removal
+and native `thread/closed` invalidate the watch even if no unsubscribe can be
+sent. Notifications from a retired generation cannot establish current coverage.
+A new generation always begins uncovered. Neither connection readiness nor a
+recent event proves that a turn's start was observed.
+
+Frames larger than `ObserverEventLimit` (256 KiB), non-text frames, decode errors
+and invalid envelopes emit `invalid` without copying their payload. Read errors
+also invalidate observation and are followed by `disconnected`. Only typed
+WebSocket normal (1000) and going-away (1001) closes use reason `normal-close`;
+EOF, protocol, size and other read errors use `read-error`. This annotation does
+not restore coverage or grant readiness, continuation or owner recovery. A prior
+invalidation remains in the event sequence. A consumer must
+invalidate affected coverage on loss, malformed relevant data or its own bound
+overflow; it must handle unknown effect notifications conservatively. The tap
+has no event queue, storage or reconnect recovery of its own. Concurrent local
+watch retirement and transport lifecycle events are serialized with callbacks;
+use the generation on each event when retiring old state.
+
+`ObserverGeneration() (uint64, bool)` reads the current ready connection identity
+without making a request. The boolean remains true for a frozen connection and
+never asserts coverage. To retain a read-only tail, first stop and join the
+application's polling and subscription work, preserving its watch references.
+Then call `FreezeObserverWrites(ctx, expectedGeneration)`. It requires an
+ObserverOnly client with an event tap, an exact connected ready generation and
+no pending RPC. It joins the existing writer serialization and irreversibly
+refuses future requests, Ensure, reconnect, resume, unsubscribe and answers.
+Rejected writes return `ErrObserverWritesFrozen`; the original reader and
+WebSocket control handling continue. An already-frozen exact live generation
+can be frozen again. A failed freeze grants no retention guarantee. Call it
+without a callback, reducer or store lock held.
+
+Freeze does not close the caller-owned activity recorder. Join its normal
+readers and call `ActivityRecorder.Close()` to flush and join disk writers;
+subsequent frames cannot restart those writers. Close the retained client when
+its tail ends. There is no unfreeze operation: returning to normal observation
+requires a new client through the application's ordinary restoration path, and
+cannot recover coverage for a turn whose start it missed.
+
 The recorder holds a lifetime lock on that directory. Each thread has an
 independent writer, a bounded current checkpoint, and a compact summary file
 for each observed turn. Directories use mode `0700`; files use mode `0600`.
