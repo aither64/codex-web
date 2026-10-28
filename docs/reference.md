@@ -53,6 +53,13 @@ transport failure. A mutation still needs its durable outcome reconciliation.
 If a failed request races with caller cancellation, its error chain retains
 both causes. Cancellation alone does not establish whether input was sent.
 
+`RPCErrorData(err)` returns a copy of native structured error data through wrapped
+errors, with a presence boolean. Missing data and non-RPC errors return false;
+explicit JSON `null` remains present. Decode only the fields needed by the
+operation and validate their shape. For example, native shutdown admission is
+identified by the exact `reason: "serverShuttingDown"` field, never diagnostic
+message text. Structured data does not itself authorize retrying a mutation.
+
 `MessageNotSentError` reports a send that never entered its mutation write, or
 received an explicit invalid-request, unknown-method or invalid-parameters
 refusal. Its saved attempt remains `prepared` and can be retried with the same

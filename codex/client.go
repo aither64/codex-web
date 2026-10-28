@@ -66,6 +66,19 @@ type rpcError struct {
 type rpcCallError struct {
 	code    int
 	message string
+	data    json.RawMessage
+}
+
+// RPCErrorData returns a detached copy of a native RPC error's structured data,
+// including through wrapped errors. The boolean is false when data is absent
+// or err is not an RPC error. Explicit JSON null is present data.
+// Callers must validate the expected shape; data alone grants no retry authority.
+func RPCErrorData(err error) (json.RawMessage, bool) {
+	var call *rpcCallError
+	if !errors.As(err, &call) || call == nil || len(call.data) == 0 {
+		return nil, false
+	}
+	return append(json.RawMessage(nil), call.data...), true
 }
 
 type ProjectNotFoundError struct {
@@ -1399,7 +1412,10 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 		}
 		var reply response
 		if message.Error != nil {
-			reply = response{err: &rpcCallError{code: message.Error.Code, message: message.Error.Message}}
+			reply = response{err: &rpcCallError{
+				code: message.Error.Code, message: message.Error.Message,
+				data: append(json.RawMessage(nil), message.Error.Data...),
+			}}
 		} else {
 			reply = response{result: message.Result}
 		}
