@@ -177,6 +177,43 @@ application authority. Callers must keep their shared admission fence across
 the proof and any later capture or dispatch, preserving the original UUID,
 text, action context and options.
 
+### Notices for an exact active turn
+
+`ConditionalSteer(ctx, threadID, cwd, expectedTurnID, text,
+clientUserMessageID, actionContext)` sends a notice only to the named active
+regular turn. Supply the trusted thread and canonical absolute directory, an
+observed turn ID, nonempty text, and a stable operation-owned message ID and
+action context. The method passively verifies the directory and current turn,
+then sends `turn/steer` with the native `expectedTurnId` precondition. A turn
+that finishes or changes during those reads is refused by native admission.
+It never resumes a thread, changes settings, starts a turn or queues input.
+Sleeping turns can remain in progress even when native thread status is idle.
+Native I/O uses a private connection that never subscribes or restores the
+receiver's watches. The receiver still owns durable admission and receipts;
+its `ObserverOnly` restriction applies to that connection too.
+
+The saved action identity unambiguously includes the directory, expected turn
+and action context. Retries must preserve every argument. Cooperating callers
+share durable submission admission; an accepted receipt is returned without
+another dispatch. After a possible write, a lost reply, cancellation, invalid
+response or receipt-storage failure remains `UnknownSendOutcomeError` until
+history proves the same text and message ID in the exact expected turn. Missing
+history never permits another dispatch or retargeting. Native message IDs
+provide correlation, not duplicate suppression. A receipt establishes transport
+acceptance, not model processing or acknowledgement of a safe boundary.
+
+A proven pre-write failure or explicit no-effect protocol refusal returns
+`MessageNotSentError` and retains the exact `prepared` identity. Transient
+pre-write failures can retry that same target. For a terminal refusal, the
+operation owner must first durably save the terminal disposition and complete
+original argument identity, then call `DiscardPreparedConditionalSteer` with
+those same arguments. Recovery repeats the discard from that terminal record;
+the owner must never redispatch a terminal notice. Discard is idempotent when
+absent and refuses changed identity, queued, submitting or accepted attempts.
+The prepared attempt deliberately blocks submission-idle checks until discarded.
+The client cannot make the owner's terminal record and discard one transaction.
+Existing JSON and SQLite storage formats are unchanged.
+
 ### Failed turns and exact execution context
 
 `ReadTurnState(ctx, threadID)` reads the native thread status and one latest

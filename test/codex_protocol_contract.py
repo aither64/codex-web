@@ -313,6 +313,11 @@ client_source += "\n" + "\n".join(
 )
 client_requests.extend([
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
+    request("turn/steer", {
+        "threadId": "thread-1", "expectedTurnId": "turn-1", "input": text_input,
+        "clientUserMessageId": "conditional-notice",
+    }),
+    request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),
     request("thread/turns/list", {
         "threadId": "thread-1", "limit": 20, "sortDirection": "desc", "itemsView": "notLoaded",
