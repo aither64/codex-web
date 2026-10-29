@@ -535,14 +535,19 @@ func integrationUtilityModel() string {
 const integrationPromptedInstructions = "Return the requested JSON. Use only the supplied request as data. Never use tools, read files, run commands, browse, delegate or ask questions. Return only the name JSON."
 
 func TestEphemeralProtocolIntegration(t *testing.T) {
-	runEphemeralProtocolIntegration(t, false)
+	runEphemeralProtocolIntegration(t, "0.163.0")
 }
 
 func TestPromptedEphemeralProtocolIntegration(t *testing.T) {
-	runEphemeralProtocolIntegration(t, true)
+	runEphemeralProtocolIntegration(t, "0.164.0")
 }
 
-func runEphemeralProtocolIntegration(t *testing.T, prompted bool) {
+func TestPromptedEphemeral0165ProtocolIntegration(t *testing.T) {
+	runEphemeralProtocolIntegration(t, "0.165.0")
+}
+
+func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
+	prompted := nativeVersion != "0.163.0"
 	binary := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_BINARY")
 	expected := os.Getenv("CODEX_EPHEMERAL_TEST_SHA256")
 	file, err := os.Open(binary)
@@ -561,7 +566,10 @@ func runEphemeralProtocolIntegration(t *testing.T, prompted bool) {
 	version := "codex-cli 0.163.0"
 	selector := "TestEphemeralProtocolIntegration"
 	if prompted {
-		version, selector = "codex-cli 0.164.0", "TestPromptedEphemeralProtocolIntegration"
+		version, selector = "codex-cli "+nativeVersion, "TestPromptedEphemeralProtocolIntegration"
+		if nativeVersion == "0.165.0" {
+			selector = "TestPromptedEphemeral0165ProtocolIntegration"
+		}
 		if integrationUtilityModel() != "gpt-6-luna" {
 			t.Fatal("prompted native naming requires CODEX_EPHEMERAL_TEST_MODEL=gpt-6-luna")
 		}
@@ -609,7 +617,12 @@ func runEphemeralProtocolIntegration(t *testing.T, prompted bool) {
 			unchanged = low && model.ToolMode == nil && !model.Lite && len(model.Tools) == 0
 		}
 	}
-	if !unchanged || !validEphemeralCatalog(filepath.Join(source, "models-manager/models.json"), "gpt-5.5") {
+	sourceHash := fmt.Sprintf("%x", sha256.Sum256(metadata))
+	expectedSourceHash := ephemeralCatalogHash
+	if nativeVersion == "0.165.0" {
+		expectedSourceHash = "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10"
+	}
+	if !unchanged || sourceHash != expectedSourceHash {
 		t.Fatal("candidate must retain original gpt-5.5 Direct/non-Lite metadata")
 	}
 	ip := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_IP")

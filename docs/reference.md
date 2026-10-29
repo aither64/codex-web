@@ -983,7 +983,10 @@ Codex build they deploy.
 
 ### Native state upgrade fixture
 
-The tagged `TestNativeStateUpgrade0163To0164` checks one disposable native
+The tagged `TestNativeStateUpgrade0164To0165` checks the selected 0.164 to
+0.165 upgrade with the same fixture described below. Its exact new native
+SHA-256 is `647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652`.
+The retained `TestNativeStateUpgrade0163To0164` checks one disposable native
 state transition from Codex 0.163.0 to 0.164.0. It uses synthetic Responses
 traffic, private home and working directories, and client receipt storage. It
 starts only one native version at a time. The upgrade phase checks that old
@@ -1019,7 +1022,8 @@ mixed-version or downgrade safety. Recovery remains forward-only.
 
 `Client.RunEphemeralTurn(ctx, EphemeralTurnOptions)` provides the strict
 utility contract for Codex 0.163.0. `Client.RunPromptedEphemeralTurn(ctx,
-EphemeralTurnOptions)` provides a separate naming contract for raw Codex 0.164.0.
+EphemeralTurnOptions)` provides a separate naming contract for raw Codex 0.164.0
+and 0.165.0.
 Both return `EphemeralTurnResult{Text: ...}` for one completed final answer and
 share the bounded private runner, sink, fixed restrictions and cleanup/retry
 proof. These Go APIs accept trusted application inputs; no browser route selects
@@ -1042,7 +1046,7 @@ the prompt for inference. An empty value uses the native server's default.
 Callers with their own provider selection must resolve and pass it on each call.
 
 The strict 0.163.0 profiles use `Effort: "low"`, with either
-`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted raw 0.164.0 naming supports
+`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted raw 0.164.0/0.165.0 naming supports
 only `Model: "gpt-6-luna"` with `Effort: "low"` or `Effort: "high"`. Each
 requires its matching immutable catalog below. Other pairs fail with
 `ErrEphemeralSettings` before connecting. The server's `model/list` must also
@@ -1080,7 +1084,10 @@ It contains the original Luna metadata
 with `tool_mode` set to `direct`, `experimental_supported_tools` emptied and
 `use_responses_lite` set to `false`. Full and derived catalog bytes are identical
 in Codex 0.163.0 and 0.164.0; their separate provenance records describe that
-shared content. Hash validation proves catalog content, not the native release
+shared content. Codex 0.165 adds only GPT-6.1 Terra to the full catalog
+(SHA-256 `1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10`);
+its derived Luna resource remains byte-identical. The strict full-catalog fixture
+remains at 0.163. Hash validation proves catalog content, not the native release
 or its tool-isolation behavior. Both supported releases use the standard
 Responses shape. Strict 0.163 requires top-level `tools: []` and no
 `additional_tools` input role; the prompted 0.164 fixture records actual native
@@ -1326,6 +1333,10 @@ namespace ownership control passes, run:
 go test -mod=readonly -tags=codex_integration ./codex \
   -run '^TestPromptedEphemeralProtocolIntegration$' -count=1 -timeout=180s
 ```
+
+For raw 0.165 use `TestPromptedEphemeral0165ProtocolIntegration` with that
+release's exact binary/hash/source and the same immutable Luna catalog. The
+0.164 selector remains available for retained installations.
 
 This fixture checks fixed-request defenses, actual tool-schema observation,
 owned final output, native retry progress, terminal retry proof, question

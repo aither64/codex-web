@@ -12,7 +12,7 @@ changing the compatibility contract. Do not add a binary dependency to this
 repository's flake merely to select a release.
 
 The strict `RunEphemeralTurn` contract supports Codex 0.163.0 with both existing
-model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0
+model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0 or 0.165.0
 and Luna with low or high effort. The strict profiles remain low-only. The
 prompted contract retains the bounded runner and fixed defenses. Its prompt
 guides the model without establishing tool-effect isolation. Preserve both API
@@ -57,6 +57,10 @@ list, and use_responses_lite to false. Preserve all other Luna metadata.
 python3 skills/update-codex-web/scripts/refresh-catalogs.py \
   --source "$codex_source" --version "$codex_version"
 ```
+
+For `--version 0.165.0`, the helper validates the exact source catalog, the
+addition of Terra and unchanged retained metadata, then writes a separate 0.165
+provenance record. It preserves strict fixtures and the shared Luna resource.
 
 For `--version 0.163.0`, the helper regenerates the strict catalogs and their
 original provenance. For `--version 0.164.0`, it verifies that both generated

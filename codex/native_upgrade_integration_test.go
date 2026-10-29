@@ -64,11 +64,20 @@ type nativeUpgradeFailureSnapshot struct {
 // the old-reader phase establishes cold reads, not old-version write or rollback
 // safety. The application recovery contract remains forward-only.
 func TestNativeStateUpgrade0163To0164(t *testing.T) {
-	old, err := nativeUpgradeBinaryFromEnv("OLD", nativeUpgradeOldSHA, "codex-cli 0.163.0")
+	runNativeStateUpgrade(t, nativeUpgradeOldSHA, "0.163.0", nativeUpgradeNewSHA, "0.164.0")
+}
+
+func TestNativeStateUpgrade0164To0165(t *testing.T) {
+	runNativeStateUpgrade(t, nativeUpgradeNewSHA, "0.164.0",
+		"647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652", "0.165.0")
+}
+
+func runNativeStateUpgrade(t *testing.T, oldHash, oldVersion, newHash, newVersion string) {
+	old, err := nativeUpgradeBinaryFromEnv("OLD", oldHash, "codex-cli "+oldVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
-	newBinary, err := nativeUpgradeBinaryFromEnv("NEW", nativeUpgradeNewSHA, "codex-cli 0.164.0")
+	newBinary, err := nativeUpgradeBinaryFromEnv("NEW", newHash, "codex-cli "+newVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,12 +224,12 @@ func TestNativeStateUpgrade0163To0164(t *testing.T) {
 			*target.thread = id
 			marker := nativeUpgradeBootstrapMarker(target.name, id)
 			err = client.BootstrapHeadlessThread(ctx, id, h.cwd, project.ID, marker)
-			recordBootstrap("seed-0163", target.name, id, project.ID, "", marker, err)
+			recordBootstrap("seed-"+oldVersion, target.name, id, project.ID, "", marker, err)
 			if err != nil {
 				t.Fatal(err)
 			}
 		}
-		state.OldUser, state.OldAnswer = "Synthetic request created by 0.163.", "Synthetic upgrade answer 1."
+		state.OldUser, state.OldAnswer = "Synthetic request created by "+oldVersion+".", "Synthetic upgrade answer 1."
 		state.OldReceipt, err = client.Send(ctx, state.Root, state.OldUser, "native-upgrade-old-message", "")
 		if err != nil {
 			t.Fatal(err)
@@ -252,7 +261,7 @@ func TestNativeStateUpgrade0163To0164(t *testing.T) {
 		if err != nil || resumed != state.Root {
 			t.Fatalf("resume original root: %q %v", resumed, err)
 		}
-		state.NewUser, state.NewAnswer = "Synthetic request created by 0.164.", "Synthetic upgrade answer 2."
+		state.NewUser, state.NewAnswer = "Synthetic request created by "+newVersion+".", "Synthetic upgrade answer 2."
 		state.NewReceipt, err = client.Send(ctx, state.Root, state.NewUser, "native-upgrade-new-message", "")
 		if err != nil {
 			t.Fatal(err)
@@ -266,7 +275,7 @@ func TestNativeStateUpgrade0163To0164(t *testing.T) {
 		}
 		marker := nativeUpgradeBootstrapMarker("fork", state.Fork)
 		err = client.BootstrapForkedHeadlessThread(ctx, state.Fork, h.cwd, state.Root, marker)
-		recordBootstrap("upgrade-0164", "fork", state.Fork, "", state.Root, marker, err)
+		recordBootstrap("upgrade-"+newVersion, "fork", state.Fork, "", state.Root, marker, err)
 		if err != nil {
 			t.Fatal(err)
 		}

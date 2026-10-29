@@ -102,7 +102,7 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 
 // RunPromptedEphemeralTurn runs one bounded naming turn on a private connection
 // using gpt-6-luna with low or high effort and the fixed catalog with raw Codex
-// 0.164. Tools may be advertised or attempted: prompt instructions are guidance,
+// 0.164 and 0.165. Tools may be advertised or attempted: prompt instructions are guidance,
 // not an enforced tool-effect isolation boundary. The caller verifies the
 // serving executable
 // and supplies explicit naming instructions, including the prohibition on tools.
