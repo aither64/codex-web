@@ -230,9 +230,12 @@ async function uploadComposer(t, options = {}) {
 }
 const rejected = (status, message = 'Filename contains control characters') => Object.assign(Error(message), {status});
 async function eventually(predicate) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
     if (predicate()) return;
-    await new Promise((resolve) => setImmediate(resolve));
+    // WebCrypto completes on a worker. Event-loop spins can exhaust the wait
+    // before that worker is scheduled on a loaded CI runner.
+    await new Promise((resolve) => setTimeout(resolve, 2));
   }
   assert.ok(predicate(), 'component did not reach the expected state');
 }
