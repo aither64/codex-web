@@ -14,36 +14,46 @@ import (
 // time includes observation through ObservedAtMS. A UI may project an open state
 // from ObservedAtMS, but must not persist that browser projection as coverage.
 type ActivitySnapshot struct {
-	Stale             bool   `json:"stale,omitempty"`
-	Refreshing        bool   `json:"refreshing,omitempty"`
-	ThreadID          string `json:"threadId"`
-	CurrentTurnID     string `json:"currentTurnId,omitempty"`
-	Messages          int    `json:"messages"`
-	ToolCalls         int    `json:"toolCalls"`
-	SentMessages      int    `json:"sentMessages"`
-	ReceivedMessages  int    `json:"receivedMessages"`
-	TotalToolCalls    int    `json:"totalToolCalls"`
-	CountsComplete    bool   `json:"countsComplete"`
-	IdleMS            int64  `json:"idleMs"`
-	CreatedAtMS       int64  `json:"createdAtMs,omitempty"`
-	WaitReason        string `json:"waitReason,omitempty"`
-	WaitUntilMS       int64  `json:"waitUntilMs,omitempty"`
-	LatestTurnStatus  string `json:"latestTurnStatus,omitempty"`
-	StartedAtMS       int64  `json:"startedAtMs,omitempty"`
-	CompletedAtMS     int64  `json:"completedAtMs,omitempty"`
-	WorkingMS         int64  `json:"workingMs"`
-	WaitingMS         int64  `json:"waitingMs"`
-	OpenWaitingMS     int64  `json:"openWaitingMs"`
-	BetweenTurnsMS    int64  `json:"betweenTurnsMs"`
-	UnclassifiedMS    int64  `json:"unclassifiedMs"`
-	ObservedAtMS      int64  `json:"observedAtMs"`
-	CoverageStartMS   int64  `json:"coverageStartMs,omitempty"`
-	CoverageComplete  bool   `json:"coverageComplete"`
-	CoverageReason    string `json:"coverageReason,omitempty"`
-	CurrentState      string `json:"currentState"`
-	StateSinceMS      int64  `json:"stateSinceMs,omitempty"`
-	Scope             string `json:"scope"`
-	TimingApproximate bool   `json:"timingApproximate"`
+	Stale             bool                      `json:"stale,omitempty"`
+	Refreshing        bool                      `json:"refreshing,omitempty"`
+	ThreadID          string                    `json:"threadId"`
+	CurrentTurnID     string                    `json:"currentTurnId,omitempty"`
+	Messages          int                       `json:"messages"`
+	ToolCalls         int                       `json:"toolCalls"`
+	SentMessages      int                       `json:"sentMessages"`
+	ReceivedMessages  int                       `json:"receivedMessages"`
+	TotalToolCalls    int                       `json:"totalToolCalls"`
+	CountsComplete    bool                      `json:"countsComplete"`
+	IdleMS            int64                     `json:"idleMs"`
+	CreatedAtMS       int64                     `json:"createdAtMs,omitempty"`
+	BlockingRequests  []ActivityBlockingRequest `json:"blockingRequests,omitempty"`
+	WaitReason        string                    `json:"waitReason,omitempty"`
+	WaitUntilMS       int64                     `json:"waitUntilMs,omitempty"`
+	LatestTurnStatus  string                    `json:"latestTurnStatus,omitempty"`
+	StartedAtMS       int64                     `json:"startedAtMs,omitempty"`
+	CompletedAtMS     int64                     `json:"completedAtMs,omitempty"`
+	WorkingMS         int64                     `json:"workingMs"`
+	WaitingMS         int64                     `json:"waitingMs"`
+	OpenWaitingMS     int64                     `json:"openWaitingMs"`
+	BetweenTurnsMS    int64                     `json:"betweenTurnsMs"`
+	UnclassifiedMS    int64                     `json:"unclassifiedMs"`
+	ObservedAtMS      int64                     `json:"observedAtMs"`
+	CoverageStartMS   int64                     `json:"coverageStartMs,omitempty"`
+	CoverageComplete  bool                      `json:"coverageComplete"`
+	CoverageReason    string                    `json:"coverageReason,omitempty"`
+	CurrentState      string                    `json:"currentState"`
+	StateSinceMS      int64                     `json:"stateSinceMs,omitempty"`
+	Scope             string                    `json:"scope"`
+	TimingApproximate bool                      `json:"timingApproximate"`
+}
+
+// ActivityBlockingRequest identifies an observed blocking request without its
+// content or response authority. The enclosing snapshot supplies the thread ID.
+type ActivityBlockingRequest struct {
+	TurnID string `json:"turnId"`
+	ItemID string `json:"itemId"`
+	Method string `json:"method"`
+	Kind   string `json:"kind"`
 }
 
 // A turn keeps aggregate elapsed time and the current second separately. Server
@@ -66,6 +76,8 @@ type activityTurnRecord struct {
 }
 
 type activityRequest struct {
+	ItemID     string `json:"itemId,omitempty"`
+	Method     string `json:"method,omitempty"`
 	TurnID     string `json:"turnId,omitempty"`
 	Blocking   bool   `json:"blocking"`
 	Category   string `json:"category"`

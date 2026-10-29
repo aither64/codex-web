@@ -154,6 +154,7 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 	var params struct {
 		ThreadID      string          `json:"threadId"`
 		TurnID        string          `json:"turnId"`
+		ItemID        string          `json:"itemId"`
 		IsBlocking    *bool           `json:"isBlocking"`
 		RequestID     json.RawMessage `json:"requestId"`
 		Turn          map[string]any  `json:"turn"`
@@ -298,7 +299,7 @@ func (r *ActivityRecorder) observe(connection string, message rpcMessage, now in
 			live.Ready = false
 			live.Overflow = true
 		} else if _, exists := live.Requests[id]; !exists {
-			live.Requests[id] = activityRequest{TurnID: params.TurnID, Blocking: blocking, Category: category, OpenedAtMS: now}
+			live.Requests[id] = activityRequest{TurnID: params.TurnID, ItemID: params.ItemID, Method: message.Method, Blocking: blocking, Category: category, OpenedAtMS: now}
 		}
 	}
 	live.Revision++

@@ -580,11 +580,26 @@ Snapshots use only durable coverage. Recorder caches are released when their
 last watch or read ends; summary files remain available for archived threads.
 
 The recorder stores thread and turn identities, namespaced connection IDs,
-outstanding request IDs and blocking categories, elapsed totals, and coverage
+outstanding request IDs, native item/method identities and blocking categories,
+elapsed totals, and coverage
 bounds. Resolved requests are removed. It does not store prompts, commands or
 answers. At most 128 outstanding requests and 128 turns awaiting compaction
 fit in one thread's current state; exceeding a bound makes the affected time
 unclassified. Historical summaries have no authority-wide size limit.
+
+`ActivitySnapshot.blockingRequests` optionally projects the current blocking
+questions and approvals as identity-only entries: `turnId`, `itemId`, `method`
+and `kind` (`userInput` or `approval`). The snapshot supplies `threadId`.
+Entries use stable item/method ordering and require a durable, connected waiting
+observation of the current in-progress turn. Optional questions, incomplete
+identity and unclassified observations are omitted. Resolution, terminal turns
+and disconnect remove the projection. These identities grant no response
+authority; passive observers still retain no interactive `Prompts()`.
+
+The optional `itemId` and `method` checkpoint fields remain within schema 1.
+Older readers ignore them, and older writers may drop them without losing timing
+totals. New readers accept their absence and omit identity until fresh native
+observation supplies it. Reconnect never restores pending authority from disk.
 
 The application owns the recorder: close observers first, then call
 `recorder.Close()`. Closing a client does not close a recorder that other

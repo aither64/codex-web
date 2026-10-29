@@ -8,6 +8,7 @@ import (
 	"github.com/coder/websocket"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -550,5 +551,122 @@ func TestTurnMetadataAutomaticWaitEvidence(t *testing.T) {
 	}}, "thread")
 	if !metadata.HasSleep || len(metadata.AutomaticWaits) != 1 || metadata.AutomaticWaits["active"].Reason != "subagents" {
 		t.Fatal(metadata)
+	}
+}
+
+func TestActivityBlockingRequestProjection(t *testing.T) {
+	r := startActivity(t, filepath.Join(t.TempDir(), "activity"))
+	question := func(id int, item, turn string, blocking any) {
+		params := map[string]any{"threadId": "thread", "turnId": turn, "itemId": item, "questions": "PRIVATE PROMPT"}
+		if blocking != nil {
+			params["isBlocking"] = blocking
+		}
+		activityEvent(r, "connection:1", "item/tool/requestUserInput", id, params, 2000)
+	}
+	question(1, "z-question", "turn", nil) // Native default is blocking.
+	question(1, "z-question", "turn", nil) // A replay retains one identity.
+	question(2, "optional", "turn", false)
+	question(3, "", "turn", true) // Older records can lack identity.
+	question(4, "other-turn", "old", true)
+	activityEvent(r, "connection:1", "item/permissions/requestApproval", 5,
+		map[string]any{"threadId": "thread", "turnId": "turn", "itemId": "a-approval", "permissions": "PRIVATE PERMISSIONS"}, 2000)
+	want := []ActivityBlockingRequest{
+		{TurnID: "turn", ItemID: "a-approval", Method: "item/permissions/requestApproval", Kind: "approval"},
+		{TurnID: "turn", ItemID: "z-question", Method: "item/tool/requestUserInput", Kind: "userInput"},
+	}
+	got := r.snapshot("thread", activityTurn("inProgress", 0), "thread", 2000)
+	if !reflect.DeepEqual(got.BlockingRequests, want) || got.WaitReason != "userInput" {
+		t.Fatalf("blocking projection = %#v", got)
+	}
+	// A second question in the same turn has a distinct native identity.
+	activityEvent(r, "connection:1", "serverRequest/resolved", nil, map[string]any{"threadId": "thread", "requestId": 1}, 3000)
+	question(6, "next-question", "turn", true)
+	want[1].ItemID = "next-question"
+	got = r.snapshot("thread", activityTurn("inProgress", 0), "thread", 3000)
+	if !reflect.DeepEqual(got.BlockingRequests, want) {
+		t.Fatalf("resolved/replaced projection = %#v", got.BlockingRequests)
+	}
+	for _, status := range []string{"completed", "failed", "interrupted"} {
+		if got := r.snapshot("thread", activityTurn(status, 3000), "thread", 3000); len(got.BlockingRequests) != 0 {
+			t.Fatalf("terminal %s retained requests: %#v", status, got)
+		}
+	}
+	if got := r.snapshot("thread", activityTurn("inProgress", 0), "unknown", 3000); len(got.BlockingRequests) != 0 {
+		t.Fatal("unknown scope projected request identity")
+	}
+	activityEvent(r, "connection:1", "future/unsupported", 7, map[string]any{"threadId": "thread"}, 3000)
+	if got := r.snapshot("thread", activityTurn("inProgress", 0), "thread", 3000); len(got.BlockingRequests) != 0 {
+		t.Fatal("unclassified state projected request identity")
+	}
+	r.disconnected("connection:1", "thread")
+	r.connected("thread", "connection:2", 4000)
+	r.reconcile("thread", "connection:2", activityTurn("inProgress", 0), map[string]any{"type": "active", "activeFlags": []any{"waitingOnUserInput"}}, 4000, 0)
+	if got := r.snapshot("thread", activityTurn("inProgress", 0), "thread", 4000); len(got.BlockingRequests) != 0 {
+		t.Fatal("reconnect reused old request identities")
+	}
+}
+
+func TestObserverActivityBlockingRequestWithoutResponseAuthority(t *testing.T) {
+	done := make(chan struct{})
+	socket := serveUnixWebsocket(t, func(connection *websocket.Conn) error {
+		if err := handshake(connection); err != nil {
+			return err
+		}
+		for _, method := range []string{"thread/resume", "thread/read", "thread/turns/list"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			if request["method"] != method {
+				return fmt.Errorf("observer wrote an unexpected frame: %v", request)
+			}
+			var result any = map[string]any{}
+			switch method {
+			case "thread/resume":
+				if err := writeObject(connection, map[string]any{"method": "turn/started", "params": map[string]any{"threadId": "thread", "turn": map[string]any{"id": "turn", "status": "inProgress", "startedAt": 1}}}); err != nil {
+					return err
+				}
+				if err := writeObject(connection, map[string]any{"id": "plan-question", "method": "item/tool/requestUserInput", "params": map[string]any{
+					"threadId": "thread", "turnId": "turn", "itemId": "plan-item", "questions": []any{map[string]any{"id": "q", "header": "Question", "question": "PRIVATE PLAN QUESTION"}},
+				}}); err != nil {
+					return err
+				}
+			case "thread/read":
+				result = map[string]any{"thread": map[string]any{"id": "thread", "status": map[string]any{"type": "active", "activeFlags": []string{"waitingOnUserInput"}}}}
+			case "thread/turns/list":
+				result = map[string]any{"data": []any{map[string]any{"id": "turn", "status": "inProgress", "startedAt": 1, "items": []any{}}}}
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": result}); err != nil {
+				return err
+			}
+		}
+		<-done // Keep connection coverage until the snapshot is inspected.
+		return nil
+	})
+	recorder, err := NewActivityRecorder(filepath.Join(t.TempDir(), "activity"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recorder.Close()
+	client := NewWithOptions(socket, ClientOptions{ObserverOnly: true, ActivityRecorder: recorder})
+	defer client.Close()
+	defer close(done)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, unsubscribe, err := client.Subscribe(ctx, "thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unsubscribe()
+	got, err := client.ReadActivity(ctx, "thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ActivityBlockingRequest{{TurnID: "turn", ItemID: "plan-item", Method: "item/tool/requestUserInput", Kind: "userInput"}}
+	if got.CurrentState != "waiting" || got.WaitReason != "userInput" || !reflect.DeepEqual(got.BlockingRequests, want) {
+		t.Fatalf("passive activity = %#v", got)
+	}
+	if len(client.Prompts("thread")) != 0 {
+		t.Fatal("passive observer acquired interactive prompts")
 	}
 }

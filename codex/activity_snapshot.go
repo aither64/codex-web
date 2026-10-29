@@ -1,6 +1,9 @@
 package codex
 
-import "context"
+import (
+	"context"
+	"sort"
+)
 
 func (r *ActivityRecorder) seedCurrent(ctx context.Context, threadID string, turns []TurnMetadata) {
 	thread := r.lookup(threadID)
@@ -113,6 +116,28 @@ func (r *ActivityRecorder) snapshotContextCached(ctx context.Context, threadID s
 				}
 			}
 		}
+	}
+	// Project only durable identities belonging to the connected current turn.
+	// Historical checkpoints can lack identity; they still contribute timing.
+	if live != nil && live.Active && live.State == "waiting" &&
+		result.LatestTurnStatus == "inProgress" && live.TurnID == result.CurrentTurnID {
+		for _, request := range live.Requests {
+			policy := requestPolicyFor(request.Method)
+			if !request.Blocking || request.TurnID == "" || request.TurnID != live.TurnID || request.ItemID == "" ||
+				!policy.blocking || policy.category != request.Category || (request.Category != "userInput" && request.Category != "approval") {
+				continue
+			}
+			result.BlockingRequests = append(result.BlockingRequests, ActivityBlockingRequest{
+				TurnID: request.TurnID, ItemID: request.ItemID, Method: request.Method, Kind: request.Category,
+			})
+		}
+		sort.Slice(result.BlockingRequests, func(i, j int) bool {
+			a, b := result.BlockingRequests[i], result.BlockingRequests[j]
+			if a.ItemID != b.ItemID {
+				return a.ItemID < b.ItemID
+			}
+			return a.Method < b.Method
+		})
 	}
 	if scope == "unknown" {
 		result.CurrentState = "unclassified"

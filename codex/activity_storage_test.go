@@ -302,3 +302,51 @@ func TestActivityOversizedThreadStateDoesNotDisableOtherThreads(t *testing.T) {
 		t.Fatalf("healthy thread = %#v", got)
 	}
 }
+
+func TestActivitySchemaOneOptionalRequestIdentityAndPrivacy(t *testing.T) {
+	r := startActivity(t, filepath.Join(t.TempDir(), "activity"))
+	activityEvent(r, "connection:1", "item/tool/requestUserInput", 1, map[string]any{
+		"threadId": "thread", "turnId": "turn", "itemId": "plan-item", "questions": "PRIVATE PROMPT", "answers": "PRIVATE ANSWERS",
+	}, 2000)
+	got := r.snapshot("thread", activityTurn("inProgress", 0), "thread", 2000)
+	if len(got.BlockingRequests) != 1 {
+		t.Fatal("missing live request identity")
+	}
+	data, err := os.ReadFile(filepath.Join(r.lookup("thread").path, "current.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "PRIVATE") {
+		t.Fatalf("persisted request content: %s", data)
+	}
+	// Decode through the predecessor's exact request shape, which ignores the
+	// additive fields. An old writer may drop identity without losing timing.
+	type oldRequest struct {
+		TurnID     string `json:"turnId,omitempty"`
+		Blocking   bool   `json:"blocking"`
+		Category   string `json:"category"`
+		OpenedAtMS int64  `json:"openedAtMs"`
+	}
+	var legacy struct {
+		Schema  int `json:"schema"`
+		Current struct {
+			Requests map[string]oldRequest `json:"requests"`
+		} `json:"current"`
+		Turns map[string]activityTurnRecord `json:"turns"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil || legacy.Schema != 1 || !legacy.Current.Requests["1"].Blocking {
+		t.Fatalf("predecessor decode: %v, %#v", err, legacy)
+	}
+	oldData, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored activityCheckpoint
+	if err := json.Unmarshal(oldData, &restored); err != nil {
+		t.Fatal(err)
+	}
+	request := restored.Current.Requests["1"]
+	if request.ItemID != "" || request.Method != "" || request.Category != "userInput" || restored.Turns["turn"].WorkingMS != 1000 {
+		t.Fatalf("schema-1 roundtrip lost timing or invented identity: %#v", restored)
+	}
+}
