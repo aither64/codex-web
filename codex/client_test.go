@@ -735,6 +735,8 @@ func TestListThreadsStateDBOnly(t *testing.T) {
 		wantParams string
 	}{
 		{"default omits field", ThreadListOptions{}, `{}`},
+		{"all providers", ThreadListOptions{ModelProviders: []string{}}, `{"modelProviders":[]}`},
+		{"selected providers", ThreadListOptions{ModelProviders: []string{"previous", "current"}}, `{"modelProviders":["previous","current"]}`},
 		{"false omits field", filtered, `{"archived":true,"cursor":"next-page","cwd":"/workspace/work/example","limit":100,"projectId":"00000000-0000-7000-8000-000000000001","sortDirection":"asc","sourceKinds":["vscode"]}`},
 		{"true preserves filters", databaseOnly, `{"archived":true,"cursor":"next-page","cwd":"/workspace/work/example","limit":100,"projectId":"00000000-0000-7000-8000-000000000001","sortDirection":"asc","sourceKinds":["vscode"],"useStateDbOnly":true}`},
 	} {

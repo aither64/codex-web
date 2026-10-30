@@ -137,6 +137,11 @@ must reject an old policy that is no longer authorized.
 `ThreadListOptions.ProjectID` lists that project's threads and rejects results
 outside it. A project ID cannot be selected during resume or fork.
 
+`ThreadListOptions.ModelProviders` selects saved threads by model provider. Nil
+preserves the App Server's default filter; an explicit empty slice includes all
+providers. Retained identity discovery should use the latter when threads can
+outlive the provider that created them.
+
 `ThreadListOptions.UseStateDBOnly` asks `ListThreads` to read the Codex state
 database without scanning JSONL rollouts to repair thread metadata. It sends
 `useStateDbOnly: true` only when enabled; false omits the field and preserves

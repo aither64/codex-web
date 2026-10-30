@@ -531,6 +531,10 @@ type ThreadListOptions struct {
 	SortDirection string
 	Cursor        string
 
+	// ModelProviders filters saved threads by provider. Nil keeps the server's
+	// default provider filter; an empty non-nil slice includes every provider.
+	ModelProviders []string
+
 	// UseStateDBOnly skips scanning JSONL rollouts to repair thread metadata.
 	// False omits the option, preserving the server's scan-and-repair behavior.
 	UseStateDBOnly bool
@@ -3784,6 +3788,9 @@ func (c *Client) ListThreads(
 	}
 	if options.UseStateDBOnly {
 		params["useStateDbOnly"] = true
+	}
+	if options.ModelProviders != nil {
+		params["modelProviders"] = append([]string{}, options.ModelProviders...)
 	}
 	var page struct {
 		Data       *[]ThreadMetadata `json:"data"`
