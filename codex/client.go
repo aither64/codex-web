@@ -66,6 +66,19 @@ type rpcError struct {
 type rpcCallError struct {
 	code    int
 	message string
+	data    json.RawMessage
+}
+
+// RPCErrorData returns a detached copy of a native RPC error's structured data,
+// including through wrapped errors. The boolean is false when data is absent
+// or err is not an RPC error. Explicit JSON null is present data.
+// Callers must validate the expected shape; data alone grants no retry authority.
+func RPCErrorData(err error) (json.RawMessage, bool) {
+	var call *rpcCallError
+	if !errors.As(err, &call) || call == nil || len(call.data) == 0 {
+		return nil, false
+	}
+	return append(json.RawMessage(nil), call.data...), true
 }
 
 type ProjectNotFoundError struct {
@@ -122,8 +135,9 @@ type response struct {
 }
 
 type pendingCall struct {
-	generation uint64
-	channel    chan response
+	generation  uint64
+	channel     chan response
+	watchThread string
 }
 
 type PendingRequest struct {
@@ -791,6 +805,7 @@ type Client struct {
 	options           ClientOptions
 	activityNamespace string
 	observer          *observerState
+	events            *observerEvents
 	turnHistoryMu     sync.Mutex
 	turnHistory       map[string]*threadHistoryCache
 	idleTurnHistory   []string
@@ -804,14 +819,15 @@ type Client struct {
 	pageRebuildBytes  uint64
 	pageRebuildTime   time.Duration
 
-	ensureMu     sync.Mutex
-	connectionMu sync.Mutex
-	connection   *websocket.Conn
-	generation   uint64
-	ready        uint64
-	closed       bool
-	writeMu      contextMutex
-	nextID       atomic.Uint64
+	ensureMu       sync.Mutex
+	connectionMu   sync.Mutex
+	connection     *websocket.Conn
+	generation     uint64
+	ready          uint64
+	closed         bool
+	observerFrozen bool // connectionMu; irreversible for this client
+	writeMu        contextMutex
+	nextID         atomic.Uint64
 
 	pendingMu         sync.Mutex
 	pending           map[uint64]pendingCall
@@ -896,7 +912,11 @@ type ClientOptions struct {
 	LifecycleRequestSettings func(context.Context, LifecycleRequest) (ThreadSettings, error)
 	// ObserverOnly prevents responses, unsupported-request rejections and
 	// thread-setting overrides. Use a dedicated client for passive monitoring.
-	ObserverOnly     bool
+	ObserverOnly bool
+	// ObserveEvent opts an ObserverOnly client into ordered, detached events.
+	// The synchronous callback must be bounded, memory-only and never call the
+	// client. It runs without client locks, before ordinary wakeup coalescing.
+	ObserveEvent     func(ObserverEvent)
 	ActivityRecorder *ActivityRecorder
 }
 
@@ -948,12 +968,17 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		options.NonBlockingUserInput = &policy
 	}
 	var observer *observerState
+	var events *observerEvents
 	if options.ObserverOnly {
 		observer = newObserverState()
+		if options.ObserveEvent != nil {
+			events = &observerEvents{}
+			events.changed = sync.NewCond(&events.mu)
+		}
 	}
 	pageContext, pageCancel := context.WithCancel(context.Background())
 	return &Client{
-		observer:    observer,
+		observer: observer, events: events,
 		pageContext: pageContext, pageCancel: pageCancel,
 		pageCursors: make(map[string]pageContinuation), pageMetadata: make(map[string]*pageMetadataCache),
 		socket: socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
@@ -975,6 +1000,10 @@ func (c *Client) Ensure(ctx context.Context) error {
 	c.ensureMu.Lock()
 	defer c.ensureMu.Unlock()
 	c.connectionMu.Lock()
+	if c.observerFrozen {
+		c.connectionMu.Unlock()
+		return ErrObserverWritesFrozen
+	}
 	if c.closed {
 		c.connectionMu.Unlock()
 		return errors.New("Codex client is closed")
@@ -1052,6 +1081,7 @@ func (c *Client) Close() {
 	clear(c.pageMetadata)
 	c.pageMu.Unlock()
 	c.connectionMu.Lock()
+	wasClosed := c.closed
 	c.closed = true
 	if c.observer != nil {
 		c.observer.cancel()
@@ -1073,6 +1103,9 @@ func (c *Client) Close() {
 		c.submission.close()
 	}
 	c.queueMu.Unlock()
+	if !wasClosed {
+		c.observeEvent(ObserverEvent{Kind: ObserverClosed, Generation: generation})
+	}
 }
 
 func (c *Client) Request(ctx context.Context, method string, params any, result any) error {
@@ -1111,6 +1144,10 @@ func (c *Client) requestConnectedGeneration(ctx context.Context, expectedGenerat
 
 func (c *Client) requestConnectedAdmission(ctx context.Context, expectedGeneration uint64, method string, params any, result any, admit func() error) error {
 	c.connectionMu.Lock()
+	if c.observerFrozen {
+		c.connectionMu.Unlock()
+		return ErrObserverWritesFrozen
+	}
 	connection := c.connection
 	generation := c.generation
 	ready := c.ready
@@ -1188,8 +1225,13 @@ func (c *Client) requestOnAdmission(ctx context.Context, connection *websocket.C
 	defer func() { c.observeDelivery(ctx, "rpc:"+method, started, requestErr) }()
 	id := c.nextID.Add(1)
 	responseChannel := make(chan response, 1)
+	watchThread := ""
+	if c.events != nil && method == "thread/resume" {
+		encoded, _ := json.Marshal(params)
+		watchThread = threadIDFromParams(encoded)
+	}
 	c.pendingMu.Lock()
-	c.pending[id] = pendingCall{generation: generation, channel: responseChannel}
+	c.pending[id] = pendingCall{generation: generation, channel: responseChannel, watchThread: watchThread}
 	c.pendingMu.Unlock()
 	defer func() {
 		c.pendingMu.Lock()
@@ -1240,6 +1282,10 @@ func (c *Client) writeOfferAdmission(ctx context.Context, connection *websocket.
 	}
 	defer c.writeMu.Unlock()
 	c.connectionMu.Lock()
+	if c.observerFrozen {
+		c.connectionMu.Unlock()
+		return ErrObserverWritesFrozen
+	}
 	if connection == nil || c.connection != connection || c.generation != generation {
 		c.connectionMu.Unlock()
 		return &TransportError{Err: errConnectionChanged}
@@ -1310,11 +1356,23 @@ func (c *Client) writeOfferAdmission(ctx context.Context, connection *websocket.
 }
 
 func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
+	c.observeEvent(ObserverEvent{Kind: ObserverConnected, Generation: generation})
+	defer c.observeEvent(ObserverEvent{Kind: ObserverDisconnected, Generation: generation})
 	for {
 		kind, data, err := connection.Read(context.Background())
 		if err != nil {
+			c.observeEvent(ObserverEvent{Kind: ObserverInvalid, Generation: generation, Reason: observerReadErrorReason(err)})
 			c.markDisconnected(connection, generation, err)
 			return
+		}
+		tapValid := true
+		if c.events != nil && (kind != websocket.MessageText || len(data) > ObserverEventLimit) {
+			reason := "non-text-frame"
+			if len(data) > ObserverEventLimit {
+				reason = "frame-too-large"
+			}
+			c.observeEvent(ObserverEvent{Kind: ObserverInvalid, Generation: generation, Reason: reason})
+			tapValid = false
 		}
 		var message rpcMessage
 		if c.ephemeral != nil {
@@ -1326,7 +1384,15 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 				return
 			}
 		} else if err := json.Unmarshal(data, &message); err != nil {
+			c.observeEvent(ObserverEvent{Kind: ObserverInvalid, Generation: generation, Reason: "decode-error"})
 			continue
+		}
+		if tapValid {
+			if message.Method == "" && (len(message.ID) == 0 || (len(message.Result) == 0 && message.Error == nil)) {
+				c.observeEvent(ObserverEvent{Kind: ObserverInvalid, Generation: generation, Reason: "invalid-envelope"})
+			} else {
+				c.observeNotification(generation, message)
+			}
 		}
 		if c.ephemeral != nil && c.ephemeral.handle(c, connection, generation, message) {
 			continue
@@ -1379,6 +1445,7 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 			c.watchedMu.Lock()
 			delete(c.watchedGeneration, thread)
 			c.watchedMu.Unlock()
+			c.observeEvent(ObserverEvent{Kind: ObserverWatchRemoved, Generation: generation, ThreadID: thread, Reason: "thread-closed"})
 			c.invalidateThreadSettings(thread)
 			c.options.ActivityRecorder.disconnected(c.activityConnection(generation), thread)
 		}
@@ -1393,6 +1460,7 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 		}
 		var id uint64
 		if err := json.Unmarshal(message.ID, &id); err != nil {
+			c.observeEvent(ObserverEvent{Kind: ObserverInvalid, Generation: generation, Reason: "invalid-response-id"})
 			continue
 		}
 		c.pendingMu.Lock()
@@ -1403,9 +1471,20 @@ func (c *Client) readLoop(connection *websocket.Conn, generation uint64) {
 		}
 		var reply response
 		if message.Error != nil {
-			reply = response{err: &rpcCallError{code: message.Error.Code, message: message.Error.Message}}
+			reply = response{err: &rpcCallError{
+				code: message.Error.Code, message: message.Error.Message,
+				data: append(json.RawMessage(nil), message.Error.Data...),
+			}}
 		} else {
 			reply = response{result: message.Result}
+		}
+		if tapValid && message.Error == nil && call.watchThread != "" {
+			var result map[string]json.RawMessage
+			if err := json.Unmarshal(message.Result, &result); err != nil || result == nil {
+				c.observeEvent(ObserverEvent{Kind: ObserverInvalid, Generation: generation, Reason: "invalid-watch-reply"})
+			} else {
+				c.observeWatchEstablished(generation, call.watchThread)
+			}
 		}
 		if c.ephemeral == nil {
 			call.channel <- reply
@@ -1701,7 +1780,21 @@ func (c *Client) removeWatch(threadID string) {
 	defer c.releaseTurnHistory(threadID, true)
 	transition := c.watchLock(threadID)
 	transition.Lock()
-	defer transition.Unlock()
+	// Serialize the local retirement with the reader's establishment marker.
+	// Acquire only after watchLock: an in-flight resume needs its reader reply.
+	if c.events != nil {
+		c.beginObserverEvent()
+	}
+	var removedEvent *ObserverEvent
+	defer func() {
+		transition.Unlock()
+		if c.events != nil {
+			defer c.endObserverEvent()
+			if removedEvent != nil {
+				c.deliverObserverEvent(*removedEvent)
+			}
+		}
+	}()
 	c.watchedMu.Lock()
 	removed := false
 	if c.watched[threadID] <= 1 {
@@ -1718,6 +1811,7 @@ func (c *Client) removeWatch(threadID string) {
 		c.connectionMu.Lock()
 		generation := c.generation
 		c.connectionMu.Unlock()
+		removedEvent = &ObserverEvent{Kind: ObserverWatchRemoved, Generation: generation, ThreadID: threadID, Reason: "last-watch-removed"}
 		c.options.ActivityRecorder.disconnected(c.activityConnection(generation), threadID)
 		c.options.ActivityRecorder.retire(threadID)
 		c.invalidateThreadSettings(threadID)
@@ -1785,7 +1879,11 @@ func (c *Client) resumeWatchedGeneration(ctx context.Context, threadID string, e
 	}
 	c.connectionMu.Lock()
 	generation := c.generation
+	frozen := c.observerFrozen
 	c.connectionMu.Unlock()
+	if frozen {
+		return ErrObserverWritesFrozen
+	}
 	if expectedGeneration != 0 && generation != expectedGeneration {
 		return errors.New("Codex App Server connection changed before watch restoration")
 	}

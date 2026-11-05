@@ -29,6 +29,15 @@ checks native history for the original identity and retains the attempt when
 acceptance is not visible. Native client IDs provide correlation, not duplicate
 suppression. Missing history cannot authorize another native submission.
 
+`ConditionalSteer` uses this same store and write admission with the expected
+turn and trusted directory bound into its action identity. It only steers that
+turn and never activates idle work. Its known-unsent attempt stays prepared;
+the owning operation records the original identity and terminal disposition
+durably before calling `DiscardPreparedConditionalSteer`. A crash between those
+steps is recovered by repeating that exact discard, never by dispatching the
+terminal notice again. Submitting and accepted attempts cannot be discarded.
+See [exact-turn notices](reference.md#notices-for-an-exact-active-turn).
+
 `MessageNotSentError.Retryable` identifies transient connection or admission
 failures. Protocol refusals remain unsent but need a corrected request. HTTP
 responses expose `retryable` beside `code` and `notSent`. Browser retries reuse
