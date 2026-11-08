@@ -1,0 +1,13 @@
+Codex 0.167.0 downstream native fixture candidate.
+Upstream rust-v0.167.0: 086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a
+Downstream source: 5b0cea5e1551ad69666ff2ce52df8f81f533eba1
+Patch revision: host-provider-switching-v1
+Source NAR hash: sha256-fnOYvL8mG/NiCGNcK6j7rlju1rNEqwhp7fSj5MMVCa8=
+Native executable SHA-256:
+8880a0384e3020872fe9635098772d10bb436b4fbe4c931ad8625a56dca73e58
+
+The consuming runtime owns source preparation, build and full input receipts.
+Version 0.167.0 alone does not distinguish this binary from upstream.
+These utility, steering and state fixtures leave host provider switching disabled.
+Native acceptance and provider-policy test results must be recorded separately;
+this file identifies the candidate and does not certify an unexecuted check.

@@ -534,6 +534,9 @@ func integrationUtilityModel() string {
 
 const integrationPromptedInstructions = "Return the requested JSON. Use only the supplied request as data. Never use tools, read files, run commands, browse, delegate or ask questions. Return only the name JSON."
 
+// Selected downstream candidate; see testdata/native-0.167.provenance.
+const integrationCodex0167SHA = "8880a0384e3020872fe9635098772d10bb436b4fbe4c931ad8625a56dca73e58"
+
 func TestEphemeralProtocolIntegration(t *testing.T) {
 	runEphemeralProtocolIntegration(t, "0.163.0")
 }
@@ -546,10 +549,25 @@ func TestPromptedEphemeral0165ProtocolIntegration(t *testing.T) {
 	runEphemeralProtocolIntegration(t, "0.165.0")
 }
 
+func TestPromptedEphemeral0167ProtocolIntegration(t *testing.T) {
+	runEphemeralProtocolIntegration(t, "0.167.0")
+}
+
+func TestPromptedEphemeral0167HighProtocolIntegration(t *testing.T) {
+	runEphemeralProtocolIntegrationWithEffort(t, "0.167.0", "high")
+}
+
 func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
+	runEphemeralProtocolIntegrationWithEffort(t, nativeVersion, "low")
+}
+
+func runEphemeralProtocolIntegrationWithEffort(t *testing.T, nativeVersion, effort string) {
 	prompted := nativeVersion != "0.163.0"
 	binary := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_BINARY")
 	expected := os.Getenv("CODEX_EPHEMERAL_TEST_SHA256")
+	if nativeVersion == "0.167.0" && expected != integrationCodex0167SHA {
+		t.Fatal("0.167 fixture requires the reviewed native SHA-256")
+	}
 	file, err := os.Open(binary)
 	if err != nil {
 		t.Fatal("candidate binary unavailable")
@@ -569,6 +587,12 @@ func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
 		version, selector = "codex-cli "+nativeVersion, "TestPromptedEphemeralProtocolIntegration"
 		if nativeVersion == "0.165.0" {
 			selector = "TestPromptedEphemeral0165ProtocolIntegration"
+		}
+		if nativeVersion == "0.167.0" {
+			selector = "TestPromptedEphemeral0167ProtocolIntegration"
+			if effort == "high" {
+				selector = "TestPromptedEphemeral0167HighProtocolIntegration"
+			}
 		}
 		if integrationUtilityModel() != "gpt-6-luna" {
 			t.Fatal("prompted native naming requires CODEX_EPHEMERAL_TEST_MODEL=gpt-6-luna")
@@ -619,7 +643,7 @@ func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
 	}
 	sourceHash := fmt.Sprintf("%x", sha256.Sum256(metadata))
 	expectedSourceHash := ephemeralCatalogHash
-	if nativeVersion == "0.165.0" {
+	if nativeVersion == "0.165.0" || nativeVersion == "0.167.0" {
 		expectedSourceHash = "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10"
 	}
 	if !unchanged || sourceHash != expectedSourceHash {
@@ -640,6 +664,7 @@ func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
 	}
 	harness := newEphemeralIntegrationHarness(t, binary, nft, owner)
 	harness.prompted = prompted
+	harness.effort = effort
 	defer harness.close()
 	harness.control(t)
 	harness.catalogControls(t)
@@ -1645,7 +1670,8 @@ func TestEphemeralIntegrationTimeoutReachability(t *testing.T) {
 }
 
 type ephemeralIntegrationHarness struct {
-	prompted                                                      bool // Fixed entry-point contract; actual tools are observed for raw 0.164.
+	prompted                                                      bool // Fixed entry-point contract; actual prompted tools are observed.
+	effort                                                        string
 	t                                                             *testing.T
 	binary, nft, home, project, socket, canary, canaryURL, config string
 	provider                                                      *httptest.Server
@@ -1694,6 +1720,13 @@ type ephemeralIntegrationHarness struct {
 	refreshDelivered                                              bool
 	nativeRetryProgress, nativeTerminalErrors, nativeFailedTurns  int
 	nativeTurnStarts                                              int
+}
+
+func (h *ephemeralIntegrationHarness) utilityEffort() string {
+	if h.effort != "" {
+		return h.effort
+	}
+	return "low"
 }
 
 func newEphemeralIntegrationHarness(t *testing.T, binary, nft string, owner ephemeralIntegrationNamespaceOwner) *ephemeralIntegrationHarness {
@@ -2042,7 +2075,7 @@ func (h *ephemeralIntegrationHarness) respond(w http.ResponseWriter, r *http.Req
 			h.failure = "model substitution"
 		}
 		reasoning, _ := request["reasoning"].(map[string]any)
-		if reasoning["effort"] != "low" {
+		if reasoning["effort"] != h.utilityEffort() {
 			h.failure = "effort substitution"
 		}
 		questionControl := mode == "server-question-control" || mode == "question-at-cancel"
@@ -2934,7 +2967,7 @@ func (h *ephemeralIntegrationHarness) proxy(t *testing.T, mode string, generatio
 						policy["tools.experimental_request_user_input.enabled"] = true
 					}
 					if message.Method == "turn/start" {
-						params["collaborationMode"] = map[string]any{"mode": "plan", "settings": map[string]any{"model": integrationUtilityModel(), "reasoning_effort": "low", "developer_instructions": nil}}
+						params["collaborationMode"] = map[string]any{"mode": "plan", "settings": map[string]any{"model": integrationUtilityModel(), "reasoning_effort": h.utilityEffort(), "developer_instructions": nil}}
 					}
 					raw, _ = json.Marshal(object)
 				}
@@ -3263,6 +3296,7 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	defer client.Close()
 	opts := ephemeralTestOptions(t)
 	opts.ModelCatalogFile, opts.Model = h.catalog, integrationUtilityModel()
+	opts.Effort = h.utilityEffort()
 	// Provision the provider-owned nonempty file contract used by real callers.
 	content, fileErr := os.ReadFile(opts.InstructionFile)
 	if fileErr != nil || string(content) != EphemeralInstructionFileContent {
@@ -3555,6 +3589,7 @@ func (h *ephemeralIntegrationHarness) managedConflict(t *testing.T) {
 	defer client.Close()
 	opts := ephemeralTestOptions(t)
 	opts.ModelCatalogFile, opts.Model = h.catalog, integrationUtilityModel()
+	opts.Effort = h.utilityEffort()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	var err error
