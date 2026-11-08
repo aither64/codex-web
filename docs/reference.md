@@ -1101,16 +1101,24 @@ Codex build they deploy.
 
 ### Native state upgrade fixture
 
+The tagged `TestNativeStateUpgrade0165To0167` checks the selected 0.165 to
+0.167 upgrade with the same fixture described below. Its exact old native
+SHA-256 is `647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652`;
+the new native SHA-256 is
+`13fc360e1eb73eeabeda7e2d9c6294aa56a0b062adc54a681b9d687a2e905b10`.
+Select this test after final review with matching binary paths, hashes, client
+revision and source/patch receipts in the environment variables below.
+
 The tagged `TestNativeStateUpgrade0164To0165` checks the selected 0.164 to
 0.165 upgrade with the same fixture described below. Its exact new native
 SHA-256 is `647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652`.
 The retained `TestNativeStateUpgrade0163To0164` checks one disposable native
-state transition from Codex 0.163.0 to 0.164.0. It uses synthetic Responses
-traffic, private home and working directories, and client receipt storage. It
+state transition from Codex 0.163.0 to 0.164.0. Each selector uses synthetic
+Responses traffic, private home and working directories, and client receipt storage. It
 starts only one native version at a time. The upgrade phase checks that old
 messages, project and thread identities, held queue order and send receipts
 survive the upgrade. It then checks new messages and a fork across another
-0.164 restart.
+restart of the selected new version.
 
 Set `CODEX_UPGRADE_OLD_BINARY` and `CODEX_UPGRADE_NEW_BINARY` to absolute
 executable paths, with their exact `CODEX_UPGRADE_OLD_SHA256` and
@@ -1128,20 +1136,26 @@ go test -mod=readonly -tags=codex_integration ./codex \
   -run '^TestNativeStateUpgrade0163To0164$' -count=1 -timeout=180s -v
 ```
 
-Before probing the old reader, the fixture stops and joins 0.164 and copies
-its complete private home and SQLite client receipts, including sidecars, to a
-separate evidence directory. It then runs 0.163 last against the same original
-path, performs public cold reads without inference, and records state-file
+Before probing the old reader, the fixture stops and joins the new version and
+copies its complete private home and SQLite client receipts, including sidecars,
+to a separate evidence directory. It then runs the selected old version last
+against the same original path, performs public cold reads without inference, and records state-file
 changes. The test prints the retained evidence directory. Upgrade and old-reader
 results are separate; successful cold reads do not establish old-version write,
 mixed-version or downgrade safety. Recovery remains forward-only.
+
+`TestNativeConditionalSteer0167ExactTurn` verifies exact-turn steering with
+the reviewed 0.167 executable selected by `CODEX_WEB_TEST_BINARY`. It checks
+duplicate receipt recovery and refusal after completion using a synthetic
+provider. Its version and SHA-256 must match the 0.167 state-upgrade candidate
+above. `TestNativeConditionalSteerExactTurn` retains the reviewed 0.165 selector.
 
 ## Ephemeral utility turns
 
 `Client.RunEphemeralTurn(ctx, EphemeralTurnOptions)` provides the strict
 utility contract for Codex 0.163.0. `Client.RunPromptedEphemeralTurn(ctx,
-EphemeralTurnOptions)` provides a separate naming contract for raw Codex 0.164.0
-and 0.165.0.
+EphemeralTurnOptions)` provides a separate naming contract for raw Codex 0.164.0,
+0.165.0 and 0.167.0.
 Both return `EphemeralTurnResult{Text: ...}` for one completed final answer and
 share the bounded private runner, sink, fixed restrictions and cleanup/retry
 proof. These Go APIs accept trusted application inputs; no browser route selects
@@ -1164,8 +1178,8 @@ the prompt for inference. An empty value uses the native server's default.
 Callers with their own provider selection must resolve and pass it on each call.
 
 The strict 0.163.0 profiles use `Effort: "low"`, with either
-`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted raw 0.164.0/0.165.0 naming supports
-only `Model: "gpt-6-luna"` with `Effort: "low"` or `Effort: "high"`. Each
+`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted raw 0.164.0/0.165.0/0.167.0
+naming supports only `Model: "gpt-6-luna"` with `Effort: "low"` or `Effort: "high"`. Each
 requires its matching immutable catalog below. Other pairs fail with
 `ErrEphemeralSettings` before connecting. The server's `model/list` must also
 advertise the exact requested
@@ -1204,9 +1218,10 @@ with `tool_mode` set to `direct`, `experimental_supported_tools` emptied and
 in Codex 0.163.0 and 0.164.0; their separate provenance records describe that
 shared content. Codex 0.165 adds only GPT-6.1 Terra to the full catalog
 (SHA-256 `1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10`);
-its derived Luna resource remains byte-identical. The strict full-catalog fixture
-remains at 0.163. Hash validation proves catalog content, not the native release
-or its tool-isolation behavior. Both supported releases use the standard
+its derived Luna resource remains byte-identical. Codex 0.167 retains those exact
+0.165 full-catalog and Luna bytes, with a separate versioned provenance record.
+The strict full-catalog fixture remains at 0.163. Hash validation proves catalog
+content, not the native release or its tool-isolation behavior. Supported releases use the standard
 Responses shape. Strict 0.163 requires top-level `tools: []` and no
 `additional_tools` input role; the prompted 0.164 fixture records actual native
 tool schemas. Both releases send explicit base
@@ -1382,6 +1397,7 @@ consumed shape. Separately validate fixed restriction keys/types with
 After mandatory independent review, the tagged
 `TestEphemeralProtocolIntegration` exercises strict Codex 0.163, and
 `TestPromptedEphemeralProtocolIntegration` exercises prompted raw Codex 0.164.
+The 0.165 and 0.167 selectors below retain that prompted acceptance boundary.
 Both use a local mock of the built-in OpenAI Responses provider and retain the
 binary's model catalog and built-in provider capabilities. The mock returns HTTP 426 for valid
 WebSocket upgrades, so the native server selects its supported HTTP Responses
@@ -1455,6 +1471,18 @@ go test -mod=readonly -tags=codex_integration ./codex \
 For raw 0.165 use `TestPromptedEphemeral0165ProtocolIntegration` with that
 release's exact binary/hash/source and the same immutable Luna catalog. The
 0.164 selector remains available for retained installations.
+
+For raw 0.167, use `TestPromptedEphemeral0167ProtocolIntegration` for low effort
+and `TestPromptedEphemeral0167HighProtocolIntegration` for high effort with the
+same immutable Luna catalog and namespace prerequisites. Both require the exact
+0.167 version and reviewed SHA-256 given in the state-upgrade section, in addition
+to matching `CODEX_EPHEMERAL_TEST_SHA256`. The candidate source must retain the
+reviewed full catalog. Run the ownership control first, then both selectors:
+
+```sh
+go test -mod=readonly -tags=codex_integration ./codex \
+  -run '^TestPromptedEphemeral0167(High)?ProtocolIntegration$' -count=1 -timeout=360s
+```
 
 This fixture checks fixed-request defenses, actual tool-schema observation,
 owned final output, native retry progress, terminal retry proof, question

@@ -12,9 +12,9 @@ changing the compatibility contract. Do not add a binary dependency to this
 repository's flake merely to select a release.
 
 The strict `RunEphemeralTurn` contract supports Codex 0.163.0 with both existing
-model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0 or 0.165.0
-and Luna with low or high effort. The strict profiles remain low-only. The
-prompted contract retains the bounded runner and fixed defenses. Its prompt
+model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0,
+0.165.0 or 0.167.0 and Luna with low or high effort. The strict profiles remain
+low-only. The prompted contract retains the bounded runner and fixed defenses. Its prompt
 guides the model without establishing tool-effect isolation. Preserve both API
 contracts; do not relabel a prompted native pass as strict isolation evidence.
 The consuming runtime verifies the exact executable. Identical catalog bytes or
@@ -58,9 +58,10 @@ python3 skills/update-codex-web/scripts/refresh-catalogs.py \
   --source "$codex_source" --version "$codex_version"
 ```
 
-For `--version 0.165.0`, the helper validates the exact source catalog, the
-addition of Terra and unchanged retained metadata, then writes a separate 0.165
-provenance record. It preserves strict fixtures and the shared Luna resource.
+For `--version 0.165.0` or `--version 0.167.0`, the helper validates the exact
+source catalog, the addition of Terra and unchanged retained metadata, then
+writes a separate versioned provenance record. Both releases have identical
+full and Luna catalogs. It preserves strict fixtures and the shared Luna resource.
 
 For `--version 0.163.0`, the helper regenerates the strict catalogs and their
 original provenance. For `--version 0.164.0`, it verifies that both generated
@@ -84,14 +85,19 @@ changes for its combined final review before long native tests.
 
 After review, follow docs/reference.md for namespace ownership and the native
 selector matching the supported contract. Strict 0.163 requires hostile-dispatch
-integration with both model profiles. Prompted raw 0.164 naming records actual
-tool schemas without requiring an empty list or absent registry handlers. It
+integration with both model profiles. Prompted raw 0.164/0.165/0.167 naming records
+actual tool schemas without requiring an empty list or absent registry handlers. It
 still checks fixed requests, output, retry proof, question rejection, deadlines
 and process teardown. Retain binary/source/patch/catalog identities and actual
 observations. Missing prerequisites or failed required checks block release.
 Fake transports and schemas establish neither native isolation nor real-provider
 adherence to naming instructions. The consuming runtime owns its real naming
 canary and native state/activation verification.
+
+For 0.167, run both the low and high prompted selectors, the exact conditional
+steer selector and the 0.165-to-0.167 state-upgrade selector documented in the
+reference. Keep old-reader observations separate from upgrade acceptance;
+successful cold reads do not establish downgrade or mixed-version write safety.
 
 Return the final source revision, selected Codex/source identities, catalog
 hashes, API/compatibility changes, executed checks and remaining release gates.

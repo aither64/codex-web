@@ -10,8 +10,9 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path, help="selected codex-rs source")
-    parser.add_argument("--version", required=True, choices=("0.163.0", "0.164.0", "0.165.0"),
-                        help="strict 0.163.0 or prompted 0.164.0/0.165.0 provenance")
+    parser.add_argument("--version", required=True,
+                        choices=("0.163.0", "0.164.0", "0.165.0", "0.167.0"),
+                        help="strict 0.163.0 or prompted 0.164.0/0.165.0/0.167.0 provenance")
     args = parser.parse_args()
     original = (args.source / "models-manager/models.json").read_bytes()
     catalog = json.loads(original)
@@ -28,8 +29,8 @@ def main():
     root = Path(__file__).resolve().parents[3]
     full_path = root / "codex/testdata/ephemeral-models.json"
     luna_path = root / "codex/ephemeral_luna_models.json"
-    if args.version == "0.165.0":
-        # 0.165 adds Terra to the full catalog; every retained model is unchanged.
+    if args.version in ("0.165.0", "0.167.0"):
+        # 0.165 adds Terra; 0.167 retains the exact catalog and Luna bytes.
         old = json.loads(full_path.read_bytes())
         old_models = {model["slug"]: model for model in old["models"]}
         new_models = {model["slug"]: model for model in json.loads(original)["models"]}
@@ -37,7 +38,7 @@ def main():
                 or set(new_models) - set(old_models) != {"gpt-6.1-terra"}
                 or any(new_models.get(key) != model for key, model in old_models.items())
                 or luna_path.read_bytes() != derived):
-            raise SystemExit("0.165 catalog differs from reviewed source; inspect compatibility first")
+            raise SystemExit(f"{args.version} catalog differs from reviewed source; inspect compatibility first")
     elif args.version == "0.164.0":
         # Both supported contracts share these exact bytes. Do not overwrite
         # strict fixtures merely to make a selected release validate.
@@ -56,12 +57,12 @@ def main():
         )
     else:
         provenance = root / "codex/testdata/prompted-ephemeral-models.provenance"
-        if args.version == "0.165.0":
-            provenance = root / "codex/testdata/prompted-ephemeral-models-0.165.provenance"
+        if args.version in ("0.165.0", "0.167.0"):
+            provenance = root / f"codex/testdata/prompted-ephemeral-models-{args.version.removesuffix('.0')}.provenance"
         provenance.write_text(
             f"Raw Codex {args.version} codex-rs/models-manager/models.json.\n" +
             ("Full catalog adds only gpt-6.1-terra to the retained 0.163/0.164 models.\n"
-             if args.version == "0.165.0" else
+             if args.version in ("0.165.0", "0.167.0") else
              "Uses the unchanged canonical codex/testdata/ephemeral-models.json.\n") +
             f"{len(original)} bytes; SHA-256 {original_hash}\n"
             "Luna reuses canonical codex/ephemeral_luna_models.json.\n"
