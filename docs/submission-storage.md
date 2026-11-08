@@ -84,7 +84,13 @@ preparation and send ordering after a complete negative.
 Exclude predecessor writers through the application's package transition before
 starting new clients. Native conversation processes can continue running.
 
-The first database access locks both configured JSON paths. It validates and
+The first database access locks both configured JSON paths before opening the
+SQLite connection, initializing WAL or creating/checking the schema. Concurrent
+cold clients therefore share the same startup serialization as import and fence
+publication. Cancellation while waiting leaves the store unopened and permits a
+later explicit retry. Ordinary initialized transactions retain SQLite concurrency;
+these startup locks are not held during network requests or for the client lifetime.
+Initialization validates and
 imports the primary ledger, or its legacy fallback when the primary is absent,
 and preserves private, checksum-named backups beside the persistent database. Send states,
 options, queue attempts, deletion intents and retirement markers survive import.

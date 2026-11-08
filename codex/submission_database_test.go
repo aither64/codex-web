@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -193,6 +194,78 @@ func TestSubmissionDatabaseKeepsConcurrentAttempts(t *testing.T) {
 	var exported queueAttemptLedger
 	if json.Unmarshal(snapshot, &exported) != nil || len(exported.Sends["thread"]) != 9 {
 		t.Fatal("concurrent write lost an attempt")
+	}
+}
+
+func TestSubmissionDatabaseFirstOpenWaitsForPredecessorLock(t *testing.T) {
+	c := databaseTestClient(t)
+	release, err := lockSubmissionPredecessors(context.Background(), []string{c.queueLedgerPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	c.queueMu.Lock()
+	err = c.openSubmissionDatabaseLocked(ctx)
+	c.queueMu.Unlock()
+	if !errors.Is(err, context.DeadlineExceeded) || c.submission != nil {
+		t.Fatalf("first open bypassed predecessor lock: store=%v err=%v", c.submission, err)
+	}
+	data, err := os.ReadFile(c.options.SubmissionDatabasePath)
+	if err != nil || len(data) != 0 {
+		t.Fatalf("blocked first open initialized SQLite: bytes=%d err=%v", len(data), err)
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(c.options.SubmissionDatabasePath + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("blocked first open created SQLite sidecar %s: %v", suffix, err)
+		}
+	}
+	if _, err := os.Stat(c.queueLedgerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("blocked first open published a fence: %v", err)
+	}
+	release()
+	release = nil
+	if err := c.recordSendAttempt("thread", "retry", "text", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := c.sendAttempt("thread", "retry", "text", ""); err != nil || !found {
+		t.Fatalf("retry after releasing predecessor lock failed: found=%t err=%v", found, err)
+	}
+}
+
+func TestSubmissionDatabaseKeepsConcurrentColdAttempts(t *testing.T) {
+	c := databaseTestClient(t)
+	start := make(chan struct{})
+	done := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		go func(i int) {
+			peer := NewWithOptions(c.socket, c.options)
+			defer peer.Close()
+			<-start
+			done <- peer.recordSendAttempt("thread", fmt.Sprint(i), "text", "", false)
+		}(i)
+	}
+	close(start)
+	for i := 0; i < 8; i++ {
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	snapshot, err := c.ExportSubmissionAttempts("thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported queueAttemptLedger
+	if json.Unmarshal(snapshot, &exported) != nil || len(exported.Sends["thread"]) != 8 {
+		t.Fatal("concurrent cold write lost an attempt")
 	}
 }
 
