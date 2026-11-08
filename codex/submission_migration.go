@@ -116,6 +116,17 @@ func initializeSubmissionDatabase(ctx context.Context, store *submissionDatabase
 	if primary == database || legacy == database {
 		return errors.New("submission database must differ from predecessor paths")
 	}
+	paths := []string{primary}
+	if legacy != "" && legacy != primary {
+		paths = append(paths, legacy)
+	}
+	// sql.Open is lazy: the first query also initializes connection/WAL
+	// pragmas. Serialize that bootstrap with the existing import/fence locks.
+	release, err := lockSubmissionPredecessors(ctx, paths)
+	if err != nil {
+		return err
+	}
+	defer release()
 	var version int
 	if err := store.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
@@ -129,22 +140,6 @@ func initializeSubmissionDatabase(ctx context.Context, store *submissionDatabase
 		}
 	}
 	phase, err := submissionMetadata(ctx, store.db, "migration_phase")
-	if err != nil {
-		return err
-	}
-	if phase == "ready" {
-		return verifySubmissionFences(ctx, store.db, database, primary, legacy)
-	}
-	paths := []string{primary}
-	if legacy != "" && legacy != primary {
-		paths = append(paths, legacy)
-	}
-	release, err := lockSubmissionPredecessors(ctx, paths)
-	if err != nil {
-		return err
-	}
-	defer release()
-	phase, err = submissionMetadata(ctx, store.db, "migration_phase")
 	if err != nil {
 		return err
 	}
@@ -353,19 +348,6 @@ func submissionMetadata(ctx context.Context, db *sql.DB, key string) (string, er
 		return "", nil
 	}
 	return value, err
-}
-
-func verifySubmissionFences(ctx context.Context, db *sql.DB, database, primary, legacy string) error {
-	paths := []string{primary}
-	if legacy != "" && legacy != primary {
-		paths = append(paths, legacy)
-	}
-	release, err := lockSubmissionPredecessors(ctx, paths)
-	if err != nil {
-		return err
-	}
-	defer release()
-	return verifySubmissionFencesLocked(ctx, db, database, primary, legacy)
 }
 
 func verifySubmissionFencesLocked(ctx context.Context, db *sql.DB, database, primary, legacy string) error {
