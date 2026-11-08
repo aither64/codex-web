@@ -18,8 +18,17 @@ import (
 )
 
 // Run after final review with CODEX_WEB_TEST_BINARY selecting the exact native
-// 0.165 executable. Only disposable state and a synthetic provider are used.
+// executable. Only disposable state and a synthetic provider are used.
 func TestNativeConditionalSteerExactTurn(t *testing.T) {
+	runNativeConditionalSteerExactTurn(t, "0.165.0",
+		"647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652")
+}
+
+func TestNativeConditionalSteer0167ExactTurn(t *testing.T) {
+	runNativeConditionalSteerExactTurn(t, "0.167.0", integrationCodex0167SHA)
+}
+
+func runNativeConditionalSteerExactTurn(t *testing.T, version, expectedHash string) {
 	entered, release := make(chan struct{}, 8), make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(release) })
@@ -46,10 +55,13 @@ func TestNativeConditionalSteerExactTurn(t *testing.T) {
 	}))
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	integrationRequireVersion(t, exec.CommandContext(ctx, h.binary, "--version"), "codex-cli 0.165.0")
+	integrationRequireVersion(t, exec.CommandContext(ctx, h.binary, "--version"), "codex-cli "+version)
 	data, err := os.ReadFile(h.binary)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(data)) != expectedHash {
+		t.Fatal("conditional steer fixture requires the reviewed native SHA-256")
 	}
 	t.Logf("native=%s sha256=%x", h.binary, sha256.Sum256(data))
 	h.start()

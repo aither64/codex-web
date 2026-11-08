@@ -72,6 +72,11 @@ func TestNativeStateUpgrade0164To0165(t *testing.T) {
 		"647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652", "0.165.0")
 }
 
+func TestNativeStateUpgrade0165To0167(t *testing.T) {
+	runNativeStateUpgrade(t, "647b0157e6472a793e0a0bd45bc44ef8ade673b6d8f3db4118260acda4976652", "0.165.0",
+		integrationCodex0167SHA, "0.167.0")
+}
+
 func runNativeStateUpgrade(t *testing.T, oldHash, oldVersion, newHash, newVersion string) {
 	old, err := nativeUpgradeBinaryFromEnv("OLD", oldHash, "codex-cli "+oldVersion)
 	if err != nil {
