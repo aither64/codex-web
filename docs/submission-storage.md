@@ -51,6 +51,34 @@ client recursively. `TestCancellationDuringDurableAdmissionRemainsRetryable`
 tests cancellation after the durable claim. `BenchmarkSubmissionStoreLookup`
 compares the backends using synthetic retained receipts.
 
+## Bounded history discovery
+
+`SendAttemptedWithOptionsResumable` is an opt-in alternative to
+`SendAttemptedWithOptions` for callers whose context cannot cover a mature
+thread's full history. An incomplete call returns an error, including the
+original cancellation or transport cause. The next explicit call on the same
+client and exact thread/message/text/action/options continues after completed,
+validated pages. The method never captures, queues, resumes or sends input.
+
+Hints contain cursors, validation identities and receipt-matching state, not
+message bodies. They expire after 30 idle minutes and at most 256 threads retain
+hints; eviction or a new client safely restarts discovery. Rollout identity,
+connection generation, file replacement/truncation and the saved prefix-tail
+check validate continuation. A materialized local rollout is required. A changed
+lookup tuple starts a separate proof. No cursor is persisted and there is no
+background continuation or protocol/storage change.
+
+A negative requires the complete history and a fresh head catch-up through the
+saved anchor. Reusing a completed negative still checks source identity, appended
+items and the durable ledger. A queue-only identity requires ordinary send
+reconciliation and returns an unknown-outcome error rather than absence.
+Prepared, submitting and accepted sends retain the existing attempt semantics.
+An exact history match imports its accepted receipt through the same atomic
+store path as the original method, including adjacent-item steer classification.
+Neither method provides execution admission or protects against unmanaged
+concurrent native writers. Callers retain their existing capture, permission,
+preparation and send ordering after a complete negative.
+
 ## Upgrade from schema-3 JSON
 
 Exclude predecessor writers through the application's package transition before

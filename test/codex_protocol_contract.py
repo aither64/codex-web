@@ -189,6 +189,8 @@ client_requests = [
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1", "includeTurns": False}),
+    # Resumable send discovery needs the raw source/createdAt lineage too.
+    request("thread/read", {"threadId": "thread-1", "includeTurns": False}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1"}),
     request("thread/read", {"threadId": "thread-1", "excludeTurns": True}),

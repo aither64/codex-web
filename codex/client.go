@@ -795,6 +795,8 @@ func ResolveForkThreadSettings(
 }
 
 type Client struct {
+	sendDiscoveryMu   sync.Mutex
+	sendDiscoveries   map[string]*sendDiscovery
 	citationMu        sync.Mutex
 	citationCache     map[string]*citationThread
 	historyPageMu     sync.Mutex
@@ -981,7 +983,8 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		observer: observer, events: events,
 		pageContext: pageContext, pageCancel: pageCancel,
 		pageCursors: make(map[string]pageContinuation), pageMetadata: make(map[string]*pageMetadataCache),
-		socket: socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
+		sendDiscoveries: make(map[string]*sendDiscovery),
+		socket:          socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
 		requests: make(map[string]PendingRequest), notices: make(map[string][]Prompt),
 		subscribers: make(map[chan struct{}]string), watched: make(map[string]int),
 		watchedGeneration: make(map[string]uint64), watchLocks: make(map[string]*sync.Mutex),
@@ -1076,6 +1079,9 @@ func (c *Client) Ensure(ctx context.Context) error {
 
 func (c *Client) Close() {
 	c.pageCancel()
+	c.sendDiscoveryMu.Lock()
+	clear(c.sendDiscoveries)
+	c.sendDiscoveryMu.Unlock()
 	c.pageMu.Lock()
 	clear(c.pageCursors)
 	clear(c.pageMetadata)
@@ -2433,38 +2439,78 @@ func (c *Client) threadItems(
 	return items, err
 }
 
+// threadItemWalk retains validation identities, never item bodies. A page is
+// committed only after its entire response and consumer have been validated.
+type threadItemWalk struct {
+	cursor      string
+	seenCursors map[string]struct{}
+	seenIDs     map[string]struct{}
+}
+
+func newThreadItemWalk() threadItemWalk {
+	return threadItemWalk{seenCursors: make(map[string]struct{}), seenIDs: make(map[string]struct{})}
+}
+
+func (c *Client) nextThreadItems(ctx context.Context, threadID string, walk *threadItemWalk) ([]threadItemEntry, *string, error) {
+	params := map[string]any{"threadId": threadID, "limit": 100, "sortDirection": "desc"}
+	if walk.cursor != "" {
+		params["cursor"] = walk.cursor
+	}
+	var page struct {
+		Data       *[]threadItemEntry `json:"data"`
+		NextCursor *string            `json:"nextCursor"`
+	}
+	if err := c.Request(ctx, "thread/items/list", params, &page); err != nil {
+		return nil, nil, err
+	}
+	if page.Data == nil {
+		return nil, nil, errors.New("thread/items/list returned no data")
+	}
+	seen := make(map[string]struct{}, len(*page.Data))
+	for _, entry := range *page.Data {
+		id := stringValue(entry.Item["id"])
+		if entry.TurnID == "" || entry.Item == nil || id == "" {
+			return nil, nil, errors.New("thread/items/list returned an invalid item entry")
+		}
+		_, duplicate := seen[id]
+		_, previous := walk.seenIDs[id]
+		if duplicate || previous {
+			return nil, nil, fmt.Errorf("thread/items/list repeated item %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+	if page.NextCursor != nil {
+		if *page.NextCursor == "" || len(*page.Data) == 0 {
+			return nil, nil, errors.New("thread/items/list returned an empty pagination cursor or page")
+		}
+		if _, exists := walk.seenCursors[*page.NextCursor]; exists {
+			return nil, nil, errors.New("thread/items/list repeated a pagination cursor")
+		}
+	}
+	return *page.Data, page.NextCursor, nil
+}
+
+func (walk *threadItemWalk) commit(entries []threadItemEntry, next *string) {
+	for _, entry := range entries {
+		walk.seenIDs[stringValue(entry.Item["id"])] = struct{}{}
+	}
+	walk.cursor = ""
+	if next != nil {
+		walk.cursor = *next
+		walk.seenCursors[*next] = struct{}{}
+	}
+}
+
 func (c *Client) walkThreadItems(
 	ctx context.Context, threadID string, visit func(threadItemEntry) (bool, error),
 ) error {
-	seenCursors := make(map[string]struct{})
-	seenIDs := make(map[string]struct{})
-	var cursor string
+	walk := newThreadItemWalk()
 	for {
-		params := map[string]any{
-			"threadId": threadID, "limit": 100, "sortDirection": "desc",
-		}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
-		var page struct {
-			Data       *[]threadItemEntry `json:"data"`
-			NextCursor *string            `json:"nextCursor"`
-		}
-		if err := c.Request(ctx, "thread/items/list", params, &page); err != nil {
+		entries, next, err := c.nextThreadItems(ctx, threadID, &walk)
+		if err != nil {
 			return err
 		}
-		if page.Data == nil {
-			return errors.New("thread/items/list returned no data")
-		}
-		for _, entry := range *page.Data {
-			id := stringValue(entry.Item["id"])
-			if entry.TurnID == "" || entry.Item == nil || id == "" {
-				return errors.New("thread/items/list returned an invalid item entry")
-			}
-			if _, exists := seenIDs[id]; exists {
-				return fmt.Errorf("thread/items/list repeated item %q", id)
-			}
-			seenIDs[id] = struct{}{}
+		for _, entry := range entries {
 			stop, err := visit(entry)
 			if err != nil {
 				return err
@@ -2473,17 +2519,10 @@ func (c *Client) walkThreadItems(
 				return nil
 			}
 		}
-		if page.NextCursor == nil {
+		walk.commit(entries, next)
+		if next == nil {
 			return nil
 		}
-		if *page.NextCursor == "" {
-			return errors.New("thread/items/list returned an empty pagination cursor")
-		}
-		if _, exists := seenCursors[*page.NextCursor]; exists {
-			return errors.New("thread/items/list repeated a pagination cursor")
-		}
-		seenCursors[*page.NextCursor] = struct{}{}
-		cursor = *page.NextCursor
 	}
 }
 
@@ -4933,40 +4972,47 @@ func (c *Client) waitForStartedByClientID(
 	return false, nil
 }
 
+type sentMessageMatch struct {
+	receipt SendReceipt
+	found   bool
+	done    bool
+}
+
+func (match *sentMessageMatch) visit(entry threadItemEntry, clientID, text string) (bool, error) {
+	if match.found {
+		match.receipt.Steered = entry.TurnID == match.receipt.TurnID
+		match.done = true
+		return true, nil
+	}
+	if stringValue(entry.Item["type"]) != "userMessage" || stringValue(entry.Item["clientId"]) != clientID {
+		return false, nil
+	}
+	sentText, err := userMessageText(entry.Item)
+	if err != nil {
+		return false, fmt.Errorf("sent message is invalid: %w", err)
+	}
+	if sentText != text {
+		return false, errors.New("message identity was reused with different text")
+	}
+	if entry.TurnID == "" {
+		return false, errors.New("sent message has no turn identity")
+	}
+	match.receipt = SendReceipt{TurnID: entry.TurnID, ClientUserMessageID: clientID}
+	match.found = true
+	return false, nil
+}
+
 func (c *Client) sentByClientID(
 	ctx context.Context, threadID, clientID, text string,
 ) (SendReceipt, bool, error) {
-	var receipt SendReceipt
-	found := false
+	var match sentMessageMatch
 	err := c.walkThreadItems(ctx, threadID, func(entry threadItemEntry) (bool, error) {
-		if found {
-			if entry.TurnID == receipt.TurnID {
-				receipt.Steered = true
-			}
-			return true, nil
-		}
-		if stringValue(entry.Item["type"]) != "userMessage" ||
-			stringValue(entry.Item["clientId"]) != clientID {
-			return false, nil
-		}
-		sentText, err := userMessageText(entry.Item)
-		if err != nil {
-			return false, fmt.Errorf("sent message is invalid: %w", err)
-		}
-		if sentText != text {
-			return false, errors.New("message identity was reused with different text")
-		}
-		if entry.TurnID == "" {
-			return false, errors.New("sent message has no turn identity")
-		}
-		receipt = SendReceipt{TurnID: entry.TurnID, ClientUserMessageID: clientID}
-		found = true
-		return false, nil
+		return match.visit(entry, clientID, text)
 	})
 	if err != nil {
 		return SendReceipt{}, false, err
 	}
-	return receipt, found, nil
+	return match.receipt, match.found, nil
 }
 
 func (c *Client) waitForSentByClientID(
