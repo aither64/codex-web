@@ -250,3 +250,38 @@ test("local persistence failure can be corrected before any network effect", asy
   await controller.sendAnswer(q("source").id, "Two");
   assert.equal(sends.length, 1);
 });
+
+test('presentation card delegates draft and keyboard actions without delivery or persistence', async t => {
+  const originalDocument = globalThis.document;
+  t.after(() => { globalThis.document = originalDocument; });
+  globalThis.document = {createElement: tag => new QuestionElement(tag)};
+  const {createQuestionCard} = await load();
+  let draft = {choice: '', note: ''}, submits = 0, checks = 0;
+  const state = {enabled: true, canSubmit: false};
+  const card = createQuestionCard({id: 'host-card', question: {title: '<plain text>', options: ['One']},
+    draft: () => draft, state: () => state,
+    onDraft: value => { draft = value; state.canSubmit = Boolean(value.choice || value.note); card.update(); },
+    onSubmit: () => submits++, onCheck: () => checks++, checkLabel: 'Check answer'});
+  const input = card.root.descendants().find(node => node.tag === 'textarea');
+  key(input); assert.equal(submits, 0, 'preselection is not an answer');
+  input.value = '/literal answer'; input.dispatchEvent(new Event('input')); key(input);
+  assert.equal(submits, 1); assert.equal(draft.note, '/literal answer');
+  state.locked = true; card.update(); key(input); assert.equal(submits, 1);
+  state.check = true; card.update();
+  const check = card.root.descendants().find(node => node.textContent === 'Check answer');
+  check.click(); assert.equal(checks, 1);
+  assert.equal(card.root.querySelector('.codex-question-title').textContent, '<plain text>');
+});
+
+test('presentation card keeps duplicate choice labels distinct through host values', async t => {
+  const originalDocument = globalThis.document; t.after(() => { globalThis.document = originalDocument; });
+  globalThis.document = {createElement: tag => new QuestionElement(tag)};
+  let selected = '';
+  const {createQuestionCard} = await load();
+  const card = createQuestionCard({id: 'ids', question: {title: 'Which?', options: ['Same', 'Same']},
+    choiceValues: ['first', 'second'], draft: () => ({choice: selected, note: ''}), state: () => ({}),
+    onDraft: value => { selected = value.choice; }, onSubmit: () => {}});
+  const radios = card.root.descendants().filter(node => node.type === 'radio');
+  radios[1].checked = true; radios[1].dispatchEvent(new Event('change'));
+  assert.equal(selected, 'second'); card.update(); assert.equal(radios[0].checked, false); assert.equal(radios[1].checked, true);
+});
