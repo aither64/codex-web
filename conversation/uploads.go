@@ -265,7 +265,7 @@ func uploadError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "file operation failed; retry shortly")
 }
 
-func (handler *Handler) prepareAttachments(ctx context.Context, target Target, kind, id, message string, ids []string) (string, error) {
+func (handler *Handler) prepareAttachments(ctx context.Context, target BackendTarget, kind, id, message string, ids []string) (string, error) {
 	if len(ids) > 100 {
 		return "", &UploadError{http.StatusBadRequest, "too many attachments"}
 	}

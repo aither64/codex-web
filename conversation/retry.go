@@ -31,7 +31,7 @@ type RetryStatus struct {
 	Reason          string `json:"reason"`
 }
 
-func (handler *Handler) retry(response http.ResponseWriter, request *http.Request, target Target, operation string) {
+func (handler *Handler) retry(response http.ResponseWriter, request *http.Request, target BackendTarget, operation string) {
 	if !target.Capabilities.Retry ||
 		(operation == "retry" && request.Method != http.MethodGet) ||
 		(operation != "retry" && request.Method != http.MethodPost) {
@@ -46,7 +46,7 @@ func (handler *Handler) retry(response http.ResponseWriter, request *http.Reques
 	var err error
 	switch operation {
 	case "retry":
-		state, err = target.Retry.ReadRetry(request.Context(), target.ThreadID)
+		state, err = target.Retry.ReadRetry(request.Context(), target.Identity.ConversationID)
 	case "retry/enabled":
 		var body struct {
 			Enabled *bool `json:"enabled"`
@@ -58,12 +58,12 @@ func (handler *Handler) retry(response http.ResponseWriter, request *http.Reques
 			writeError(response, http.StatusBadRequest, "enabled must be a boolean")
 			return
 		}
-		state, err = target.Retry.SetRetryEnabled(request.Context(), target.ThreadID, *body.Enabled)
+		state, err = target.Retry.SetRetryEnabled(request.Context(), target.Identity.ConversationID, *body.Enabled)
 	case "retry/cancel":
 		if !handler.decodeEmpty(response, request) {
 			return
 		}
-		state, err = target.Retry.CancelRetry(request.Context(), target.ThreadID)
+		state, err = target.Retry.CancelRetry(request.Context(), target.Identity.ConversationID)
 	}
 	if err != nil {
 		handler.serverError(response, request, errors.New("retry provider operation failed"))

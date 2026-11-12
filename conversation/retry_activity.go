@@ -58,7 +58,7 @@ var retryActivityIdentity = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
 
 const maxSafeJSONInteger int64 = 1<<53 - 1
 
-func (handler *Handler) retryActivity(response http.ResponseWriter, request *http.Request, target Target, operation string) {
+func (handler *Handler) retryActivity(response http.ResponseWriter, request *http.Request, target BackendTarget, operation string) {
 	if !target.Capabilities.RetryActivity ||
 		(operation == "retry/activity" && request.Method != http.MethodGet) ||
 		(operation != "retry/activity" && request.Method != http.MethodPost) {
@@ -72,7 +72,7 @@ func (handler *Handler) retryActivity(response http.ResponseWriter, request *htt
 	var state RetryActivityStatus
 	var err error
 	if operation == "retry/activity" {
-		state, err = target.RetryActivity.ReadRetryActivity(request.Context(), target.ThreadID)
+		state, err = target.RetryActivity.ReadRetryActivity(request.Context(), target.Identity.ConversationID)
 	} else {
 		var body struct {
 			Token string `json:"token"`
@@ -85,9 +85,9 @@ func (handler *Handler) retryActivity(response http.ResponseWriter, request *htt
 			return
 		}
 		if operation == "retry/now" {
-			state, err = target.RetryActivity.RetryNow(request.Context(), target.ThreadID, body.Token)
+			state, err = target.RetryActivity.RetryNow(request.Context(), target.Identity.ConversationID, body.Token)
 		} else {
-			state, err = target.RetryActivity.StopRetry(request.Context(), target.ThreadID, body.Token)
+			state, err = target.RetryActivity.StopRetry(request.Context(), target.Identity.ConversationID, body.Token)
 		}
 	}
 	if err != nil {

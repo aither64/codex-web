@@ -19,7 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation/backend"
 )
 
 const (
@@ -55,117 +55,8 @@ type Capabilities struct {
 	RetryActivity bool
 }
 
-// Client is the App Server behavior used by Handler. *codex.Client implements
-// this interface.
-type Client interface {
-	VerifyThread(context.Context, string, string) error
-	ReadThread(context.Context, string) (codex.Transcript, error)
-	PromptsWithItems(context.Context, string) ([]codex.Prompt, error)
-	ListQueue(context.Context, string) ([]codex.QueueEntry, error)
-	SendAttempted(context.Context, string, string, string, string) (bool, error)
-	Send(context.Context, string, string, string, string) (codex.SendReceipt, error)
-	AcknowledgeSends(context.Context, string, []codex.SendAcknowledgement) ([]string, error)
-	Queue(context.Context, string, string, string) (codex.QueueEntry, error)
-	DeleteQueueEntry(context.Context, string, string) error
-	StartQueue(context.Context, string, string) error
-	Interrupt(context.Context, string) error
-	ListModels(context.Context) ([]codex.Model, error)
-	ListCollaborationModes(context.Context) ([]codex.CollaborationMode, error)
-	UpdateThreadSettings(context.Context, string, codex.ThreadSettingsUpdate) (codex.ThreadSettings, error)
-	RespondDecision(context.Context, string, string, string) error
-	RespondAnswers(context.Context, string, string, map[string]map[string][]string) error
-	SnoozeUserInput(string, string) error
-	Subscribe(context.Context, string) (<-chan struct{}, func(), error)
-}
-
-// ActivityProvider is optional, preserving source compatibility for applications
-// implementing Client. The resolver selects its trusted authority separately.
-type ActivityProvider interface {
-	ReadActivity(context.Context, string) (codex.ActivitySnapshot, error)
-}
-
-type TranscriptPageReader interface {
-	ReadThreadPage(context.Context, string, string) (codex.TranscriptPage, error)
-}
-
-// PendingRevisionProvider supplies an in-memory pending-control invalidation
-// token. Reading it must not perform RPCs or access durable submission state.
-type PendingRevisionProvider interface {
-	PendingRevision(threadID string) uint64
-}
-
-// PromptResponder adds request-bound responses without changing the legacy
-// Client interface used by existing embedding applications.
-type PromptResponder interface {
-	RespondPrompt(context.Context, string, codex.PromptResponse) error
-}
-
-// ResolveRequest describes the operation for which an application must resolve
-// authorization and runtime ownership.
-type ResolveRequest struct {
-	ID        string
-	Operation string
-	Method    string
-	Mutation  bool
-}
-
-// Target is the trusted server-side mapping for one opaque conversation ID.
-// Socket paths, thread IDs and working directories never come from browser
-// input. MutationLock must be shared with every other application operation
-// that mutates the same conversation. Release is called after the operation,
-// including an event stream.
-type Target struct {
-	Attachments AttachmentProvider
-	Client      Client
-	// ModelCatalog optionally resolves models for this trusted conversation's
-	// provider. Both the picker and settings validation use the same catalog.
-	ModelCatalog        func(context.Context) ([]codex.Model, error)
-	Activity            ActivityProvider
-	Retry               RetryProvider
-	RetryActivity       RetryActivityProvider
-	ThreadID            string
-	Directory           string
-	Capabilities        Capabilities
-	MutationLock        MutationLocker
-	TransformTranscript func(*codex.Transcript)
-	// PresentTranscript renders application-owned presentation after attachment
-	// decoration. TransformTranscript retains its earlier, pre-attachment order.
-	PresentTranscript func(*codex.Transcript)
-	Release           func()
-}
-
-func (target Target) models(ctx context.Context) ([]codex.Model, error) {
-	if target.ModelCatalog != nil {
-		return target.ModelCatalog(ctx)
-	}
-	return target.Client.ListModels(ctx)
-}
-
-// Resolver maps an application-defined opaque ID to its trusted App Server
-// client, thread and working directory for every request.
-type Resolver interface {
-	ResolveConversation(context.Context, ResolveRequest) (Target, error)
-}
-
-type ResolverFunc func(context.Context, ResolveRequest) (Target, error)
-
-func (fn ResolverFunc) ResolveConversation(ctx context.Context, request ResolveRequest) (Target, error) {
-	return fn(ctx, request)
-}
-
-type Options struct {
-	Resolver         Resolver
-	AllowedOrigins   []string
-	BasePath         string
-	MaxBodyBytes     int64
-	MaxMessageBytes  int
-	OperationTimeout time.Duration
-	Shutdown         <-chan struct{}
-	Logger           *log.Logger
-}
-
 type Handler struct {
-	resolver         Resolver
+	resolver         BackendResolver
 	allowedOrigins   []string
 	basePath         string
 	maxBodyBytes     int64
@@ -176,7 +67,7 @@ type Handler struct {
 	assets           http.Handler
 }
 
-func NewHandler(options Options) (*Handler, error) {
+func NewBackendHandler(options BackendOptions) (*Handler, error) {
 	if options.Resolver == nil {
 		return nil, errors.New("conversation resolver is required")
 	}
@@ -296,7 +187,7 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		request = request.WithContext(operationContext)
 	}
 	mutation := request.Method != http.MethodGet && request.Method != http.MethodHead
-	resolved, err := handler.resolver.ResolveConversation(request.Context(), ResolveRequest{
+	resolved, err := handler.resolver.ResolveBackend(request.Context(), ResolveRequest{
 		ID: id, Operation: operation, Method: request.Method, Mutation: mutation,
 	})
 	if err != nil {
@@ -307,15 +198,15 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	if resolved.Release != nil {
 		defer resolved.Release()
 	}
-	if resolved.Client == nil || resolved.ThreadID == "" || !filepath.IsAbs(resolved.Directory) ||
-		filepath.Clean(resolved.Directory) != resolved.Directory ||
+	if resolved.Operations.Verify == nil || resolved.Identity.BackendID == "" || resolved.Identity.ScopeKey == "" || resolved.Identity.ConversationID == "" || !filepath.IsAbs(resolved.Identity.Directory) ||
+		filepath.Clean(resolved.Identity.Directory) != resolved.Identity.Directory ||
 		(mutation && resolved.MutationLock == nil) {
 		handler.logError(request, errors.New("conversation resolver returned an invalid target"))
 		writeError(response, http.StatusServiceUnavailable, "Codex service is unavailable")
 		return
 	}
 	verifyContext, cancel := context.WithTimeout(request.Context(), 5*time.Second)
-	err = resolved.Client.VerifyThread(verifyContext, resolved.ThreadID, resolved.Directory)
+	err = resolved.Operations.Verify.Verify(verifyContext, resolved.Identity)
 	cancel()
 	if err != nil {
 		handler.logError(request, fmt.Errorf("verify resolved conversation: %w", err))
@@ -364,7 +255,7 @@ func (handler *Handler) originAllowed(request *http.Request) bool {
 }
 
 func (handler *Handler) serveOperation(
-	response http.ResponseWriter, request *http.Request, target Target, operation string,
+	response http.ResponseWriter, request *http.Request, target BackendTarget, operation string,
 ) {
 	response.Header().Set("Cache-Control", "no-store")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
@@ -390,8 +281,8 @@ func (handler *Handler) serveOperation(
 			writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid page cursor", "code": "transcript_cursor_invalid"})
 			return
 		}
-		reader, ok := target.Client.(TranscriptPageReader)
-		if !ok {
+		reader := target.Operations.Page
+		if reader == nil {
 			writeJSON(response, http.StatusNotImplemented, map[string]string{"error": "conversation paging is unavailable", "code": "transcript_paging_unavailable"})
 			return
 		}
@@ -399,9 +290,9 @@ func (handler *Handler) serveOperation(
 		if len(query["cursor"]) == 1 {
 			cursor = query["cursor"][0]
 		}
-		page, err := reader.ReadThreadPage(ctx, target.ThreadID, cursor)
+		page, err := reader.ReadPage(ctx, target.Identity, backend.HistoryCursor(cursor))
 		if err != nil {
-			var cursorErr *codex.TranscriptCursorError
+			var cursorErr *backend.CursorError
 			if errors.As(err, &cursorErr) {
 				status := http.StatusConflict
 				message := "conversation history changed; reload recent messages"
@@ -419,21 +310,20 @@ func (handler *Handler) serveOperation(
 				writeJSON(response, status, map[string]string{"error": message, "code": cursorErr.Code})
 				return
 			}
-			handler.serverError(response, request, errors.New("read transcript page failed"))
+			var upload *UploadError
+			if errors.As(err, &upload) {
+				uploadError(response, err)
+			} else {
+				handler.serverError(response, request, errors.New("read transcript page failed"))
+			}
 			return
 		}
-		if page.ThreadID != target.ThreadID || len(page.Entries) > 100 {
+		if page.ThreadID != target.Identity.ConversationID || len(page.Entries) > 100 {
 			handler.serverError(response, request, errors.New("page reader returned invalid transcript"))
 			return
 		}
 		if target.TransformTranscript != nil {
 			target.TransformTranscript(&page.Transcript)
-		}
-		if target.Attachments != nil {
-			if err := target.Attachments.ObserveTranscript(ctx, &page.Transcript); err != nil {
-				uploadError(response, err)
-				return
-			}
 		}
 		if target.PresentTranscript != nil {
 			target.PresentTranscript(&page.Transcript)
@@ -444,16 +334,16 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
-		if target.Activity == nil {
+		if target.Operations.Activity == nil {
 			writeError(response, http.StatusNotFound, "activity is unavailable")
 			return
 		}
-		activity, err := target.Activity.ReadActivity(ctx, target.ThreadID)
+		activity, err := target.Operations.Activity.ReadActivity(ctx, target.Identity)
 		if err != nil {
 			handler.serverError(response, request, err)
 			return
 		}
-		if activity.ThreadID != target.ThreadID {
+		if activity.ThreadID != target.Identity.ConversationID {
 			handler.serverError(response, request, errors.New("activity provider returned a different thread"))
 			return
 		}
@@ -463,19 +353,17 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
-		transcript, err := target.Client.ReadThread(ctx, target.ThreadID)
+		if !handler.requireSupport(response, request, target.Operations.Read != nil) {
+			return
+		}
+
+		transcript, err := target.Operations.Read.Read(ctx, target.Identity)
 		if err != nil {
-			handler.serverError(response, request, err)
+			handler.readError(response, request, err)
 			return
 		}
 		if target.TransformTranscript != nil {
 			target.TransformTranscript(&transcript)
-		}
-		if target.Attachments != nil {
-			if err := target.Attachments.ObserveTranscript(ctx, &transcript); err != nil {
-				uploadError(response, err)
-				return
-			}
 		}
 		if target.PresentTranscript != nil {
 			target.PresentTranscript(&transcript)
@@ -486,7 +374,11 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
-		prompts, err := target.Client.PromptsWithItems(ctx, target.ThreadID)
+		if !handler.requireSupport(response, request, target.Operations.Pending != nil) {
+			return
+		}
+
+		prompts, err := target.Operations.Pending.Pending(ctx, target.Identity)
 		if err != nil {
 			handler.serverError(response, request, err)
 			return
@@ -497,13 +389,17 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
+		if !handler.requireSupport(response, request, target.Operations.Settings != nil) {
+			return
+		}
+
 		models, err := target.models(ctx)
 		if err != nil {
 			handler.serverError(response, request, err)
 			return
 		}
 		if models == nil {
-			models = []codex.Model{}
+			models = []backend.Model{}
 		}
 		writeJSON(response, http.StatusOK, models)
 	case "collaboration-modes":
@@ -511,13 +407,17 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
-		modes, err := target.Client.ListCollaborationModes(ctx)
+		if !handler.requireSupport(response, request, target.Operations.Settings != nil) {
+			return
+		}
+
+		modes, err := target.Operations.Settings.Modes(ctx, target.Identity)
 		if err != nil {
 			handler.serverError(response, request, err)
 			return
 		}
 		if modes == nil {
-			modes = []codex.CollaborationMode{}
+			modes = []backend.CollaborationMode{}
 		}
 		writeJSON(response, http.StatusOK, modes)
 	case "queue":
@@ -543,10 +443,14 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
+		if !handler.requireSupport(response, request, target.Operations.Interrupt != nil) {
+			return
+		}
+
 		if !handler.decodeEmpty(response, request) {
 			return
 		}
-		if err := target.Client.Interrupt(ctx, target.ThreadID); err != nil {
+		if err := target.Operations.Interrupt.Interrupt(ctx, target.Identity); err != nil {
 			handler.serverError(response, request, err)
 			return
 		}
@@ -566,11 +470,15 @@ func (handler *Handler) serveOperation(
 	}
 }
 
-func (handler *Handler) send(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) send(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if request.Method != http.MethodPost || !target.Capabilities.Send {
 		handler.rejectOperation(response, request)
 		return
 	}
+	if !handler.requireSupport(response, request, target.Operations.Send != nil) {
+		return
+	}
+
 	var body struct {
 		Message             string   `json:"message"`
 		ClientUserMessageID string   `json:"clientUserMessageId"`
@@ -614,50 +522,46 @@ func (handler *Handler) send(response http.ResponseWriter, request *http.Request
 			}
 		}()
 	}
-	if body.Retry {
-		if _, err := target.Client.SendAttempted(
-			ctx, target.ThreadID, message, body.ClientUserMessageID, "",
-		); err != nil {
-			handler.serverError(response, request, err)
-			return
-		}
-	}
-	receipt, err := target.Client.Send(
-		ctx, target.ThreadID, message, body.ClientUserMessageID, "",
-	)
-	if err != nil {
-		handler.sendError(response, request, err)
+	result, err := target.Operations.Send.Send(ctx, target.Identity, backend.SendRequest{
+		Message: message, ClientUserMessageID: body.ClientUserMessageID, Retry: body.Retry,
+	})
+	if result.Outcome == backend.Accepted && err == nil {
+		writeJSON(response, http.StatusAccepted, result.Receipt)
 		return
 	}
-	writeJSON(response, http.StatusAccepted, receipt)
+	handler.sendError(response, request, result, err)
 }
 
-func (handler *Handler) sendError(response http.ResponseWriter, request *http.Request, err error) {
-	var unsent *codex.MessageNotSentError
-	var unknown *codex.UnknownSendOutcomeError
-	switch {
-	case errors.As(err, &unsent):
+func (handler *Handler) sendError(response http.ResponseWriter, request *http.Request, result backend.SendResult, err error) {
+	if err != nil {
 		handler.logError(request, err)
+	}
+	switch result.Outcome {
+	case backend.NotSubmitted:
 		writeJSON(response, http.StatusServiceUnavailable, map[string]any{
-			"error": "The message was not sent.", "code": "message_not_sent", "notSent": true, "retryable":unsent.Retryable,
+			"error": "The message was not sent.", "code": "message_not_sent", "notSent": true, "retryable": result.Retryable,
 		})
-	case errors.As(err, &unknown):
-		handler.logError(request, err)
+	case backend.Unknown:
 		writeJSON(response, http.StatusConflict, map[string]any{
 			"error": "Message delivery could not be confirmed.", "code": "message_delivery_unknown", "notSent": false,
 		})
 	default:
-		handler.serverError(response, request, err)
+		// Empty/unknown outcomes never prove either success or non-submission.
+		handler.serverError(response, request, errors.New("message delivery failed without an evidenced outcome"))
 	}
 }
 
-func (handler *Handler) acknowledge(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) acknowledge(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if request.Method != http.MethodPost || !target.Capabilities.Send {
 		handler.rejectOperation(response, request)
 		return
 	}
+	if !handler.requireSupport(response, request, target.Operations.Acknowledge != nil) {
+		return
+	}
+
 	var body struct {
-		Acknowledgements []codex.SendAcknowledgement `json:"acknowledgements"`
+		Acknowledgements []backend.SendAcknowledgement `json:"acknowledgements"`
 	}
 	if !handler.decode(response, request, &body) {
 		return
@@ -679,8 +583,8 @@ func (handler *Handler) acknowledge(response http.ResponseWriter, request *http.
 		}
 		seen[item.ClientUserMessageID] = struct{}{}
 	}
-	acknowledged, err := target.Client.AcknowledgeSends(
-		request.Context(), target.ThreadID, body.Acknowledgements,
+	acknowledged, err := target.Operations.Acknowledge.Acknowledge(
+		request.Context(), target.Identity, body.Acknowledgements,
 	)
 	if err != nil {
 		handler.serverError(response, request, err)
@@ -691,23 +595,20 @@ func (handler *Handler) acknowledge(response http.ResponseWriter, request *http.
 	})
 }
 
-func (handler *Handler) queue(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) queue(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if request.Method == http.MethodGet {
 		if !target.Capabilities.QueueRead {
 			handler.rejectOperation(response, request)
 			return
 		}
-
-		entries, err := target.Client.ListQueue(request.Context(), target.ThreadID)
-		if err != nil {
-			handler.serverError(response, request, err)
+		if !handler.requireSupport(response, request, target.Operations.QueueRead != nil) {
 			return
 		}
-		if target.Attachments != nil {
-			if err := target.Attachments.ObserveQueue(request.Context(), entries); err != nil {
-				uploadError(response, err)
-				return
-			}
+
+		entries, err := target.Operations.QueueRead.ListQueue(request.Context(), target.Identity)
+		if err != nil {
+			handler.readError(response, request, err)
+			return
 		}
 		writeJSON(response, http.StatusOK, nonNilQueue(entries))
 		return
@@ -716,6 +617,10 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 		handler.rejectOperation(response, request)
 		return
 	}
+	if !handler.requireSupport(response, request, target.Operations.QueueWrite != nil) {
+		return
+	}
+
 	var body struct {
 		Message             string   `json:"message"`
 		ClientUserMessageID string   `json:"clientUserMessageId"`
@@ -737,70 +642,69 @@ func (handler *Handler) queue(response http.ResponseWriter, request *http.Reques
 		uploadError(response, prepareErr)
 		return
 	}
-	entry, err := target.Client.Queue(
-		request.Context(), target.ThreadID, message, body.ClientUserMessageID,
-	)
+	entry, err := target.Operations.QueueWrite.Queue(request.Context(), target.Identity, backend.QueueRequest{
+		Message: message, ClientUserMessageID: body.ClientUserMessageID,
+	})
 	if err != nil {
-		handler.serverError(response, request, err)
+		handler.queueError(response, request, err)
 		return
-	}
-	if target.Attachments != nil {
-		entries := []codex.QueueEntry{entry}
-		if err := target.Attachments.ObserveQueue(request.Context(), entries); err != nil {
-			uploadError(response, err)
-			return
-		}
-		entry = entries[0]
 	}
 	writeJSON(response, http.StatusAccepted, entry)
 }
 
-func (handler *Handler) reconcileQueue(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) reconcileQueue(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if request.Method != http.MethodPost || !target.Capabilities.Queue {
 		handler.rejectOperation(response, request)
 		return
 	}
-	if client, ok := target.Client.(QueueDeletionCompleter); ok {
+	if client := target.Operations.QueueCompletion; client != nil {
 		complete := func(id string) error {
 			if target.Attachments != nil {
 				return target.Attachments.QueueDeleted(request.Context(), id)
 			}
 			return nil
 		}
-		if err := client.ReconcileQueueDeletionsWithCompletion(request.Context(), target.ThreadID, complete); err != nil {
+		if err := client.ReconcileDeletions(request.Context(), target.Identity, complete); err != nil {
 			handler.serverError(response, request, err)
 			return
 		}
 	} else if target.Attachments != nil {
 		writeError(response, http.StatusServiceUnavailable, "Attachment deletion recovery is unavailable")
 		return
+	} else if !target.legacyQueueReconcile {
+		handler.requireSupport(response, request, false)
+		return
 	}
 	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (handler *Handler) deleteQueue(
-	response http.ResponseWriter, request *http.Request, target Target, id string,
+	response http.ResponseWriter, request *http.Request, target BackendTarget, id string,
 ) {
 	if request.Method != http.MethodDelete || !target.Capabilities.Queue || id == "" {
 		handler.rejectOperation(response, request)
 		return
 	}
+	if target.Attachments == nil && !handler.requireSupport(response, request, target.Operations.QueueWrite != nil) {
+		return
+	}
+
 	decoded, err := url.PathUnescape(id)
 	if err != nil || !validOpaqueID(decoded) || encodeOpaquePathSegment(decoded) != id {
 		writeError(response, http.StatusBadRequest, "queued message ID is invalid")
 		return
 	}
 	if target.Attachments != nil {
-		client, ok := target.Client.(QueueDeletionCompleter)
-		if !ok {
+		client := target.Operations.QueueCompletion
+		if client == nil {
 			writeError(response, http.StatusServiceUnavailable, "Attachment deletion recovery is unavailable")
 			return
 		}
-		err = client.DeleteQueueEntryWithCompletion(request.Context(), target.ThreadID, decoded, func() error {
+		err = client.DeleteWithCompletion(request.Context(), target.Identity, decoded, func() error {
 			return target.Attachments.QueueDeleted(request.Context(), decoded)
 		})
 	} else {
-		err = target.Client.DeleteQueueEntry(request.Context(), target.ThreadID, decoded)
+		err = target.Operations.QueueWrite.Delete(request.Context(), target.Identity, decoded)
 	}
 	if err != nil {
 		handler.serverError(response, request, err)
@@ -810,11 +714,15 @@ func (handler *Handler) deleteQueue(
 	writeJSON(response, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (handler *Handler) startQueue(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) startQueue(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if request.Method != http.MethodPost || !target.Capabilities.Queue {
 		handler.rejectOperation(response, request)
 		return
 	}
+	if !handler.requireSupport(response, request, target.Operations.QueueWrite != nil) {
+		return
+	}
+
 	var body struct {
 		QueuedSubmissionID string `json:"queuedSubmissionId"`
 	}
@@ -825,22 +733,24 @@ func (handler *Handler) startQueue(response http.ResponseWriter, request *http.R
 		writeError(response, http.StatusBadRequest, "queued message ID is invalid")
 		return
 	}
-	if err := target.Client.StartQueue(
-		request.Context(), target.ThreadID, body.QueuedSubmissionID,
-	); err != nil {
+	if err := target.Operations.QueueWrite.Start(request.Context(), target.Identity, body.QueuedSubmissionID); err != nil {
 		handler.serverError(response, request, err)
 		return
 	}
 	writeJSON(response, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
-func (handler *Handler) settings(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) settings(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if (request.Method != http.MethodPost && request.Method != http.MethodPatch) ||
 		!target.Capabilities.Settings {
 		handler.rejectOperation(response, request)
 		return
 	}
-	var update codex.ThreadSettingsUpdate
+	if !handler.requireSupport(response, request, target.Operations.Settings != nil) {
+		return
+	}
+
+	var update backend.SettingsUpdate
 	if !handler.decode(response, request, &update) {
 		return
 	}
@@ -882,7 +792,7 @@ func (handler *Handler) settings(response http.ResponseWriter, request *http.Req
 		return
 	}
 	if update.CollaborationMode != nil {
-		modes, err := target.Client.ListCollaborationModes(request.Context())
+		modes, err := target.Operations.Settings.Modes(request.Context(), target.Identity)
 		if err != nil {
 			handler.serverError(response, request, err)
 			return
@@ -896,7 +806,7 @@ func (handler *Handler) settings(response http.ResponseWriter, request *http.Req
 			return
 		}
 	}
-	settings, err := target.Client.UpdateThreadSettings(request.Context(), target.ThreadID, update)
+	settings, err := target.Operations.Settings.Update(request.Context(), target.Identity, update)
 	if err != nil {
 		handler.serverError(response, request, err)
 		return
@@ -904,12 +814,12 @@ func (handler *Handler) settings(response http.ResponseWriter, request *http.Req
 	writeJSON(response, http.StatusOK, settings)
 }
 
-func (handler *Handler) respond(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) respond(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if request.Method != http.MethodPost || !target.Capabilities.Respond {
 		handler.rejectOperation(response, request)
 		return
 	}
-	var body codex.PromptResponse
+	var body backend.PromptResponse
 	if !handler.decode(response, request, &body) {
 		return
 	}
@@ -933,8 +843,13 @@ func (handler *Handler) respond(response http.ResponseWriter, request *http.Requ
 		writeError(response, http.StatusBadRequest, "prompt response must select one action")
 		return
 	}
+	if target.Operations.Respond == nil && body.Token == "" && !handler.requireSupport(response, request, target.Operations.LegacyRespond != nil) {
+		return
+	}
+
 	var err error
-	responder, bound := target.Client.(PromptResponder)
+	responder := target.Operations.Respond
+	bound := responder != nil
 	if bound && body.Token == "" {
 		writeJSON(response, http.StatusConflict, map[string]any{"error": "Reload this page to update the question controls.", "code": "reload_required", "notSent": true})
 		return
@@ -947,16 +862,16 @@ func (handler *Handler) respond(response http.ResponseWriter, request *http.Requ
 			})
 			return
 		}
-		err = responder.RespondPrompt(request.Context(), target.ThreadID, body)
+		err = responder.Respond(request.Context(), target.Identity, body)
 	} else if body.Snooze {
-		err = target.Client.SnoozeUserInput(body.ID, target.ThreadID)
+		err = target.Operations.LegacyRespond.Snooze(request.Context(), target.Identity, body.ID)
 	} else if len(body.Answers) > 0 {
-		err = target.Client.RespondAnswers(request.Context(), body.ID, target.ThreadID, body.Answers)
+		err = target.Operations.LegacyRespond.Answers(request.Context(), target.Identity, body.ID, body.Answers)
 	} else {
-		err = target.Client.RespondDecision(request.Context(), body.ID, target.ThreadID, body.Decision)
+		err = target.Operations.LegacyRespond.Decision(request.Context(), target.Identity, body.ID, body.Decision)
 	}
 	if err != nil {
-		var prompt *codex.PromptResponseError
+		var prompt *backend.PromptError
 		if errors.As(err, &prompt) {
 			status := http.StatusServiceUnavailable
 			message := "The connection changed before your response was sent."
@@ -981,17 +896,21 @@ func (handler *Handler) respond(response http.ResponseWriter, request *http.Requ
 
 const heartbeatInterval = 20 * time.Second
 
-func (handler *Handler) events(response http.ResponseWriter, request *http.Request, target Target) {
+func (handler *Handler) events(response http.ResponseWriter, request *http.Request, target BackendTarget) {
 	if request.Method != http.MethodGet || !target.Capabilities.EventStream {
 		handler.rejectOperation(response, request)
 		return
 	}
+	if !handler.requireSupport(response, request, target.Operations.Watch != nil) {
+		return
+	}
+
 	flusher, ok := response.(http.Flusher)
 	if !ok {
 		writeError(response, http.StatusInternalServerError, "event streaming is unavailable")
 		return
 	}
-	events, unsubscribe, err := target.Client.Subscribe(request.Context(), target.ThreadID)
+	events, unsubscribe, err := target.Operations.Watch.Subscribe(request.Context(), target.Identity)
 	if err != nil {
 		handler.serverError(response, request, err)
 		return
@@ -1000,8 +919,8 @@ func (handler *Handler) events(response http.ResponseWriter, request *http.Reque
 	keepalive := time.NewTicker(heartbeatInterval)
 	defer keepalive.Stop()
 	var revision func() uint64
-	if provider, ok := target.Client.(PendingRevisionProvider); ok && target.Capabilities.Pending {
-		revision = func() uint64 { return provider.PendingRevision(target.ThreadID) }
+	if provider := target.Operations.PendingRevision; provider != nil && target.Capabilities.Pending {
+		revision = func() uint64 { return provider.PendingRevision(target.Identity) }
 	}
 	handler.streamEvents(response, request, flusher, events, keepalive.C, revision)
 }
@@ -1067,6 +986,35 @@ func (handler *Handler) rejectOperation(response http.ResponseWriter, request *h
 	writeError(response, http.StatusForbidden, "conversation operation is not allowed")
 }
 
+func (handler *Handler) requireSupport(response http.ResponseWriter, request *http.Request, supported bool) bool {
+	if !supported {
+		writeError(response, http.StatusNotImplemented, "conversation operation is unavailable")
+	}
+	return supported
+}
+
+func (handler *Handler) readError(response http.ResponseWriter, request *http.Request, err error) {
+	var upload *UploadError
+	if errors.As(err, &upload) {
+		uploadError(response, err)
+		return
+	}
+	handler.serverError(response, request, err)
+}
+
+func (handler *Handler) queueError(response http.ResponseWriter, request *http.Request, err error) {
+	var legacy *legacyQueueError
+	if errors.As(err, &legacy) {
+		if legacy.observation {
+			uploadError(response, legacy.err)
+		} else {
+			handler.serverError(response, request, err)
+		}
+		return
+	}
+	handler.readError(response, request, err)
+}
+
 func (handler *Handler) decode(response http.ResponseWriter, request *http.Request, value any) bool {
 	request.Body = http.MaxBytesReader(response, request.Body, handler.maxBodyBytes)
 	decoder := json.NewDecoder(request.Body)
@@ -1112,16 +1060,16 @@ func (handler *Handler) logError(request *http.Request, err error) {
 	handler.logger.Printf("conversation %s %q: %v", request.Method, request.URL.Path, err)
 }
 
-func nonNilPrompts(prompts []codex.Prompt) []codex.Prompt {
+func nonNilPrompts(prompts []backend.Prompt) []backend.Prompt {
 	if prompts == nil {
-		return []codex.Prompt{}
+		return []backend.Prompt{}
 	}
 	return prompts
 }
 
-func nonNilQueue(queue []codex.QueueEntry) []codex.QueueEntry {
+func nonNilQueue(queue []backend.QueueEntry) []backend.QueueEntry {
 	if queue == nil {
-		return []codex.QueueEntry{}
+		return []backend.QueueEntry{}
 	}
 	return queue
 }

@@ -1086,6 +1086,70 @@ addresses and browser origins and is not an authenticated remote deployment.
 Applications exposing the handler beyond a trusted local browser must provide
 their own authentication before granting conversation capabilities.
 
+## Conversation backend adapters
+
+`conversation.NewBackendHandler(conversation.BackendOptions)` serves the same
+routes and browser assets through independent types in `conversation/backend`.
+The leaf package uses only the standard library. It contains presentation
+values, operation interfaces and outcome/error types, without a native client,
+runtime launcher or persistence implementation.
+
+Implement `BackendResolver.ResolveBackend(ctx, request)` (or use
+`BackendResolverFunc`) to return a trusted `BackendTarget` for every request.
+The target contains:
+
+- `Identity`: adapter kind, stable application scope, adapter-owned conversation
+  ID, canonical directory and current execution generation. These are server
+  values. A generation change must not create a new submission identity.
+- `Operations`: independently nullable operation groups. `Verify` is required;
+  the other groups describe supported reads, sends, queues, settings, responses,
+  watches and observations. A missing group does not grant permission.
+- `Capabilities`: the application's authorization grants, with its shared
+  `MutationLock` and optional `Release` callback. Support and permission are
+  checked separately. Unsupported neutral operations fail before dispatch.
+- Optional model catalog, transcript presentation and attachment-preparation
+  hooks, plus the existing application-owned retry providers.
+
+The handler checks exact origins before resolving, validates the trusted target,
+verifies it within the existing request budget and locks mutations before
+dispatch. `Release` covers the complete request, including event streams.
+Browser input cannot select a backend, native path, socket, scope or generation.
+The compatibility JSON spelling `threadId` identifies the adapter's opaque
+conversation; it does not require a Codex UUID. History cursors remain opaque
+32-character strings, with the existing validation and page bounds.
+
+Use `backend.SendRequest` to receive the original submission ID, prepared
+message, host action context and retry intent. Return `Accepted` only with
+acceptance evidence, `NotSubmitted` only with positive proof that dispatch did
+not occur, or `Unknown` while the original outcome remains uncertain. Accepted
+input need not have finished executing. Only positively unsubmitted attempts
+may be retryable. Empty or unrecognized outcomes fail without granting resend
+permission. The handler supplies no deduplication or recovery store; the
+adapter must preserve immutable input and its original receipt across restarts.
+
+`Page`, `Respond`, `PendingRevision`, `QueueCompletion` and `Activity` are
+separate optional groups. Missing paging returns 501; missing activity returns
+404. Token-bearing responses never fall back to unbound response methods.
+Attachment-aware queue deletion requires completion support so the application
+can retire attachment references before forgetting the deletion receipt.
+New neutral targets without reconciliation support return 501; the old
+constructor retains its attachment-free reconciliation acknowledgement.
+
+`NewHandler(Options)` and the existing exported `Client`, `Target`, optional
+interfaces, retry and upload APIs remain source-compatible. The legacy adapter
+runs `TransformTranscript`, attachment observation and `PresentTranscript` on
+the original native transcript/page before one forward projection. It preserves
+private native citation metadata and callback order; attachment failure prevents
+presentation. Queue observation likewise precedes projection. Neutral targets
+can supply their own typed transcript callbacks; storage-specific decoration
+belongs in their readers. The separate `NewUploadHandler` API is unchanged.
+
+The legacy adapter retains the original native send/reconciliation behavior,
+including retry preflight. The `SendAttempted` boolean is not an acceptance
+result. Native typed delivery and prompt errors retain their causes through
+adaptation, while the browser receives the existing bounded status/code fields.
+This adapter layer does not change native protocol, catalog or receipt formats.
+
 ## Development
 
 Run the package checks with:

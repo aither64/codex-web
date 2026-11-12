@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation/backend"
 )
 
 type fakeClient struct {
@@ -362,10 +363,10 @@ func TestHandlerRejectsWrongOriginBeforeResolving(t *testing.T) {
 func TestConversationModelCatalogControlsPickerAndSettings(t *testing.T) {
 	handler, _, _, _, _ := newTestHandler(t, Capabilities{Settings: true})
 	resolver := handler.resolver
-	handler.resolver = ResolverFunc(func(ctx context.Context, request ResolveRequest) (Target, error) {
-		target, err := resolver.ResolveConversation(ctx, request)
-		target.ModelCatalog = func(context.Context) ([]codex.Model, error) {
-			return []codex.Model{{Model: "session-model", SupportedReasoningEfforts: []codex.ReasoningEffortOption{{ReasoningEffort: "ultra"}}}}, nil
+	handler.resolver = BackendResolverFunc(func(ctx context.Context, request ResolveRequest) (BackendTarget, error) {
+		target, err := resolver.ResolveBackend(ctx, request)
+		target.ModelCatalog = func(context.Context) ([]backend.Model, error) {
+			return []backend.Model{{Model: "session-model", SupportedReasoningEfforts: []backend.ReasoningEffortOption{{ReasoningEffort: "ultra"}}}}, nil
 		}
 		return target, err
 	})
@@ -475,8 +476,8 @@ func TestHandlerChecksDurableRetryBeforeSending(t *testing.T) {
 	request.Header.Set("Origin", "https://workspace.example.test")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted || !client.retryChecked {
-		t.Fatalf("status = %d, retry checked = %t", response.Code, client.retryChecked)
+	if response.Code != http.StatusAccepted || !client.retryChecked || client.sentText != "hello" {
+		t.Fatalf("status = %d, retry checked = %t, sent text = %q", response.Code, client.retryChecked, client.sentText)
 	}
 }
 
