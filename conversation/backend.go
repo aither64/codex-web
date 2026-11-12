@@ -14,7 +14,7 @@ func NewHandler(options Options) (*Handler, error) {
 	if options.Resolver == nil {
 		return nil, errors.New("conversation resolver is required")
 	}
-	return NewBackendHandler(BackendOptions{
+	handler, err := NewBackendHandler(BackendOptions{
 		Resolver: BackendResolverFunc(func(ctx context.Context, request ResolveRequest) (BackendTarget, error) {
 			target, err := options.Resolver.ResolveConversation(ctx, request)
 			return adaptLegacyTarget(target), err
@@ -23,6 +23,13 @@ func NewHandler(options Options) (*Handler, error) {
 		MaxBodyBytes: options.MaxBodyBytes, MaxMessageBytes: options.MaxMessageBytes,
 		OperationTimeout: options.OperationTimeout, Shutdown: options.Shutdown, Logger: options.Logger,
 	})
+	if err != nil {
+		return nil, err
+	}
+	handler.pageCursorMinBytes = 32
+	handler.pageCursorMaxBytes = 32
+	handler.pageQueryMaxBytes = 256
+	return handler, nil
 }
 
 // BackendResolver resolves application authorization and trusted adapter routing

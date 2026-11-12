@@ -280,7 +280,9 @@ type ActivityBlockingRequest struct {
 	Kind   string `json:"kind"`
 }
 
-// HistoryCursor is an opaque adapter-owned history position.
+// HistoryCursor is an opaque adapter-owned history position. Neutral HTTP
+// cursors contain 1..5462 ASCII URL-safe characters (A-Z, a-z, 0-9, _ and -).
+// The legacy Codex handler retains its exact 32-character token contract.
 type HistoryCursor string
 
 // TranscriptPage retains the browser's bounded history page shape.

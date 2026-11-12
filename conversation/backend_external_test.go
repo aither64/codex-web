@@ -18,12 +18,15 @@ import (
 
 // This backend fixture deliberately imports no native client, types or transport.
 type independentBackend struct {
-	identities []backend.Identity
-	sends      []backend.SendRequest
-	commands   []string
-	result     backend.SendResult
-	err        error
-	wrongPage  bool
+	identities  []backend.Identity
+	sends       []backend.SendRequest
+	commands    []string
+	result      backend.SendResult
+	err         error
+	wrongPage   bool
+	tooManyPage bool
+	pageCursor  backend.HistoryCursor
+	pageErr     error
 }
 
 func (b *independentBackend) Verify(_ context.Context, id backend.Identity) error {
@@ -36,10 +39,17 @@ func (b *independentBackend) Verify(_ context.Context, id backend.Identity) erro
 func (b *independentBackend) Read(_ context.Context, id backend.Identity) (backend.Transcript, error) {
 	return backend.Transcript{ThreadID: id.ConversationID, Status: "idle", Entries: []backend.TranscriptEntry{{Kind: "agentMessage", Text: "hello"}}}, nil
 }
-func (b *independentBackend) ReadPage(ctx context.Context, id backend.Identity, _ backend.HistoryCursor) (backend.TranscriptPage, error) {
+func (b *independentBackend) ReadPage(ctx context.Context, id backend.Identity, cursor backend.HistoryCursor) (backend.TranscriptPage, error) {
+	b.pageCursor = cursor
+	if b.pageErr != nil {
+		return backend.TranscriptPage{}, b.pageErr
+	}
 	value, _ := b.Read(ctx, id)
 	if b.wrongPage {
 		value.ThreadID = "other"
+	}
+	if b.tooManyPage {
+		value.Entries = make([]backend.TranscriptEntry, 101)
 	}
 	return backend.TranscriptPage{Transcript: value}, nil
 }
@@ -131,6 +141,45 @@ func neutralFixture(t *testing.T) (*conversation.Handler, *independentBackend, *
 }
 
 const attempt = "2a0e3d66-f923-4c79-bde5-c25c1edfd02b"
+
+func TestNeutralHistoryCursorBoundsAndDispositions(t *testing.T) {
+	for _, fixture := range []struct {
+		name, query, cursor string
+		status              int
+	}{
+		{"newest", "", "", 200},
+		{"short opaque", "?cursor=A_-9", "A_-9", 200},
+		{"maximum", "?cursor=" + strings.Repeat("A", 5462), strings.Repeat("A", 5462), 200},
+		{"maximum escaped raw", "?cursor=" + strings.Repeat("%41", 5462), strings.Repeat("A", 5462), 200},
+		{"raw over limit", "?cursor=" + strings.Repeat("%41", 5462) + "&", "", 400},
+		{"decoded over limit", "?cursor=" + strings.Repeat("A", 5463), "", 400},
+		{"empty", "?cursor=", "", 400},
+		{"duplicate", "?cursor=A&cursor=B", "", 400},
+		{"unknown", "?other=A", "", 400},
+		{"extra", "?cursor=A&other=B", "", 400},
+		{"bad escape", "?cursor=%GG", "", 400},
+		{"bad alphabet", "?cursor=A%2FB", "", 400},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			handler, b, _, _ := neutralFixture(t)
+			response := callNeutral(handler, "GET", "thread/page"+fixture.query, "")
+			if response.Code != fixture.status || string(b.pageCursor) != fixture.cursor {
+				t.Fatalf("status=%d cursor=%q body=%s", response.Code, b.pageCursor, response.Body.String())
+			}
+			if response.Code == 400 && !strings.Contains(response.Body.String(), `"code":"transcript_cursor_invalid"`) {
+				t.Fatal(response.Body.String())
+			}
+		})
+	}
+	for code, status := range map[string]int{"transcript_cursor_invalid": 400, "transcript_cursor_expired": 409, "transcript_reset_required": 409} {
+		handler, b, _, _ := neutralFixture(t)
+		b.pageErr = &backend.CursorError{Code: code}
+		response := callNeutral(handler, "GET", "thread/page?cursor=valid_opaque", "")
+		if response.Code != status || !strings.Contains(response.Body.String(), `"code":"`+code+`"`) {
+			t.Fatal(response.Code, response.Body.String())
+		}
+	}
+}
 
 func callNeutral(handler http.Handler, method, route, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, "/codex/conversations/application-id/"+route, strings.NewReader(body))
@@ -253,5 +302,10 @@ func TestNeutralPageAndOriginCannotBroadenAuthority(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != 403 || len(b.identities) != 1 || *releases != 1 {
 		t.Fatal("origin check reached backend")
+	}
+	h, b, _, _ = neutralFixture(t)
+	b.tooManyPage = true
+	if response := callNeutral(h, "GET", "thread/page", ""); response.Code != 503 {
+		t.Fatal("oversized page accepted", response.Code)
 	}
 }

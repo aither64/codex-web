@@ -1115,8 +1115,15 @@ verifies it within the existing request budget and locks mutations before
 dispatch. `Release` covers the complete request, including event streams.
 Browser input cannot select a backend, native path, socket, scope or generation.
 The compatibility JSON spelling `threadId` identifies the adapter's opaque
-conversation; it does not require a Codex UUID. History cursors remain opaque
-32-character strings, with the existing validation and page bounds.
+conversation; it does not require a Codex UUID. Neutral history cursors are opaque
+strings of 1 to 5462 ASCII URL-safe characters (`A-Z`, `a-z`, `0-9`, `_`, `-`).
+The raw query is bounded to 16393 bytes before parsing. Only one nonempty
+`cursor` parameter is allowed; omit it for the newest page. The legacy
+`NewHandler` keeps its exact 32-character cursor and 256-byte raw-query limits.
+Adapters return `transcript_cursor_invalid` for malformed positions and
+`transcript_reset_required` for a valid position whose history or identity changed;
+an adapter with expiring positions can return `transcript_cursor_expired`.
+Page identity, authorization and the 100-entry response bound remain unchanged.
 
 Use `backend.SendRequest` to receive the original submission ID, prepared
 message, host action context and retry intent. Return `Accepted` only with

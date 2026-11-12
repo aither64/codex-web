@@ -58,6 +58,11 @@ func TestThreadPageAuthorizationAndCursorValidation(t *testing.T) {
 	}{
 		{"newest", "", true, true, http.StatusOK, 1},
 		{"older", "?cursor=" + strings.Repeat("A", 32), true, true, http.StatusOK, 1},
+		{"escaped older", "?cursor=" + strings.Repeat("%41", 32), true, true, http.StatusOK, 1},
+		{"short", "?cursor=" + strings.Repeat("A", 31), true, true, http.StatusBadRequest, 0},
+		{"long", "?cursor=" + strings.Repeat("A", 33), true, true, http.StatusBadRequest, 0},
+		{"empty", "?cursor=", true, true, http.StatusBadRequest, 0},
+		{"raw limit", "?cursor=" + strings.Repeat("%41", 84), true, true, http.StatusBadRequest, 0},
 		{"denied", "", false, true, http.StatusForbidden, 0},
 		{"old client", "", true, false, http.StatusNotImplemented, 0},
 		{"malformed", "?cursor=bad", true, true, http.StatusBadRequest, 0},

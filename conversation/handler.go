@@ -32,7 +32,7 @@ var browserAttemptPattern = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
 )
 var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-var pageCursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32}$`)
+var pageCursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
 //go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js assets/questions.js assets/citations.js assets/retry.js assets/retry_activity.js assets/delivery_retry.js
@@ -56,15 +56,18 @@ type Capabilities struct {
 }
 
 type Handler struct {
-	resolver         BackendResolver
-	allowedOrigins   []string
-	basePath         string
-	maxBodyBytes     int64
-	maxMessageBytes  int
-	operationTimeout time.Duration
-	shutdown         <-chan struct{}
-	logger           *log.Logger
-	assets           http.Handler
+	resolver           BackendResolver
+	allowedOrigins     []string
+	basePath           string
+	maxBodyBytes       int64
+	maxMessageBytes    int
+	operationTimeout   time.Duration
+	shutdown           <-chan struct{}
+	logger             *log.Logger
+	assets             http.Handler
+	pageCursorMinBytes int
+	pageCursorMaxBytes int
+	pageQueryMaxBytes  int
 }
 
 func NewBackendHandler(options BackendOptions) (*Handler, error) {
@@ -130,7 +133,8 @@ func NewBackendHandler(options BackendOptions) (*Handler, error) {
 		resolver: options.Resolver, allowedOrigins: origins, basePath: basePath,
 		maxBodyBytes: maxBodyBytes, maxMessageBytes: maxMessageBytes,
 		operationTimeout: operationTimeout, shutdown: options.Shutdown, logger: logger,
-		assets: http.FileServer(http.FS(assets)),
+		assets:             http.FileServer(http.FS(assets)),
+		pageCursorMinBytes: 1, pageCursorMaxBytes: 5462, pageQueryMaxBytes: 16393,
 	}, nil
 }
 
@@ -270,14 +274,15 @@ func (handler *Handler) serveOperation(
 			handler.rejectOperation(response, request)
 			return
 		}
-		if len(request.URL.RawQuery) > 256 {
+		if len(request.URL.RawQuery) > handler.pageQueryMaxBytes {
 			writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid page cursor", "code": "transcript_cursor_invalid"})
 			return
 		}
 		query, err := url.ParseQuery(request.URL.RawQuery)
 		if err != nil || len(query) > 1 || len(query["cursor"]) > 1 ||
 			(len(query) == 1 && len(query["cursor"]) != 1) ||
-			(len(query["cursor"]) == 1 && !pageCursorPattern.MatchString(query["cursor"][0])) {
+			(len(query["cursor"]) == 1 && (len(query["cursor"][0]) < handler.pageCursorMinBytes ||
+				len(query["cursor"][0]) > handler.pageCursorMaxBytes || !pageCursorPattern.MatchString(query["cursor"][0]))) {
 			writeJSON(response, http.StatusBadRequest, map[string]string{"error": "invalid page cursor", "code": "transcript_cursor_invalid"})
 			return
 		}
