@@ -35,7 +35,7 @@ func TestBoundPromptHTTPMultiQuestionAnswerContract(t *testing.T) {
 			handler := &Handler{maxBodyBytes: defaultMaxBodyBytes, logger: log.New(&bytes.Buffer{}, "", 0)}
 			request := httptest.NewRequest("POST", "/respond", bytes.NewBufferString(`{"id":"questions","token":"same-offer",`+test.payload+`}`))
 			response := httptest.NewRecorder()
-			handler.respond(response, request, Target{Client: client, ThreadID: "trusted-thread", Capabilities: Capabilities{Respond: true}})
+			handler.respond(response, request, adaptLegacyTarget(Target{Client: client, ThreadID: "trusted-thread", Capabilities: Capabilities{Respond: true}}))
 			if response.Code != test.status {
 				t.Fatalf("response: %d %s", response.Code, response.Body)
 			}
@@ -75,7 +75,7 @@ func TestBoundPromptHTTPResponses(t *testing.T) {
 			handler := &Handler{maxBodyBytes: defaultMaxBodyBytes, logger: log.New(&bytes.Buffer{}, "", 0)}
 			request := httptest.NewRequest("POST", "/respond", bytes.NewBufferString(`{"id":"request-1","token":"offer-token","answers":{"choice":{"answers":["First"]}}}`))
 			response := httptest.NewRecorder()
-			handler.respond(response, request, Target{Client: client, ThreadID: "trusted-thread", Capabilities: Capabilities{Respond: true}})
+			handler.respond(response, request, adaptLegacyTarget(Target{Client: client, ThreadID: "trusted-thread", Capabilities: Capabilities{Respond: true}}))
 			if response.Code != test.status {
 				t.Fatalf("response: %d %s", response.Code, response.Body)
 			}
@@ -102,7 +102,7 @@ func TestBoundPromptCannotFallBackToAnUnboundLegacyClient(t *testing.T) {
 	handler := &Handler{maxBodyBytes: defaultMaxBodyBytes}
 	request := httptest.NewRequest("POST", "/respond", bytes.NewBufferString(`{"id":"request-1","token":"offer-token","snooze":true}`))
 	response := httptest.NewRecorder()
-	handler.respond(response, request, Target{Client: &fakeClient{}, Capabilities: Capabilities{Respond: true}})
+	handler.respond(response, request, adaptLegacyTarget(Target{Client: &fakeClient{}, Capabilities: Capabilities{Respond: true}}))
 	if response.Code != 409 || !bytes.Contains(response.Body.Bytes(), []byte("reload_required")) {
 		t.Fatalf("response: %d %s", response.Code, response.Body)
 	}
@@ -114,7 +114,7 @@ func TestTokenlessHTTPDoesNotReachTheLegacySurfaceOfABoundClient(t *testing.T) {
 		handler := &Handler{maxBodyBytes: defaultMaxBodyBytes}
 		request := httptest.NewRequest("POST", "/respond", bytes.NewBufferString(`{"id":"reused",`+action+`}`))
 		response := httptest.NewRecorder()
-		handler.respond(response, request, Target{Client: client, ThreadID: "thread", Capabilities: Capabilities{Respond: true}})
+		handler.respond(response, request, adaptLegacyTarget(Target{Client: client, ThreadID: "thread", Capabilities: Capabilities{Respond: true}}))
 		if response.Code != 409 || !bytes.Contains(response.Body.Bytes(), []byte("reload_required")) || client.response.ID != "" {
 			t.Fatalf("tokenless response: %d %s", response.Code, response.Body)
 		}
