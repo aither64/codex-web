@@ -33,6 +33,74 @@ export function bindQuestionAnswerKeyboard(input, submit) {
   });
 }
 
+// Presentation only: the owner supplies draft/state and every action. This
+// function never persists, sends, acknowledges or changes delivery state.
+export function createQuestionCard({id, threadId = "", question, pinned = false,
+  draft, state, onDraft, onSubmit, onDismiss = () => {}, onCheck = () => {},
+  checkLabel = "Retry answer", choiceValues}) {
+    const document = globalThis.document;
+    const root = document.createElement("section");
+    root.className = "codex-async-question";
+    root.dataset.asyncQuestionId = id;
+    root.dataset.asyncQuestionThread = threadId;
+    const viewId = `codex-question-${++nextViewId}`;
+    const title = document.createElement("p"); title.className = "codex-question-title"; title.id = viewId; title.tabIndex = -1;
+    const actions = document.createElement("div"); actions.className = "codex-question-options";
+    actions.setAttribute("role", "radiogroup"); actions.setAttribute("aria-labelledby", viewId);
+    const input = document.createElement("textarea"); input.rows = 2;
+    input.setAttribute("aria-label", `Answer: ${question.title}`);
+    input.placeholder = question.options?.length ? "Add details or write your own answer…" : "Type an answer";
+    const submit = document.createElement("button"); submit.type = "button"; submit.textContent = "Send answer";
+    submit.className = "codex-question-action";
+    const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.textContent = "Dismiss";
+    dismiss.className = "codex-question-action";
+    dismiss.hidden = !pinned;
+    const retry = document.createElement("button"); retry.type = "button"; retry.textContent = checkLabel;
+    retry.className = "codex-question-action";
+    const status = document.createElement("p"); status.setAttribute("role", "status");
+    const updateDraft = (choice, note) => onDraft({choice, note});
+    const radios = (question.options?.length ? [...question.options, ""] : []).map((labelText, index) => {
+      const choice = choiceValues?.[index] ?? labelText;
+      const label = document.createElement("label"); label.className = "codex-question-option";
+      const radio = document.createElement("input"); radio.type = "radio"; radio.name = viewId; radio.value = String(index);
+      const text = document.createElement("span"); text.textContent = labelText || "Other";
+      radio.addEventListener("change", () => { if (radio.checked) updateDraft(choice, draft().note); });
+      label.append(radio, text); actions.append(label);
+      return {radio, choice};
+    });
+    const footer = document.createElement("div"); footer.className = "codex-question-actions";
+    footer.append(submit, dismiss, retry);
+    root.append(title, actions, input, footer, status);
+    input.addEventListener("input", () => { updateDraft(draft().choice, input.value); });
+    submit.addEventListener("click", () => { onSubmit(); });
+    bindQuestionAnswerKeyboard(input, submit);
+    retry.addEventListener("click", () => { onCheck(); });
+    dismiss.addEventListener("click", () => { onDismiss(); });
+    const view = {root, update: () => {
+      const {answered = false, answer, enabled = true, busy = false, locked = false,
+        dismissed = false, error = "", check = false, canSubmit = false, statusText} = state();
+      const current = draft();
+      title.textContent = question.title;
+      status.textContent = statusText ?? (answered ? `Answered: ${answer}` : busy ? "Sending answer…" :
+        error || (dismissed ? "Dismissed" : ""));
+      status.hidden = !status.textContent;
+      root.dataset.questionState = answered ? "answered" : busy ? "sending" : "unanswered";
+      actions.hidden = answered || !enabled || !radios.length;
+      input.hidden = submit.hidden = answered || !enabled;
+      dismiss.hidden = !pinned || answered;
+      dismiss.disabled = !enabled || busy;
+      if (input.value !== current.note) input.value = current.note;
+      input.disabled = busy || locked;
+      for (const {radio, choice} of radios) {
+        radio.checked = current.choice === choice;
+        radio.disabled = !enabled || busy || locked;
+      }
+      submit.disabled = !enabled || busy || locked || !canSubmit;
+      retry.hidden = answered || !check || !enabled || busy;
+    }};
+    view.update(); return view;
+}
+
 // One owner for inline and pinned controls. The normal composer has its own draft
 // and delivery records; question answers still use the ordinary message endpoint.
 export function createAsyncQuestions({storage, namespace, send, acknowledge,
@@ -187,69 +255,22 @@ export function createAsyncQuestions({storage, namespace, send, acknowledge,
     return {choice: "", note: draft};
   };
   const createView = (record, pinned) => {
-    const document = globalThis.document;
-    const root = document.createElement("section");
-    root.className = "codex-async-question";
-    root.dataset.asyncQuestionId = record.id;
-    root.dataset.asyncQuestionThread = record.threadId;
-    const viewId = `codex-question-${++nextViewId}`;
-    const title = document.createElement("p"); title.className = "codex-question-title"; title.id = viewId; title.tabIndex = -1;
-    const actions = document.createElement("div"); actions.className = "codex-question-options";
-    actions.setAttribute("role", "radiogroup"); actions.setAttribute("aria-labelledby", viewId);
-    const input = document.createElement("textarea"); input.rows = 2;
-    input.setAttribute("aria-label", `Answer: ${record.question.title}`);
-    input.placeholder = record.question.options?.length ? "Add details or write your own answer…" : "Type an answer";
-    const submit = document.createElement("button"); submit.type = "button"; submit.textContent = "Send answer";
-    submit.className = "codex-question-action";
-    const dismiss = document.createElement("button"); dismiss.type = "button"; dismiss.textContent = "Dismiss";
-    dismiss.className = "codex-question-action";
-    dismiss.hidden = !pinned;
-    const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "Retry answer";
-    retry.className = "codex-question-action";
-    const status = document.createElement("p"); status.setAttribute("role", "status");
-    const updateDraft = (choice, note) => {
-      Object.assign(record.state, {choice, note, draft: answerText(choice, note)});
-      save(record); emit();
-    };
-    const radios = (record.question.options?.length ? [...record.question.options, ""] : []).map((choice, index) => {
-      const label = document.createElement("label"); label.className = "codex-question-option";
-      const radio = document.createElement("input"); radio.type = "radio"; radio.name = viewId; radio.value = String(index);
-      const text = document.createElement("span"); text.textContent = choice || "Other";
-      radio.addEventListener("change", () => { if (radio.checked) updateDraft(choice, draftFor(record).note); });
-      label.append(radio, text); actions.append(label);
-      return {radio, choice};
+    const action = fn => () => { record.pinnedAction = pinned; fn(); };
+    const view = createQuestionCard({id: record.id, threadId: record.threadId,
+      question: record.question, pinned, draft: () => draftFor(record),
+      state: () => ({answered: record.state.answer !== undefined, answer: record.state.answer,
+        enabled: record.threadId === threadId && canSend(), busy: record.busy,
+        locked: Boolean(record.state.attempt), dismissed: record.state.dismissed,
+        error: record.error, check: Boolean(record.state.attempt), canSubmit: Boolean(record.state.draft.trim())}),
+      onDraft: ({choice, note}) => {
+        Object.assign(record.state, {choice, note, draft: answerText(choice, note)});
+        save(record); emit();
+      },
+      onSubmit: action(() => { void sendAnswer(record.id, record.state.draft); }),
+      onCheck: action(() => { void sendAnswer(record.id, record.state.attempt?.answer); }),
+      onDismiss: action(() => { record.state.dismissed = true; save(record); pins.delete(record.id); emit(); }),
     });
-    const footer = document.createElement("div"); footer.className = "codex-question-actions";
-    footer.append(submit, dismiss, retry);
-    root.append(title, actions, input, footer, status);
-    input.addEventListener("input", () => { updateDraft(draftFor(record).choice, input.value); });
-    submit.addEventListener("click", () => { record.pinnedAction = pinned; void sendAnswer(record.id, record.state.draft); });
-    bindQuestionAnswerKeyboard(input, submit);
-    retry.addEventListener("click", () => { record.pinnedAction = pinned; void sendAnswer(record.id, record.state.attempt?.answer); });
-    dismiss.addEventListener("click", () => { record.pinnedAction = pinned; record.state.dismissed = true; save(record); pins.delete(record.id); emit(); });
-    const view = {root, update: () => {
-      const answered = record.state.answer !== undefined;
-      const enabled = record.threadId === threadId && canSend();
-      const draft = draftFor(record);
-      title.textContent = record.question.title;
-      status.textContent = answered ? `Answered: ${record.state.answer}` : record.busy ? "Sending answer…" :
-        record.error || (record.state.dismissed ? "Dismissed" : "");
-      status.hidden = !status.textContent;
-      root.dataset.questionState = answered ? "answered" : record.busy ? "sending" : "unanswered";
-      actions.hidden = answered || !enabled || !radios.length;
-      input.hidden = submit.hidden = answered || !enabled;
-      dismiss.hidden = !pinned || answered;
-      dismiss.disabled = !enabled || record.busy;
-      if (input.value !== draft.note) input.value = draft.note;
-      input.disabled = record.busy || Boolean(record.state.attempt);
-      for (const {radio, choice} of radios) {
-        radio.checked = draft.choice === choice;
-        radio.disabled = !enabled || record.busy || Boolean(record.state.attempt);
-      }
-      submit.disabled = !enabled || record.busy || Boolean(record.state.attempt) || !record.state.draft.trim();
-      retry.hidden = answered || !record.state.attempt || !enabled || record.busy;
-    }};
-    views.add(view); view.update(); return root;
+    views.add(view); return view.root;
   };
   return {
     update, ordinaryAccepted, sendAnswer,
