@@ -139,9 +139,9 @@ func TestPendingRevisionAdvertisementRequiresPendingAuthority(t *testing.T) {
 			client := &revisionClient{fakeClient: &fakeClient{}}
 			done := make(chan struct{})
 			go func() {
-				(&Handler{}).events(r, httptest.NewRequest("GET", "/events", nil).WithContext(ctx), Target{
+				(&Handler{}).events(r, httptest.NewRequest("GET", "/events", nil).WithContext(ctx), adaptLegacyTarget(Target{
 					Client: client, ThreadID: "trusted-thread", Capabilities: Capabilities{EventStream: true, Pending: allowed},
-				})
+				}))
 				close(done)
 			}()
 			select {

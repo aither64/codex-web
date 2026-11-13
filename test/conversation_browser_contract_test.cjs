@@ -765,6 +765,39 @@ class MemoryStorage {
     "successful legacy fallback is silent");
   disposeTeam();
 
+  // Response-shaped neutral rows share the existing renderer and filters.
+  const diagnosticText = 'aborted: <script>"猫" & diagnostic</script>';
+  const neutralRows = [
+    {kind: "userMessage", itemId: "user-1", turnId: "user-1", text: "<b>input</b>", html: "&lt;b&gt;input&lt;/b&gt;"},
+    {kind: "agentMessage", itemId: "assistant-1", turnId: "user-1", text: "answer", html: "answer"},
+    {kind: "toolResult", itemId: "tool-1", turnId: "user-1", text: "tool output"},
+    {kind: "agentMessage", itemId: "pi-stream", turnId: "user-1", turnStatus: "inProgress", text: "stream", html: "stream"},
+    {kind: "error", itemId: "failed-1", turnId: "user-1", text: diagnosticText,
+      html: "aborted: &lt;script&gt;&#34;猫&#34; &amp; diagnostic&lt;/script&gt;"},
+  ];
+  const neutralRoot = new FakeElement("main");
+  const disposeNeutral = mountConversation(neutralRoot, {id: "neutral-projection", client: {
+    async thread() { return {threadId: "opaque-native", status: "active", entries: neutralRows}; },
+  }, capabilities: {pending: false, queueRead: false, send: false, queue: false,
+    interrupt: false, settings: false, respond: false, eventStream: false}});
+  await new Promise(resolve => setImmediate(resolve));
+  const neutralFilter = neutralRoot.descendants().find(el => el.attributes["aria-label"] === "Transcript filter");
+  const neutralList = neutralRoot.descendants().find(el => el.name === "ol");
+  for (const [value, count] of [["messages", 4], ["activity", 2], ["all", 5]]) {
+    neutralFilter.value = value; neutralFilter.listeners.get("change")();
+    assert.equal(neutralList.children.length, count);
+  }
+  assert.equal(transcriptEntryVisible(neutralRows[2], "activity"), true);
+  assert.equal(transcriptEntryCopyText(neutralRows[4]), diagnosticText);
+  const diagnosticNode = neutralList.children.find(el => el.attributes.class === "codex-entry codex-entry-error");
+  assert.equal(diagnosticNode.children[1].name, "pre");
+  assert.equal(diagnosticNode.children[1].textContent, diagnosticText);
+  assert.equal(diagnosticNode.children[1].innerHTML, undefined);
+  assert.equal(diagnosticNode.descendants().filter(el => el.name === "a" || el.name === "script").length, 0);
+  assert.equal(neutralList.children[0].children[1].innerHTML, neutralRows[0].html);
+  assert.equal(neutralRows[3].turnStatus, "inProgress");
+  disposeNeutral();
+
   const citationToken = "\ue200cite\ue202fixture\ue201", citationPrefix = "Příliš 🐈 ";
   const citationStart = Buffer.byteLength(citationPrefix);
   const citationEntry = {kind: "agentMessage", turnStatus: "completed", text: citationPrefix + citationToken + " done",

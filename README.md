@@ -163,6 +163,12 @@ The [technical reference](docs/reference.md) contains the complete Go and
 browser API contract, including durable delivery, prompt responses, activity,
 uploads, compatibility, and protocol requirements.
 
+Applications with another conversation runtime can use
+[`NewBackendHandler`](docs/reference.md#conversation-backend-adapters).
+Its independent view types and optional operation groups preserve the same
+browser interface. The application still owns runtime identity, authorization,
+execution and delivery recovery. Existing Codex integrations use `NewHandler`.
+
 The [submission storage guide](docs/submission-storage.md) explains indexed
 receipt storage, delivery boundaries and migration from the JSON ledger.
 
