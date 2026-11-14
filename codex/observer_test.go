@@ -36,6 +36,21 @@ func TestObserverListQueueStaysReadOnly(t *testing.T) {
 		if err := handshake(connection); err != nil {
 			return err
 		}
+		for _, returnedID := range []string{"project-1", "wrong-project"} {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			if request["method"] != "project/read" || len(params) != 1 || params["projectId"] != "project-1" {
+				return fmt.Errorf("unexpected passive project read: %v", request)
+			}
+			if err := writeObject(connection, map[string]any{
+				"id": request["id"], "result": map[string]any{"project": map[string]any{"id": returnedID}},
+			}); err != nil {
+				return err
+			}
+		}
 		for page := 0; page < 2; page++ {
 			request, err := readObject(connection)
 			if err != nil {
@@ -101,6 +116,13 @@ func TestObserverListQueueStaysReadOnly(t *testing.T) {
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	project, err := client.ReadProject(ctx, "project-1")
+	if err != nil || project.ID != "project-1" {
+		t.Fatalf("passive project read = %#v, %v", project, err)
+	}
+	if _, err := client.ReadProject(ctx, "project-1"); err == nil || !strings.Contains(err.Error(), "wrong project identity") {
+		t.Fatalf("passive project read accepted wrong identity: %v", err)
+	}
 	entries, err := client.ListQueue(ctx, "cold-thread")
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +136,7 @@ func TestObserverListQueueStaysReadOnly(t *testing.T) {
 		}
 	}
 	for _, method := range []string{
-		"thread/start", "thread/resume", "thread/settings/update",
+		"project/create", "thread/start", "thread/resume", "thread/settings/update",
 		"thread/queue/add", "thread/queue/update", "thread/queue/start", "thread/queue/delete",
 		"turn/start", "turn/steer", "turn/interrupt",
 	} {
