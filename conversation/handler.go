@@ -46,6 +46,7 @@ type Capabilities struct {
 	Pending       bool
 	QueueRead     bool
 	Send          bool
+	InputDelivery bool
 	Queue         bool
 	Interrupt     bool
 	Settings      bool
@@ -489,6 +490,7 @@ func (handler *Handler) send(response http.ResponseWriter, request *http.Request
 		ClientUserMessageID string   `json:"clientUserMessageId"`
 		Retry               bool     `json:"retry"`
 		AttachmentIDs       []string `json:"attachmentIds,omitempty"`
+		Delivery            string   `json:"delivery,omitempty"`
 	}
 	if !handler.decode(response, request, &body) {
 		return
@@ -498,6 +500,16 @@ func (handler *Handler) send(response http.ResponseWriter, request *http.Request
 	if (message == "" && len(body.AttachmentIDs) == 0) || len([]byte(message)) > handler.maxMessageBytes ||
 		!browserAttemptPattern.MatchString(body.ClientUserMessageID) {
 		writeError(response, http.StatusBadRequest, "message and browser attempt ID are invalid")
+		return
+	}
+	// Mode validation precedes attachment preparation: unsupported modes cannot
+	// bind uploads or cause native effects.
+	if body.Delivery != "" && body.Delivery != "steer" && body.Delivery != "followUp" {
+		writeError(response, http.StatusBadRequest, "message delivery mode is invalid")
+		return
+	}
+	if body.Delivery != "" && !target.Capabilities.InputDelivery {
+		writeError(response, http.StatusForbidden, "native input delivery is unavailable")
 		return
 	}
 	var prepareErr error
@@ -528,10 +540,17 @@ func (handler *Handler) send(response http.ResponseWriter, request *http.Request
 		}()
 	}
 	result, err := target.Operations.Send.Send(ctx, target.Identity, backend.SendRequest{
-		Message: message, ClientUserMessageID: body.ClientUserMessageID, Retry: body.Retry,
+		Message: message, ClientUserMessageID: body.ClientUserMessageID, Retry: body.Retry, Delivery: body.Delivery,
 	})
 	if result.Outcome == backend.Accepted && err == nil {
 		writeJSON(response, http.StatusAccepted, result.Receipt)
+		return
+	}
+	if result.Outcome == backend.Pending && err == nil && body.Delivery != "" {
+		writeJSON(response, http.StatusConflict, map[string]any{
+			"error": "Message is queued for native delivery.", "code": "message_pending", "pending": true,
+			"clientUserMessageId": body.ClientUserMessageID, "delivery": body.Delivery,
+		})
 		return
 	}
 	handler.sendError(response, request, result, err)

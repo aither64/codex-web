@@ -1134,6 +1134,15 @@ may be retryable. Empty or unrecognized outcomes fail without granting resend
 permission. The handler supplies no deduplication or recovery store; the
 adapter must preserve immutable input and its original receipt across restarts.
 
+Backends that advertise `InputDelivery` accept `delivery: "steer"` or
+`delivery: "followUp"` on message requests. Omitting `delivery` preserves the
+backend's existing send behavior. A `409 message_pending` response with
+`pending: true`, the original `clientUserMessageId` and matching `delivery`
+confirms that the native runtime queued the input. It does not confirm delivery
+or supply a turn ID. Keep the original message ID, text, attachments and delivery
+mode while the adapter reconciles the pending operation. For these modes, a retry
+enquires about that original operation and never enqueues it again.
+
 `Page`, `Respond`, `PendingRevision`, `QueueCompletion` and `Activity` are
 separate optional groups. Missing paging returns 501; missing activity returns
 404. Token-bearing responses never fall back to unbound response methods.

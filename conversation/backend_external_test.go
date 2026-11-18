@@ -309,3 +309,56 @@ func TestNeutralPageAndOriginCannotBroadenAuthority(t *testing.T) {
 		t.Fatal("oversized page accepted", response.Code)
 	}
 }
+
+func TestNeutralNativeDeliveryPendingAndCapabilityBoundary(t *testing.T) {
+	for _, mode := range []string{"steer", "followUp"} {
+		h, b, target, _ := neutralFixture(t)
+		b.result = backend.SendResult{Outcome: backend.Pending}
+		body := `{"message":"same literal","clientUserMessageId":"` + attempt + `","delivery":"` + mode + `","retry":true}`
+		if w := callNeutral(h, "POST", "message", body); w.Code != 403 || len(b.sends) != 0 {
+			t.Fatalf("unsupported mode reached sender: %d", w.Code)
+		}
+		target.Capabilities.InputDelivery = true
+		w := callNeutral(h, "POST", "message", body)
+		var reply map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil {
+			t.Fatal(err)
+		}
+		if w.Code != 409 || reply["code"] != "message_pending" || reply["pending"] != true || reply["clientUserMessageId"] != attempt || reply["delivery"] != mode || reply["notSent"] != nil || reply["turnId"] != nil {
+			t.Fatalf("false acceptance/refusal: %d %v", w.Code, reply)
+		}
+		if len(b.sends) != 1 || b.sends[0].Delivery != mode || !b.sends[0].Retry {
+			t.Fatal("lost enquiry identity", b.sends)
+		}
+		w = callNeutral(h, "POST", "message", strings.Replace(body, mode, "invented", 1))
+		if w.Code != 400 || len(b.sends) != 1 {
+			t.Fatal("invalid delivery dispatched")
+		}
+	}
+}
+
+// Frozen c05 provider shape is also embedded in retained supervisor requests.
+// A new optional field must not alter any legacy request, including zero Send.
+func TestNeutralDeliveryPreservesLegacySendWire(t *testing.T) {
+	type legacySend struct {
+		Message, ClientUserMessageID, ActionContext string
+		Retry                                       bool
+	}
+	for _, old := range []legacySend{{}, {Message: "literal", ClientUserMessageID: attempt, ActionContext: "ordinary", Retry: true}} {
+		current := backend.SendRequest{Message: old.Message, ClientUserMessageID: old.ClientUserMessageID, ActionContext: old.ActionContext, Retry: old.Retry}
+		expected, _ := json.Marshal(old)
+		actual, _ := json.Marshal(current)
+		if string(actual) != string(expected) {
+			t.Fatalf("legacy wire changed: %s != %s", actual, expected)
+		}
+		var decoded backend.SendRequest
+		if err := json.Unmarshal(expected, &decoded); err != nil || decoded != current {
+			t.Fatal("new reader lost old caller", decoded, err)
+		}
+	}
+	explicit, _ := json.Marshal(backend.SendRequest{Delivery: "steer"})
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(explicit, &fields); err != nil || string(fields["Delivery"]) != `"steer"` {
+		t.Fatal("explicit mode missing", string(explicit), err)
+	}
+}

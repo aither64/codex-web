@@ -4,6 +4,7 @@ package backend
 
 // Transcript is a conversation presentation value.
 type Transcript struct {
+	InputDelivery     bool              `json:"inputDelivery,omitempty"`
 	ThreadID          string            `json:"threadId"`
 	Status            string            `json:"status"`
 	LatestTurnID      string            `json:"latestTurnId,omitempty"`

@@ -89,13 +89,16 @@ type Operations struct {
 
 type SendRequest struct {
 	Message, ClientUserMessageID, ActionContext string
-	Retry                                       bool
+	// Delivery is empty for legacy admission, or steer/followUp for native input.
+	Delivery string `json:",omitempty"`
+	Retry    bool
 }
 type QueueRequest struct{ Message, ClientUserMessageID string }
 type SendOutcome string
 
 const (
 	Accepted     SendOutcome = "accepted"
+	Pending      SendOutcome = "pending"
 	NotSubmitted SendOutcome = "not_submitted"
 	Unknown      SendOutcome = "unknown"
 )

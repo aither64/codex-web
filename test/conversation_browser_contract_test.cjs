@@ -172,6 +172,19 @@ class MemoryStorage {
   }
 
   assert.equal(JSON.parse(requests[7].options.body).retry, true);
+  assert.equal(Object.hasOwn(JSON.parse(requests[7].options.body), "delivery"), false);
+  for (const delivery of ["steer", "followUp"]) {
+    const pending = createConversationClient({id: "opaque", fetch: async (_, init) => {
+      const input = JSON.parse(init.body);
+      assert.equal(input.delivery, delivery);
+      assert.equal(input.retry, true);
+      return {ok: false, status: 409, json: async () => ({code: "message_pending", pending: true,
+        clientUserMessageId: input.clientUserMessageId, delivery})};
+    }});
+    await assert.rejects(pending.message("literal", "exact-id", true, [], delivery), error =>
+      error.status === 409 && error.code === "message_pending" && error.pending === true &&
+      error.clientUserMessageId === "exact-id" && error.delivery === delivery && !error.notSent);
+  }
   const compatibilityClient = createConversationClient({
     id: "opaque", basePath: "/shared", conversationPath: "/api/sessions/opaque",
     fetch: fetchRequest,

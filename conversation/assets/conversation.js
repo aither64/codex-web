@@ -276,7 +276,10 @@ export function createConversationClient(options) {
         error.status = response.status;
         error.code = typeof payload.code === "string" ? payload.code : "";
         error.notSent = payload.notSent === true;
-		error.retryable = payload.retryable === true;
+        error.retryable = payload.retryable === true;
+        error.pending = payload.pending === true;
+        error.clientUserMessageId = typeof payload.clientUserMessageId === "string" ? payload.clientUserMessageId : "";
+        error.delivery = typeof payload.delivery === "string" ? payload.delivery : "";
         throw error;
       }
       return payload;
@@ -298,8 +301,8 @@ export function createConversationClient(options) {
     modes: async (options) => (await read("collaboration-modes", options)) || [],
     queue: async (options) => (await read("queue", options)) || [],
     reconcileQueue: (options = {}) => request("queue/reconcile", {method: "POST", body: "{}", signal: options.signal}),
-    message: (message, clientUserMessageId, retry = false, attachments = []) => request("message", {
-      method: "POST", body: JSON.stringify({message, clientUserMessageId, retry, ...(attachments.length ? {attachmentIds: attachmentIDs(attachments)} : {})}),
+    message: (message, clientUserMessageId, retry = false, attachments = [], delivery = undefined) => request("message", {
+      method: "POST", body: JSON.stringify({message, clientUserMessageId, retry, ...(delivery ? {delivery} : {}), ...(attachments.length ? {attachmentIds: attachmentIDs(attachments)} : {})}),
     }),
     acknowledgeMessages: (acknowledgements) => request("message-ack", {
       method: "POST", body: JSON.stringify({acknowledgements}),
