@@ -335,6 +335,25 @@ func (handler *Handler) serveOperation(
 			target.PresentTranscript(&page.Transcript)
 		}
 		writeJSON(response, http.StatusOK, page)
+	case "provider":
+		if request.Method != http.MethodGet || !target.Capabilities.Read {
+			handler.rejectOperation(response, request)
+			return
+		}
+		if target.Operations.ProviderInfo == nil {
+			writeError(response, http.StatusNotFound, "provider information is unavailable")
+			return
+		}
+		info, err := target.Operations.ProviderInfo.ReadProvider(ctx, target.Identity)
+		if err != nil {
+			handler.serverError(response, request, err)
+			return
+		}
+		if info.ThreadID != target.Identity.ConversationID || info.Generation != target.Identity.Generation {
+			handler.serverError(response, request, errors.New("provider reader returned a different conversation"))
+			return
+		}
+		writeJSON(response, http.StatusOK, info)
 	case "activity":
 		if request.Method != http.MethodGet || !target.Capabilities.Read {
 			handler.rejectOperation(response, request)

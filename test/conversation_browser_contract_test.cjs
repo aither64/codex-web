@@ -124,6 +124,14 @@ class MemoryStorage {
     return {ok: true, status: 200, json: async () => ({})};
   };
   const client = createConversationClient({id: "opaque", basePath: "/shared", fetch: fetchRequest});
+  const providerRead = new AbortController();
+  await client.provider({signal: providerRead.signal});
+  const providerRequest = requests.pop();
+  assert.equal(providerRequest.path, "/shared/conversations/opaque/provider");
+  assert.equal(providerRequest.options.credentials, "same-origin");
+  assert.equal(providerRequest.options.method, undefined);
+  providerRead.abort();
+  assert.equal(providerRequest.options.signal.aborted, true);
   await client.thread();
   await client.threadPage();
   await client.threadPage({cursor: "A/B?=+"});

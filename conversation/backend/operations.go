@@ -61,6 +61,9 @@ type PendingRevisionProvider interface{ PendingRevision(Identity) uint64 }
 type ActivityProvider interface {
 	ReadActivity(context.Context, Identity) (ActivitySnapshot, error)
 }
+type ProviderInfoReader interface {
+	ReadProvider(context.Context, Identity) (ProviderInfo, error)
+}
 type AttachmentPreparer interface {
 	Prepare(context.Context, string, string, string, []string) (string, error)
 	QueueDeleted(context.Context, string) error
@@ -85,6 +88,7 @@ type Operations struct {
 	Watch           Watcher
 	PendingRevision PendingRevisionProvider
 	Activity        ActivityProvider
+	ProviderInfo    ProviderInfoReader
 }
 
 type SendRequest struct {

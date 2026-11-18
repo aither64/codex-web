@@ -1151,6 +1151,10 @@ can retire attachment references before forgetting the deletion receipt.
 New neutral targets without reconciliation support return 501; the old
 constructor retains its attachment-free reconciliation acknowledgement.
 
+`Operations.ProviderInfo` optionally implements `ReadProvider(ctx, Identity)` for the scoped `GET provider` route. The handler uses the current resolver, the `Read` grant and request cancellation; an absent operation returns 404. The browser reads it with `client.provider({signal})`. A response can retain provider and account identity when usage is unavailable. Omit unavailable numeric values rather than reporting zero, and never return endpoint URLs, credentials, private paths or credential hashes.
+
+The legacy `Target.ProviderInfo` field forwards the same optional support. It does not change `Client` or the existing global provider endpoints.
+
 `NewHandler(Options)` and the existing exported `Client`, `Target`, optional
 interfaces, retry and upload APIs remain source-compatible. The legacy adapter
 runs `TransformTranscript`, attachment observation and `PresentTranscript` on

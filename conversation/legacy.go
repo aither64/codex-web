@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aither64/codex-web/codex"
+	"github.com/aither64/codex-web/conversation/backend"
 )
 
 // Client is the App Server behavior used by Handler. *codex.Client implements
@@ -74,6 +75,7 @@ type Target struct {
 	// provider. Both the picker and settings validation use the same catalog.
 	ModelCatalog        func(context.Context) ([]codex.Model, error)
 	Activity            ActivityProvider
+	ProviderInfo        backend.ProviderInfoReader
 	Retry               RetryProvider
 	RetryActivity       RetryActivityProvider
 	ThreadID            string

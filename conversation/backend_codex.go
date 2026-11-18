@@ -37,6 +37,7 @@ func adaptLegacyTarget(target Target) BackendTarget {
 		Verify: adapter, Read: adapter, Pending: adapter, Send: adapter,
 		Acknowledge: adapter, QueueRead: adapter, QueueWrite: adapter,
 		Interrupt: adapter, Settings: adapter, LegacyRespond: adapter, Watch: adapter,
+		ProviderInfo: target.ProviderInfo,
 	}
 	if _, ok := target.Client.(TranscriptPageReader); ok {
 		result.Operations.Page = adapter

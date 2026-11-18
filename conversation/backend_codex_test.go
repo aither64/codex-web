@@ -98,7 +98,7 @@ func TestNativeProjectionPreservesEmptyCollections(t *testing.T) {
 
 func TestLegacyAdapterRetainsOptionalAbsence(t *testing.T) {
 	plain := adaptLegacyTarget(Target{Client: &fakeClient{}, ThreadID: "trusted", Directory: "/workspace"})
-	if plain.Operations.Page != nil || plain.Operations.Respond != nil || plain.Operations.PendingRevision != nil || plain.Operations.QueueCompletion != nil || plain.Operations.Activity != nil {
+	if plain.Operations.Page != nil || plain.Operations.Respond != nil || plain.Operations.PendingRevision != nil || plain.Operations.QueueCompletion != nil || plain.Operations.Activity != nil || plain.Operations.ProviderInfo != nil {
 		t.Fatal("legacy adapter invented optional support")
 	}
 	if plain.Operations.LegacyRespond == nil || plain.Operations.Verify == nil || plain.Operations.Send == nil {
@@ -107,6 +107,24 @@ func TestLegacyAdapterRetainsOptionalAbsence(t *testing.T) {
 	page := adaptLegacyTarget(Target{Client: &fakePageClient{fakeClient: &fakeClient{}}, ThreadID: "trusted", Directory: "/workspace"})
 	if page.Operations.Page == nil || page.Operations.Respond != nil {
 		t.Fatal("optional groups were not detected independently")
+	}
+}
+
+type legacyProviderFixture struct{}
+
+func (p *legacyProviderFixture) ReadProvider(_ context.Context, id backend.Identity) (backend.ProviderInfo, error) {
+	return backend.ProviderInfo{ThreadID: id.ConversationID, Generation: id.Generation, ProviderID: "fixture"}, nil
+}
+
+func TestLegacyAdapterForwardsScopedProviderRead(t *testing.T) {
+	reader := &legacyProviderFixture{}
+	target := adaptLegacyTarget(Target{Client: &fakeClient{}, ThreadID: "trusted", Directory: "/workspace", ProviderInfo: reader})
+	if target.Operations.ProviderInfo != reader {
+		t.Fatal("application provider reader was not forwarded")
+	}
+	info, err := target.Operations.ProviderInfo.ReadProvider(context.Background(), target.Identity)
+	if err != nil || info.ThreadID != "trusted" || info.Generation != target.Identity.Generation {
+		t.Fatal("legacy provider read changed the resolved identity")
 	}
 }
 

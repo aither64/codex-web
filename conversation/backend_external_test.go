@@ -142,6 +142,69 @@ func neutralFixture(t *testing.T) (*conversation.Handler, *independentBackend, *
 
 const attempt = "2a0e3d66-f923-4c79-bde5-c25c1edfd02b"
 
+type scopedProviderFixture struct {
+	result backend.ProviderInfo
+	seen   []backend.Identity
+}
+
+func (p *scopedProviderFixture) ReadProvider(_ context.Context, id backend.Identity) (backend.ProviderInfo, error) {
+	p.seen = append(p.seen, id)
+	return p.result, nil
+}
+
+func TestNeutralProviderReadPreservesIdentityWithoutUsage(t *testing.T) {
+	h, b, target, releases := neutralFixture(t)
+	p := &scopedProviderFixture{result: backend.ProviderInfo{
+		ThreadID: target.Identity.ConversationID, Generation: target.Identity.Generation,
+		ProviderID: "route", ProviderLabel: "Fixture route", AccountRef: "member-account",
+		Usage: backend.ProviderUsage{State: "unavailable", Reason: "metrics_unavailable"},
+	}}
+	target.Operations.ProviderInfo = p
+	response := callNeutral(h, http.MethodGet, "provider", "")
+	if response.Code != http.StatusOK || len(p.seen) != 1 || p.seen[0] != target.Identity || *releases != 1 || len(b.commands) != 0 || len(b.sends) != 0 {
+		t.Fatalf("scoped read failed: status=%d", response.Code)
+	}
+	var info backend.ProviderInfo
+	if err := json.Unmarshal(response.Body.Bytes(), &info); err != nil || info.ProviderID != "route" || info.AccountRef != "member-account" || info.Usage.State != "unavailable" || info.Usage.Metrics != nil {
+		t.Fatal("quota failure discarded provider identity")
+	}
+	for _, field := range []string{"token", "endpoint", "directory", "scopeKey"} {
+		if strings.Contains(response.Body.String(), field) {
+			t.Fatalf("response contains private field %q", field)
+		}
+	}
+}
+
+func TestNeutralProviderReadRequiresCapabilityAndMatchingScope(t *testing.T) {
+	for _, mode := range []string{"unsupported", "no-read", "post", "thread", "generation"} {
+		t.Run(mode, func(t *testing.T) {
+			h, b, target, _ := neutralFixture(t)
+			p := &scopedProviderFixture{result: backend.ProviderInfo{ThreadID: target.Identity.ConversationID, Generation: target.Identity.Generation}}
+			target.Operations.ProviderInfo = p
+			method := http.MethodGet
+			switch mode {
+			case "unsupported":
+				target.Operations.ProviderInfo = nil
+			case "no-read":
+				target.Capabilities.Read = false
+			case "post":
+				method = http.MethodPost
+			case "thread":
+				p.result.ThreadID = "another-thread"
+			case "generation":
+				p.result.Generation = "another-generation"
+			}
+			response := callNeutral(h, method, "provider", "")
+			if response.Code == http.StatusOK || len(b.commands) != 0 || len(b.sends) != 0 {
+				t.Fatalf("invalid provider read accepted: %d", response.Code)
+			}
+			if (mode == "unsupported" || mode == "no-read" || mode == "post") && len(p.seen) != 0 {
+				t.Fatal("unsupported operation invoked the provider")
+			}
+		})
+	}
+}
+
 func TestNeutralHistoryCursorBoundsAndDispositions(t *testing.T) {
 	for _, fixture := range []struct {
 		name, query, cursor string

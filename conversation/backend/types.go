@@ -2,6 +2,58 @@
 // conversation adapters. It contains no native transport or persistence policy.
 package backend
 
+import "time"
+
+// ProviderInfo is a read-only projection of one resolved conversation. It must
+// not contain endpoint URLs, credential material or credential cache identities.
+type ProviderInfo struct {
+	ThreadID         string        `json:"threadId"`
+	Generation       string        `json:"generation"`
+	ProviderID       string        `json:"providerId"`
+	ProviderLabel    string        `json:"providerLabel"`
+	NativeProviderID string        `json:"nativeProviderId,omitempty"`
+	AccountRef       string        `json:"accountRef,omitempty"`
+	AccountLabel     string        `json:"accountLabel,omitempty"`
+	ObservedAt       time.Time     `json:"observedAt"`
+	Usage            ProviderUsage `json:"usage"`
+}
+
+type ProviderUsage struct {
+	State      string           `json:"state"`
+	Reason     string           `json:"reason,omitempty"`
+	Stale      bool             `json:"stale,omitempty"`
+	ObservedAt *time.Time       `json:"observedAt,omitempty"`
+	Metrics    *ProviderMetrics `json:"metrics,omitempty"`
+}
+
+// Optional numeric fields distinguish missing measurements from reported zero.
+type ProviderMetrics struct {
+	Windows        []ProviderWindow   `json:"windows,omitempty"`
+	KeyQuotas      []ProviderQuota    `json:"keyQuotas,omitempty"`
+	UpstreamQuotas []ProviderQuota    `json:"upstreamQuotas,omitempty"`
+	PoolRemaining  map[string]float64 `json:"poolRemaining,omitempty"`
+	Requests       *int64             `json:"requests,omitempty"`
+	Tokens         *int64             `json:"tokens,omitempty"`
+	CostUSD        *float64           `json:"costUSD,omitempty"`
+}
+
+type ProviderWindow struct {
+	UsedPercent        *int   `json:"usedPercent,omitempty"`
+	WindowDurationMins *int64 `json:"windowDurationMins,omitempty"`
+	ResetsAt           *int64 `json:"resetsAt,omitempty"`
+}
+
+type ProviderQuota struct {
+	Type      string     `json:"limit_type"`
+	Window    string     `json:"limit_window"`
+	Model     *string    `json:"model_filter,omitempty"`
+	Maximum   *float64   `json:"max_value,omitempty"`
+	Used      *float64   `json:"current_value,omitempty"`
+	Remaining *float64   `json:"remaining_value,omitempty"`
+	ResetAt   *time.Time `json:"reset_at,omitempty"`
+	Source    string     `json:"source"`
+}
+
 // Transcript is a conversation presentation value.
 type Transcript struct {
 	InputDelivery     bool              `json:"inputDelivery,omitempty"`
