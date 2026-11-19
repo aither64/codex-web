@@ -1155,6 +1155,12 @@ constructor retains its attachment-free reconciliation acknowledgement.
 
 The legacy `Target.ProviderInfo` field forwards the same optional support. It does not change `Client` or the existing global provider endpoints.
 
+`ProviderMetrics.Credits` carries reported credit availability and unlimited
+flags, plus an optional string balance. It preserves false flags and reported
+zero balances without parsing or rounding. A nil balance means no balance was
+reported; an absent credits snapshot means no credit information was reported.
+`ProviderUsage` continues to describe the read's availability and staleness.
+
 `NewHandler(Options)` and the existing exported `Client`, `Target`, optional
 interfaces, retry and upload APIs remain source-compatible. The legacy adapter
 runs `TransformTranscript`, attachment observation and `PresentTranscript` on

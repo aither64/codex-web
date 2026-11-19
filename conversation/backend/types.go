@@ -28,6 +28,7 @@ type ProviderUsage struct {
 
 // Optional numeric fields distinguish missing measurements from reported zero.
 type ProviderMetrics struct {
+	Credits        *ProviderCredits   `json:"credits,omitempty"`
 	Windows        []ProviderWindow   `json:"windows,omitempty"`
 	KeyQuotas      []ProviderQuota    `json:"keyQuotas,omitempty"`
 	UpstreamQuotas []ProviderQuota    `json:"upstreamQuotas,omitempty"`
@@ -35,6 +36,14 @@ type ProviderMetrics struct {
 	Requests       *int64             `json:"requests,omitempty"`
 	Tokens         *int64             `json:"tokens,omitempty"`
 	CostUSD        *float64           `json:"costUSD,omitempty"`
+}
+
+// ProviderCredits preserves reported flags and an optional exact balance.
+// A missing balance is not a reported zero; a missing snapshot is not reported.
+type ProviderCredits struct {
+	HasCredits bool    `json:"hasCredits"`
+	Unlimited  bool    `json:"unlimited"`
+	Balance    *string `json:"balance"`
 }
 
 type ProviderWindow struct {

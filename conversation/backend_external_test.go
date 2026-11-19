@@ -175,6 +175,35 @@ func TestNeutralProviderReadPreservesIdentityWithoutUsage(t *testing.T) {
 	}
 }
 
+func TestNeutralProviderCreditsPreserveReportedValues(t *testing.T) {
+	finite, zero := "17.25", "0"
+	for _, tc := range []struct {
+		name    string
+		credits *backend.ProviderCredits
+	}{
+		{"finite", &backend.ProviderCredits{HasCredits: true, Balance: &finite}},
+		{"zero_false_flag", &backend.ProviderCredits{Balance: &zero}},
+		{"unlimited", &backend.ProviderCredits{HasCredits: true, Unlimited: true}},
+		{"balance_not_reported", &backend.ProviderCredits{HasCredits: true}},
+		{"absent", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, b, target, _ := neutralFixture(t)
+			p := &scopedProviderFixture{result: backend.ProviderInfo{ThreadID: target.Identity.ConversationID, Generation: target.Identity.Generation,
+				Usage: backend.ProviderUsage{State: "available", Metrics: &backend.ProviderMetrics{Credits: tc.credits}}}}
+			target.Operations.ProviderInfo = p
+			response := callNeutral(h, http.MethodGet, "provider", "")
+			var got backend.ProviderInfo
+			if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &got) != nil || got.ThreadID != target.Identity.ConversationID || got.Generation != target.Identity.Generation || got.Usage.State != "available" || got.Usage.Metrics == nil || !reflect.DeepEqual(got.Usage.Metrics.Credits, tc.credits) || len(b.commands)+len(b.sends) != 0 {
+				t.Fatal("provider credit contract lost identity or reported values")
+			}
+			if strings.Contains(response.Body.String(), `"credits"`) != (tc.credits != nil) {
+				t.Fatal("absent credit snapshot became a reported value")
+			}
+		})
+	}
+}
+
 func TestNeutralProviderReadRequiresCapabilityAndMatchingScope(t *testing.T) {
 	for _, mode := range []string{"unsupported", "no-read", "post", "thread", "generation"} {
 		t.Run(mode, func(t *testing.T) {
