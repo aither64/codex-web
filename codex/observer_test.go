@@ -92,6 +92,26 @@ func TestObserverListQueueStaysReadOnly(t *testing.T) {
 				return err
 			}
 		}
+		for page := 0; page < 2; page++ {
+			request, err := readObject(connection)
+			if err != nil {
+				return err
+			}
+			params, _ := request["params"].(map[string]any)
+			if request["method"] != "thread/loaded/list" || params["limit"] != float64(100) ||
+				page == 0 && len(params) != 1 || page == 1 && (len(params) != 2 || params["cursor"] != "loaded-next") {
+				return fmt.Errorf("observer changed passive loaded-list pagination: %v", request)
+			}
+			var cursor any
+			if page == 0 {
+				cursor = "loaded-next"
+			}
+			if err := writeObject(connection, map[string]any{"id": request["id"], "result": map[string]any{
+				"data": []any{fmt.Sprintf("loaded-%d", page)}, "nextCursor": cursor,
+			}}); err != nil {
+				return err
+			}
+		}
 		// This final read also fences the rejected mutations and prompt responses:
 		// no resume, setting write, answer or rejection may precede it on the wire.
 		request, err := readObject(connection)
@@ -135,8 +155,13 @@ func TestObserverListQueueStaysReadOnly(t *testing.T) {
 			t.Fatalf("queue entry %d = %#v", page, entry)
 		}
 	}
+	loaded, err := client.LoadedThreadIDs(ctx)
+	if err != nil || len(loaded) != 2 || loaded[0] != "loaded-0" || loaded[1] != "loaded-1" {
+		t.Fatalf("passive loaded inventory = %v, %v", loaded, err)
+	}
 	for _, method := range []string{
 		"project/create", "thread/start", "thread/resume", "thread/settings/update",
+		"thread/archive", "thread/unarchive", "thread/delete", "future/unsupported",
 		"thread/queue/add", "thread/queue/update", "thread/queue/start", "thread/queue/delete",
 		"turn/start", "turn/steer", "turn/interrupt",
 	} {
