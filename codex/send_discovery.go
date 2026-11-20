@@ -14,6 +14,11 @@ type sendDiscoveryKey struct {
 	clientID, textDigest, action, optionsDigest string
 }
 
+type sendDiscoveryLookup struct {
+	threadID string
+	key      sendDiscoveryKey
+}
+
 type sendDiscoverySource struct {
 	cwd, path, identity string
 	generation          uint64
@@ -53,8 +58,9 @@ func (c *Client) takeSendDiscovery(threadID string, key sendDiscoveryKey) *sendD
 			delete(c.sendDiscoveries, id)
 		}
 	}
-	hint := c.sendDiscoveries[threadID]
-	delete(c.sendDiscoveries, threadID)
+	lookup := sendDiscoveryLookup{threadID, key}
+	hint := c.sendDiscoveries[lookup]
+	delete(c.sendDiscoveries, lookup)
 	if hint != nil && hint.key == key {
 		return hint
 	}
@@ -67,17 +73,21 @@ func (c *Client) saveSendDiscovery(threadID string, hint *sendDiscovery) {
 	if c.pageContext.Err() != nil {
 		return
 	}
+	lookup := sendDiscoveryLookup{threadID, hint.key}
+	// Replacing this exact hint must not evict another request at the global cap.
+	delete(c.sendDiscoveries, lookup)
 	for len(c.sendDiscoveries) >= pageCursorLimit {
-		oldestID := ""
+		var oldestID sendDiscoveryLookup
+		var oldest *sendDiscovery
 		for id, entry := range c.sendDiscoveries {
-			if oldestID == "" || entry.lastUsed.Before(c.sendDiscoveries[oldestID].lastUsed) {
-				oldestID = id
+			if oldest == nil || entry.lastUsed.Before(oldest.lastUsed) {
+				oldestID, oldest = id, entry
 			}
 		}
 		delete(c.sendDiscoveries, oldestID)
 	}
 	hint.lastUsed = time.Now()
-	c.sendDiscoveries[threadID] = hint
+	c.sendDiscoveries[lookup] = hint
 }
 
 func (c *Client) sendDiscoverySource(ctx context.Context, threadID string) (sendDiscoverySource, error) {

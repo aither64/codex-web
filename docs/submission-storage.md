@@ -61,10 +61,11 @@ client and exact thread/message/text/action/options continues after completed,
 validated pages. The method never captures, queues, resumes or sends input.
 
 Hints contain cursors, validation identities and receipt-matching state, not
-message bodies. They expire after 30 idle minutes and at most 256 threads retain
-hints; eviction or a new client safely restarts discovery. Rollout identity,
-connection generation, file replacement/truncation and the saved prefix-tail
-check validate continuation. A materialized local rollout is required. A changed
+message bodies. They expire after 30 idle minutes and the client retains at most
+256 exact thread/message/text/action/options hints in total. Alternating requests
+on one thread retain separate progress; eviction or a new client safely restarts
+discovery. Rollout identity, connection generation, file replacement/truncation
+and the saved prefix-tail check validate continuation. A materialized local rollout is required. A changed
 lookup tuple starts a separate proof. No cursor is persisted and there is no
 background continuation or protocol/storage change.
 

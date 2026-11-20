@@ -217,6 +217,77 @@ func TestSendDiscoveryBoundedPasses(t *testing.T) {
 	t.Logf("old: four bounded passes revisit head; new: %d incomplete passes then one capture/native start and accepted replay", passes)
 }
 
+func TestSendDiscoveryAlternatingIdentitiesProgress(t *testing.T) {
+	p, socket := newSendDiscoveryPeer(t, 24)
+	p.items[21] = discoveryMessage("item-21", "old-id", "old message", "accepted-turn")
+	c := newTestClient(socket)
+	defer c.Close()
+	options := testTurnOptions()
+	receipt := SendReceipt{TurnID: "accepted-turn", ClientUserMessageID: "old-id"}
+	if err := c.recordSendAttemptWithReceipt("thread", "old-id", "old message", "action", false, options, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := p.pass(-1)
+	acked, err := c.AcknowledgeSends(ctx, "thread", []SendAcknowledgement{{ClientUserMessageID: "old-id", Digest: queueTextDigest("old message")}})
+	cancel()
+	if err != nil || len(acked) != 1 {
+		t.Fatalf("acknowledge: %v %v", acked, err)
+	}
+	ids, texts := [2]string{"old-id", "new-id"}, [2]string{"old message", "new message"}
+	complete, heads, passes := [2]bool{}, [2]int{}, [2]int{}
+	// One page per pass would finish the backfill plus two head refreshes.
+	// Each call permits two pages; the generous bound is derived from this history.
+	for round := 0; round < len(p.items)/p.width+3 && (!complete[0] || !complete[1]); round++ {
+		for i, id := range ids {
+			if complete[i] {
+				continue
+			}
+			ctx, cancel := p.pass(2)
+			found, err := c.SendAttemptedWithOptionsResumable(ctx, "thread", texts[i], id, "action", options)
+			cancel()
+			cursors, sends := p.progress()
+			passes[i]++
+			if len(cursors) > 0 && cursors[0] == "" {
+				heads[i]++
+			}
+			if sends != 0 {
+				t.Fatal("incomplete discovery submitted native input")
+			}
+			if err != nil {
+				if found || !errors.Is(err, context.Canceled) {
+					t.Fatalf("%s: %v %v", id, found, err)
+				}
+				continue
+			}
+			if found != (i == 0) {
+				t.Fatalf("%s acceptance=%v", id, found)
+			}
+			complete[i] = true
+		}
+	}
+	if !complete[0] || !complete[1] {
+		t.Fatalf("alternating exact IDs lost progress: completed=%v passes=%v head starts=%v", complete, passes, heads)
+	}
+	ctx, cancel = p.pass(-1)
+	defer cancel()
+	old, err := c.SendWithOptions(ctx, "thread", texts[0], ids[0], "action", options)
+	if err != nil || old.TurnID != "accepted-turn" {
+		t.Fatalf("old receipt: %#v %v", old, err)
+	}
+	if err := c.PrepareSendWithOptions("thread", texts[1], ids[1], "action", false, options); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := c.SendWithOptions(ctx, "thread", texts[1], ids[1], "action", options); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, sends := p.progress(); sends != 1 {
+		t.Fatalf("new ID sent %d times; old ID must only recover its receipt", sends)
+	}
+	t.Logf("alternating IDs completed in %v calls, head starts=%v; old receipt recovered, new ID sent once", passes, heads)
+}
+
 func TestSendDiscoveryAcknowledgedOldPageEdge(t *testing.T) {
 	for _, steered := range []bool{false, true} {
 		t.Run(strconv.FormatBool(steered), func(t *testing.T) {
@@ -559,6 +630,43 @@ func TestSendDiscoveryLedgerAndSerialization(t *testing.T) {
 	})
 }
 
+func TestSendDiscoverySameThreadGlobalHintLimit(t *testing.T) {
+	_, socket := newSendDiscoveryPeer(t, 1)
+	c := newTestClient(socket)
+	defer c.Close()
+	for i := 0; i < pageCursorLimit; i++ {
+		c.saveSendDiscovery("thread", &sendDiscovery{key: sendDiscoveryKey{clientID: fmt.Sprint(i)}})
+	}
+	oldest := sendDiscoveryKey{clientID: "0"}
+	c.sendDiscoveryMu.Lock()
+	c.sendDiscoveries[sendDiscoveryLookup{"thread", oldest}].lastUsed = time.Now().Add(-time.Minute)
+	c.sendDiscoveryMu.Unlock()
+	replacement := &sendDiscovery{key: sendDiscoveryKey{clientID: "1"}}
+	c.saveSendDiscovery("thread", replacement)
+	if len(c.sendDiscoveries) != pageCursorLimit {
+		t.Fatal("same-tuple replacement changed the global bound")
+	}
+	extra := &sendDiscovery{key: sendDiscoveryKey{clientID: "extra"}}
+	c.saveSendDiscovery("thread", extra)
+	if len(c.sendDiscoveries) != pageCursorLimit || c.takeSendDiscovery("thread", oldest) != nil {
+		t.Fatal("same-thread hints escaped global eviction")
+	}
+	if got := c.takeSendDiscovery("thread", replacement.key); got != replacement {
+		t.Fatal("replaced hint remained authoritative")
+	}
+	extra.lastUsed = time.Now().Add(-pageCursorIdle - time.Second)
+	if got := c.takeSendDiscovery("thread", extra.key); got != nil {
+		t.Fatal("expired hint survived lookup")
+	}
+	if got := c.takeSendDiscovery("other-thread", sendDiscoveryKey{clientID: "2"}); got != nil {
+		t.Fatal("hint crossed thread identity")
+	}
+	c.Close()
+	if len(c.sendDiscoveries) != 0 {
+		t.Fatal("close retained discovery hints")
+	}
+}
+
 func TestSendDiscoveryExpiredHintRestarts(t *testing.T) {
 	p, socket := newSendDiscoveryPeer(t, 12)
 	c := newTestClient(socket)
@@ -567,7 +675,7 @@ func TestSendDiscoveryExpiredHintRestarts(t *testing.T) {
 		t.Fatalf("partial %v %v", found, err)
 	}
 	c.sendDiscoveryMu.Lock()
-	c.sendDiscoveries["thread"].lastUsed = time.Now().Add(-pageCursorIdle - time.Second)
+	c.sendDiscoveries[sendDiscoveryLookup{"thread", sendDiscoveryKey{"client", queueTextDigest("message"), "action", mustDiscoveryOptions(t)}}].lastUsed = time.Now().Add(-pageCursorIdle - time.Second)
 	c.sendDiscoveryMu.Unlock()
 	if found, err := discoverBounded(t, p, c, 1); found || !errors.Is(err, context.Canceled) {
 		t.Fatalf("expired %v %v", found, err)

@@ -796,7 +796,7 @@ func ResolveForkThreadSettings(
 
 type Client struct {
 	sendDiscoveryMu   sync.Mutex
-	sendDiscoveries   map[string]*sendDiscovery
+	sendDiscoveries   map[sendDiscoveryLookup]*sendDiscovery
 	citationMu        sync.Mutex
 	citationCache     map[string]*citationThread
 	historyPageMu     sync.Mutex
@@ -983,7 +983,7 @@ func NewWithOptions(socket string, options ClientOptions) *Client {
 		observer: observer, events: events,
 		pageContext: pageContext, pageCancel: pageCancel,
 		pageCursors: make(map[string]pageContinuation), pageMetadata: make(map[string]*pageMetadataCache),
-		sendDiscoveries: make(map[string]*sendDiscovery),
+		sendDiscoveries: make(map[sendDiscoveryLookup]*sendDiscovery),
 		socket:          socket, options: options, activityNamespace: randomActivityNamespace(), pending: make(map[uint64]pendingCall),
 		requests: make(map[string]PendingRequest), notices: make(map[string][]Prompt),
 		subscribers: make(map[chan struct{}]string), watched: make(map[string]int),
