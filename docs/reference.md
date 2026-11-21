@@ -603,6 +603,13 @@ from the new lineage. The expected thread identity also applies to authorized
 legacy `/thread` reads. Capture `repairVersion` with a historical cursor and
 discard its response or error if that version changes before it settles.
 
+`createTranscriptHistory({keyFor})` accepts an optional
+`keyFor(entry, index, entries)` callback for display identity. It uses this key for
+merging, deduplication and recovery. By default it uses `transcriptEntryKey`. A
+custom key must identify the same entry across overlapping pages and keep distinct
+entries separate. Consumers must use the same key when rendering rows. Display
+keys do not change native IDs or authorize message operations.
+
 To record time without a browser, create a separate client with
 `ClientOptions{ObserverOnly: true, ActivityRecorder: recorder}`. Construct the
 recorder with `NewActivityRecorder(path)` using a private directory scoped

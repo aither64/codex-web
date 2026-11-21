@@ -168,6 +168,73 @@ const lineagePage = (items, turnId, cursor = null) => ({...page([], cursor),
   assert.equal(transcriptEntryKey({turnId: "turn-1", kind: "error"}, 0, []),
     transcriptEntryKey({turnId: "turn-1", kind: "error"}, 0, []));
 
+  // One native item can have different page-local turn metadata. All history
+  // paths must use the consumer's display key, keeping source order and content.
+  let customKeyCalls = 0;
+  const itemKey = (item, index, entries) => {
+    assert.equal(entries[index], item);
+    customKeyCalls++;
+    return item.itemId;
+  };
+  const customPage = (items, turnId, cursor = null) => ({...page([], cursor),
+    entries: items.map(number => ({...entry(number), turnId, text: "equal text", timestamp: number,
+      kind: number === 51 ? "userMessage" : "agentMessage"})),
+  });
+  const custom = createTranscriptHistory({keyFor: itemKey});
+  const assertCustomOrder = (last) => {
+    assert.deepEqual(numbers(custom), range(1, last));
+    assert.equal(new Set(custom.rows.map(row => row.key)).size, last);
+    assert(custom.rows.every(row => row.key === row.entry.itemId));
+    assert(custom.entries.every(item => item.text === "equal text" &&
+      item.timestamp === Number(item.itemId.slice(5))));
+    assert.equal(custom.entries.find(item => item.itemId === "item-51").kind, "userMessage");
+  };
+  custom.applyNewest(customPage(range(51, 100), "page-turn", "custom-old"));
+  const customChanges = custom.applyNewest(customPage(range(76, 125), "", "custom-new"));
+  assert.deepEqual([...customChanges.changed], range(76, 125).map(number => `item-${number}`));
+  custom.applyOlder(customPage(range(1, 60), "older-turn", "custom-earlier"));
+  assertCustomOrder(125);
+  assert.equal(custom.entries.filter(item => item.itemId === "item-76").length, 1);
+  assert.equal(custom.entries.find(item => item.itemId === "item-76").turnId, "");
+  custom.applyNewest(customPage(range(176, 225), "newest-turn", "custom-gap"));
+  assert.equal(custom.gap, true);
+  custom.applyRepair(customPage(range(126, 175), "", "custom-gap-2"));
+  custom.applyRepair(customPage(range(76, 125), "repair-turn", "custom-gap-3"));
+  assert.equal(custom.gap, false);
+  assertCustomOrder(225);
+  assert.equal(custom.entries.find(item => item.itemId === "item-76").turnId, "repair-turn");
+  custom.invalidateCursor();
+  custom.applyNewest(customPage(range(201, 250), "reset-turn", "custom-reset-1"));
+  assert.equal(custom.gap, true);
+  assertCustomOrder(250);
+  custom.applyRepair(customPage(range(151, 200), "", "custom-reset-2"));
+  custom.applyRepair(customPage(range(101, 150), "reset-older", "custom-reset-3"));
+  custom.applyRepair(customPage(range(51, 100), "", "custom-reset-4"));
+  custom.applyRepair(customPage(range(1, 50), "reset-oldest"));
+  assert.equal(custom.gap, false);
+  assertCustomOrder(250);
+  assert.equal(custom.entries.find(item => item.itemId === "item-76").turnId, "");
+  const blockPage = {...page([]), entries: [
+    {itemId: "native:block:0", turnId: "first-page", kind: "event", text: "equal text"},
+    {itemId: "native:block:1", turnId: "first-page", kind: "event", text: "equal text"},
+  ]};
+  custom.applyNewest(blockPage);
+  custom.applyNewest({...blockPage, entries: blockPage.entries.map(item => ({...item, turnId: ""}))});
+  assert.deepEqual(custom.rows.map(row => row.key), ["native:block:0", "native:block:1"]);
+  assert.throws(() => custom.applyNewest({...blockPage,
+    entries: [blockPage.entries[0], {...blockPage.entries[0], turnId: "another-page"}]}),
+  /Conversation page repeated an entry/);
+  custom.clear();
+  custom.applyNewest({...customPage([1], "new-thread"), threadId: "another-thread"});
+  assert.equal(custom.rows[0].key, "item-1");
+  assert(customKeyCalls > 0);
+
+  // Omitted keyFor retains the original turn/item identity, including errors.
+  const defaults = createTranscriptHistory();
+  const defaultEntries = [entry(1), {...entry(1), turnId: "turn-2"}, {kind: "error", turnId: "turn-1"}];
+  defaults.applyNewest({...page([]), entries: defaultEntries});
+  assert.deepEqual(defaults.rows.map(row => row.key), defaultEntries.map(transcriptEntryKey));
+
   const authorizedLegacy = {threadId: "thread-1", status: "idle", entries: [entry(1)]};
   let fallbackReads = 0;
   const unsupported = {

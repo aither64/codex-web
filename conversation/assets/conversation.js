@@ -383,6 +383,7 @@ export async function readTranscriptPage(client, {signal, cursor, legacy = false
 }
 
 export function createTranscriptHistory(options = {}) {
+  const {keyFor = transcriptEntryKey} = options;
   const policy = {...refreshPolicy, ...options.policy};
   let threadId = "", rows = [], initialized = false, legacy = false;
   let olderCursor = null, hasOlder = false, gapCursor = null, gapStart = -1;
@@ -397,7 +398,7 @@ export function createTranscriptHistory(options = {}) {
   const pairs = (entries) => {
     const seen = new Set();
     return entries.map((entry, index) => {
-      const key = transcriptEntryKey(entry, index, entries);
+      const key = keyFor(entry, index, entries);
       if (seen.has(key)) throw new Error("Conversation page repeated an entry");
       seen.add(key);
       return {key, entry};
