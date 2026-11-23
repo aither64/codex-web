@@ -64,6 +64,20 @@ type ActivityProvider interface {
 type ProviderInfoReader interface {
 	ReadProvider(context.Context, Identity) (ProviderInfo, error)
 }
+
+// GoalReader observes the exact conversation without waking it or changing its goal.
+type GoalReader interface {
+	ReadGoal(context.Context, Identity) (GoalSnapshot, error)
+}
+
+// GoalWriter owns goal admission, including current authority, operation-ID
+// replay and change-token comparison. It runs under the application's mutation
+// lock. Return the latest scoped snapshot with ErrGoalConflict. No other error
+// asserts that a mutation did not take effect.
+type GoalWriter interface {
+	MutateGoal(context.Context, Identity, GoalMutation) (GoalSnapshot, error)
+}
+
 type AttachmentPreparer interface {
 	Prepare(context.Context, string, string, string, []string) (string, error)
 	QueueDeleted(context.Context, string) error
@@ -89,6 +103,8 @@ type Operations struct {
 	PendingRevision PendingRevisionProvider
 	Activity        ActivityProvider
 	ProviderInfo    ProviderInfoReader
+	GoalRead        GoalReader
+	GoalWrite       GoalWriter
 }
 
 type SendRequest struct {

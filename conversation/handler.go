@@ -54,6 +54,8 @@ type Capabilities struct {
 	EventStream   bool
 	Retry         bool
 	RetryActivity bool
+	GoalRead      bool
+	GoalWrite     bool
 }
 
 type Handler struct {
@@ -184,6 +186,11 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 	operation := strings.Join(parts[1:], "/")
 	if !handler.originAllowed(request) {
 		writeError(response, http.StatusForbidden, "request origin is not allowed")
+		return
+	}
+	if operation == "goal" && request.Method != http.MethodGet && request.Method != http.MethodPost {
+		response.Header().Set("Allow", "GET, POST")
+		writeError(response, http.StatusMethodNotAllowed, "method is not allowed")
 		return
 	}
 	if operation != "events" || request.Method != http.MethodGet {
@@ -335,6 +342,8 @@ func (handler *Handler) serveOperation(
 			target.PresentTranscript(&page.Transcript)
 		}
 		writeJSON(response, http.StatusOK, page)
+	case "goal":
+		handler.goal(response, request, target)
 	case "provider":
 		if request.Method != http.MethodGet || !target.Capabilities.Read {
 			handler.rejectOperation(response, request)

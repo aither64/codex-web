@@ -1183,6 +1183,48 @@ result. Native typed delivery and prompt errors retain their causes through
 adaptation, while the browser receives the existing bounded status/code fields.
 This adapter layer does not change native protocol, catalog or receipt formats.
 
+### Optional goal operations
+
+`GET goal` and `POST goal` under `/conversations/{id}/` require their own
+`Capabilities.GoalRead` or `Capabilities.GoalWrite` grant and matching optional
+`Operations.GoalRead` or `Operations.GoalWrite` slot. `ReadGoal` must be passive:
+it must not load or wake work, apply an edit, or grant execution. Neither the
+legacy constructor nor Codex's recovery-only `HasActiveGoal` supplies these slots.
+
+A successful response is a `GoalSnapshot`: `enabled`, an opaque `changeToken`,
+`allowedActions`, and optional `goal`. A missing `goal` means the exact
+conversation has no goal, not that the endpoint is unsupported. An existing
+goal has `objective`, `status` (`active`, `paused`, `blocked`, `done`,
+`usageLimited`, or `budgetLimited`), and optional `progress`, `next`, `reason`,
+and boolean `pendingApplication`. The handler checks the adapter's conversation
+ID and generation against trusted routing on success and conflict; neither
+identity field is sent to the browser. `allowedActions` is an array for display,
+not authorization, and is empty without the write grant and slot.
+
+`POST goal` takes one strict JSON object with `action`, `operationId`,
+`expectedChangeToken` and, only for `edit`, `objective`. The operation ID uses the
+same lowercase UUID format as message input IDs; change tokens are nonempty and
+at most 256 UTF-8 bytes. Edit takes nonblank plain text up to 4096 UTF-8 bytes,
+without NUL. It corrects an existing goal, never creates or resumes one. The
+other actions are `enable` (passive, prospective), `disable` (revokes), `pause`,
+and `resume`. The HTTP body limit is the smaller of 32 KiB and the configured
+request limit. There are no query parameters, native routing fields, execution
+grants or agent-authored writes on this route.
+
+`MutateGoal` runs under the resolved mutation lock with the request's
+cancellation and deadline. The domain owner must enforce current authority and
+state requirements and bind the operation ID to the exact payload and owner.
+Reconcile the same ID and payload without running the operation again, even if
+its first success changed the token. A stale token on a new operation or reuse
+of an ID with a changed payload returns `ErrGoalConflict` and the latest scoped
+snapshot. HTTP returns `409` with `code: "goal_conflict"` and that `snapshot`;
+refresh the view without discarding the user's draft or automatically retrying
+with a new ID. If receipt history is no longer sufficient to reconcile a retry,
+the owner must not treat ambiguous prior execution as fresh admission. The
+handler does not keep receipts or compare tokens against a pre-read. Unsupported
+operations return `501 goal_unsupported` when granted, and an unavailable
+backend operation returns `503 goal_unavailable`; no grant returns `403`.
+
 ## Development
 
 Run the package checks with:
