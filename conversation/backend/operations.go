@@ -72,6 +72,7 @@ type AttachmentPreparer interface {
 // Operations describes support, independently of application authorization.
 // Verify is required; nil optional groups must remain absent after adaptation.
 type Operations struct {
+	Deliveries      DurableDeliveries
 	Verify          Verifier
 	Read            Reader
 	Page            PageReader

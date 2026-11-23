@@ -35,25 +35,26 @@ var messageDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var pageCursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 var basePathPattern = regexp.MustCompile(`^[A-Za-z0-9/._~!$&'()*+,;=:@-]+$`)
 
-//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js assets/questions.js assets/citations.js assets/retry.js assets/retry_activity.js assets/delivery_retry.js
+//go:embed assets/conversation.js assets/conversation.css assets/uploads.js assets/uploads.css assets/sync.js assets/refresh.js assets/questions.js assets/citations.js assets/retry.js assets/retry_activity.js assets/delivery_retry.js assets/deliveries.js
 var assetFiles embed.FS
 
 // Capabilities grants an opaque conversation ID access to individual
 // operations. Applications should grant only the operations their own policy
 // allows for the current request.
 type Capabilities struct {
-	Read          bool
-	Pending       bool
-	QueueRead     bool
-	Send          bool
-	InputDelivery bool
-	Queue         bool
-	Interrupt     bool
-	Settings      bool
-	Respond       bool
-	EventStream   bool
-	Retry         bool
-	RetryActivity bool
+	DurableDelivery bool
+	Read            bool
+	Pending         bool
+	QueueRead       bool
+	Send            bool
+	InputDelivery   bool
+	Queue           bool
+	Interrupt       bool
+	Settings        bool
+	Respond         bool
+	EventStream     bool
+	Retry           bool
+	RetryActivity   bool
 }
 
 type Handler struct {
@@ -266,6 +267,8 @@ func (handler *Handler) serveOperation(
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	ctx := request.Context()
 	switch operation {
+	case "deliveries":
+		handler.deliveries(response, request, target, "")
 	case "retry/activity", "retry/now", "retry/stop":
 		handler.retryActivity(response, request, target, operation)
 	case "retry", "retry/enabled", "retry/cancel":
@@ -487,6 +490,10 @@ func (handler *Handler) serveOperation(
 	case "events":
 		handler.events(response, request, target)
 	default:
+		if strings.HasPrefix(operation, "deliveries/") {
+			handler.deliveries(response, request, target, strings.TrimPrefix(operation, "deliveries/"))
+			return
+		}
 		if strings.HasPrefix(operation, "queue/") {
 			handler.deleteQueue(response, request, target, strings.TrimPrefix(operation, "queue/"))
 			return

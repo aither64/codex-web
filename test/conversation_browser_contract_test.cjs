@@ -589,12 +589,19 @@ class MemoryStorage {
       this.listeners = new Map();
       this.textContent = "";
       this.value = "";
+      this.dataset = {};
+      this.ownerDocument = globalThis.document;
     }
     setAttribute(key, value) { this.attributes[key] = String(value); }
     get childNodes() { return this.children; }
-    append(...children) { this.children.push(...children); }
+    append(...children) { for (const child of children) { child.remove?.(); child.parentElement = this; this.children.push(child); } }
+    insertBefore(child, before) { if (child === before) return; child.remove?.(); const at = this.children.indexOf(before); child.parentElement = this; this.children.splice(at < 0 ? this.children.length : at, 0, child); }
+    remove() { if (this.parentElement) { const at = this.parentElement.children.indexOf(this); if (at >= 0) this.parentElement.children.splice(at, 1); this.parentElement = null; } }
+    focus() { this.focused = true; }
     replaceChildren(...children) {
-      this.children = children;
+      this.children.forEach(child => { child.parentElement = null; });
+      this.children = [];
+      this.append(...children);
       if (this.name === "select" && children[0] && !this.value) {
         this.value = children[0].attributes.value || "";
       }
@@ -1588,6 +1595,53 @@ class MemoryStorage {
     releaseAcknowledgement();
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(textarea.value, editDuringAcknowledgement ? "race message " : "");
+    dispose();
+  }
+
+  // Exercise the actual shared mount: durable statuses are not legacy receipts,
+  // unsupported modes do not fall back, and edits during admission survive.
+  for (const [deliveryState, action, modes] of [["queued","send",["steer","followUp"]], ["not_sent","send",["steer","followUp"]], ["unknown","send",["steer","followUp"]], ["queued","followUp",["steer","followUp"]], ["queued","refuse",["followUp"]], ["queued","legacy",["steer","followUp"]], ["queued","changed",["steer","followUp"]], ["queued","mode",["steer","followUp"]], ["queued","scope",["steer","followUp"]], ["queued","poll",["steer","followUp"]]]) {
+    const storage = new MemoryStorage(), root = new FakeElement("main");
+    const requests = [], selection = "a".repeat(64);
+    let release, entered;
+    const legacyCalls=[]; let metadataReads = 0;
+    const started = new Promise(resolve => { entered = resolve; });
+    const client = {...mountedClient, async thread() { return {threadId:"durable",status:"idle",model:"model-b",reasoningEffort:"xhigh",...(action === "mode" ? {collaborationMode:"plan"} : {}),entries:[]}; },
+      async deliveries() { metadataReads++; return {version:1,scope: action === "scope" && metadataReads > 1 ? "other-scope" : "durable-scope",canEnqueue:true,selection: ["changed","poll"].includes(action) && metadataReads > 1 ? "b".repeat(64) : selection,deliveryModes:modes,settings:{model:"model-b",reasoningEffort:"xhigh",...(action === "mode" ? {collaborationMode:metadataReads > 1 ? "default" : "plan"} : {})},entries:action === "poll" ? [{version:1,scope:"durable-scope",selection,clientUserMessageId:"33333333-3333-4333-8333-333333333333",state:"unknown",message:"older",delivery:"steer",sequence:1,createdAtMs:1,updatedAtMs:1}] : []}; },
+      async message(message,id,retry) {legacyCalls.push({message,id,retry});return {clientUserMessageId:id,turnId:"legacy-turn",steered:false};},
+      async acknowledgeMessages() {return {acknowledgedClientUserMessageIds:[]};},
+      async admitDelivery(input) { requests.push(input); entered(); await new Promise(resolve => { release = resolve; });
+        return {...input,scope:"durable-scope",sequence:1,state:deliveryState,createdAtMs:1,updatedAtMs:1}; },
+    };
+    if (action === "legacy") {
+      const {createDurableSender} = await import("../conversation/assets/conversation.js");
+      const oldClient = {...client,message:async()=>{throw new Error("lost legacy reply");}};
+      const oldSender=createDurableSender({id:"durable",basePath:"/codex",client:oldClient,storage,randomUUID:()=>"22222222-2222-4222-8222-222222222222"});
+      await assert.rejects(oldSender.send("saved input"),/lost legacy reply/);
+    }
+    const dispose = mountConversation(root,{id:"durable",basePath:"/codex",client,storage,EventSource:null,
+      randomUUID:()=>"11111111-1111-4111-8111-111111111111",
+      capabilities:{pending:false,queueRead:false,send:true,queue:true,settings:false,interrupt:false,respond:false,eventStream:false,durableDelivery:true}});
+    await new Promise(resolve=>setImmediate(resolve));
+    const textarea = root.descendants().find(node=>node.attributes["aria-label"]==="Message");
+    const form = root.descendants().find(node=>node.attributes.class==="codex-conversation-form");
+    textarea.value="saved input";
+    if (action === "poll") { await root.descendants().find(node=>node.name==="button" && node.textContent==="Check delivery").listeners.get("click")(); await new Promise(resolve=>setImmediate(resolve)); }
+    const submitted = action === "followUp" ? root.descendants().find(node=>node.name==="button" && node.textContent==="Queue").listeners.get("click")() : form.listeners.get("submit")({preventDefault(){}});
+    if (action === "legacy" || action === "refuse" || ["changed","mode","scope","poll"].includes(action)) {
+      await submitted;
+      assert.equal(requests.length,0);
+      if (action === "legacy") { assert.equal(legacyCalls.length,1); assert.equal(legacyCalls[0].retry,true); assert.equal(legacyCalls[0].id,"22222222-2222-4222-8222-222222222222"); }
+      else if (action === "refuse") assert.equal(root.descendants().some(node=>node.textContent.includes("selected delivery mode is unavailable")),true);
+      else { assert.equal(textarea.value,"saved input"); assert.equal(root.descendants().some(node=>node.textContent.includes("Refresh the selected settings")),true); }
+      dispose(); continue;
+    }
+    await started;
+    textarea.value="edited draft"; textarea.listeners.get("input")(); release(); await submitted;
+    assert.equal(textarea.value,"edited draft");
+    assert.equal(requests[0].delivery,action === "followUp" ? "followUp" : "steer");
+    const notice=root.descendants().find(node=>node.attributes.class==="codex-submission-status");
+    assert.equal(notice.textContent.startsWith({queued:"Queued",not_sent:"Not sent",unknown:"Outcome unknown"}[deliveryState]),true);
     dispose();
   }
 

@@ -1183,6 +1183,86 @@ result. Native typed delivery and prompt errors retain their causes through
 adaptation, while the browser receives the existing bounded status/code fields.
 This adapter layer does not change native protocol, catalog or receipt formats.
 
+### Application-owned durable deliveries
+
+Applications can expose a separate inbox through the optional
+`backend.DurableDeliveries` provider and `Capabilities.DurableDelivery` capability.
+Existing `message`, native `queue`, `SendResult` and `message_pending` contracts
+remain unchanged. An unsupported inbox returns HTTP 501 with
+`durable_delivery_unavailable`; it cannot select another backend.
+
+`GET deliveries` returns a version-1 collection with opaque scope and selection,
+`canEnqueue`, supported `deliveryModes`, display settings and entries. Reading
+saved statuses can remain authorized when new admission is unavailable. The
+collection includes at most 20 outstanding entries and a combined window of 100
+recent terminal or retired entries. `GET deliveries/:clientUserMessageId` reads
+the status for an older ID.
+
+`POST deliveries` accepts `{version: 1, clientUserMessageId, message,
+attachmentIds, delivery, selection}`. The application derives the selection
+digest from its saved target, settings and policy. It validates and pins files,
+then rechecks local authority before committing the original immutable request.
+Repeating the same request creates or retrieves that request, including after
+response loss. Changed text, file order, mode or selection under the same ID
+conflicts. IDs retain their exact lowercase UUID or compact 32-hex spelling.
+
+HTTP 202 returns a `DeliveryStatus`, rather than a native receipt. Its `state` is
+`queued`, `dispatching`, `pending`, `sent`, `not_sent` or `unknown`. Only `sent`
+contains an exact native receipt and may display Sent. Queued acknowledges durable
+application ownership; pending acknowledges native enqueue. Neither confirms
+native consumption or completed execution. A confirmed `not_sent` result permits
+an explicit new submission; `unknown` requires checking the original ID. The
+provider retains unresolved records and duplicate-detection identities across
+restarts, independently of browser tabs. It owns ordering, native dispatch claims,
+pre-effect authority checks, recovery and attachment retention.
+
+The optional `retired: true` field is valid only with `state: "unknown"` and no receipt.
+The application may persist it only after its original receipt owner proves an
+explicit retirement. It releases the ordering barrier and outstanding capacity
+for distinct later inputs. The original remains Unknown, keeps its immutable
+request and duplicate-detection identity, and is never dispatched again. Ordinary
+Unknown continues to block. Exact-ID lookup remains available for retired entries
+outside the recent window.
+
+A definitive refusal before queue admission uses `DeliveryError.NotQueued`, a
+`DeliveryNotQueuedProof` containing version 1, authenticated scope and the entire
+canonical request. The provider must commit that negative identity in the same
+transactional authority used by admission. Admit and Reject first resolve the
+existing admitted or refused identity; changed requests conflict. A refused ID
+can never enter the queue, including after restart or a late original POST.
+The HTTP handler exposes `notQueued: true` and `proof` only after checking the
+scope and exact submitted request. Authentication, authorization, syntax, storage
+and transport errors alone do not establish this proof.
+
+Resolve these routes separately from native operations. Their required verifier
+authorizes local scope, and their mutation lock serializes local admission only.
+Before the durable acknowledgement, they must not acquire a native-effect lock,
+load or inspect a native worker, or read native history. The application performs
+fresh execution authorization before any later native effect. The handler leaves
+persistence and background dispatch to the application.
+
+The shared client exposes `deliveries`, `delivery(id)` and `admitDelivery(input)`.
+`createDurableDeliverySender` uses the existing verified browser store and exact
+endpoint namespace, with an additional scope binding. It saves the original
+request before POST and recovers a lost admission reply using that same request.
+Only a matching complete negative proof clears a refused browser admission. The
+draft and files remain for a later explicit Send with the current selection and
+a new ID. A boolean alone, mismatched proof or generic error retains the original
+saved request. The helper never automatically sends a replacement.
+
+The mounted composer retains its selected scope and digest separately from status
+polling. A changed digest blocks a new Send even when visible settings are
+unchanged. Reload the page, or complete an explicit settings/mode save followed by
+a fresh same-scope confirmation, to use a new selection. Failed or late reads
+cannot confirm it. Saved original requests retain their existing recovery path.
+
+`mountDeliveryStatuses` renders typed statuses and status/copy actions.
+`mountConversation` opts in with `capabilities.durableDelivery: true`, preserving
+legacy pending attempts on their original endpoint. It clears only an unchanged
+submitted draft after the server owns the input; later edits remain intact.
+The native `/message` retry contract remains unchanged: a missing original native
+receipt does not authorize enqueueing a replacement.
+
 ## Development
 
 Run the package checks with:

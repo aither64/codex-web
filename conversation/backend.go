@@ -47,6 +47,9 @@ func (fn BackendResolverFunc) ResolveBackend(ctx context.Context, request Resolv
 // BackendTarget separates supported operations from authorization grants.
 // Identity and every provider are trusted application values. Release runs after
 // the request, including the lifetime of an event stream.
+// A target for deliveries uses a local-scope verifier and a separate admission
+// lock: neither may wait for native execution. Its provider owns fresh effect
+// admission later. This exception grants local storage authority only.
 type BackendTarget struct {
 	// Set only by the legacy constructor for its historical attachment-free
 	// queue reconciliation no-op. It never advertises native completion support.

@@ -8,6 +8,8 @@ import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {mountRetryControls} from "./retry.js?v=1";
 export {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
 import {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
+import {createDeliverySender, mountDeliveryStatuses, deliveryStatusPresentation, validateDeliveryCollection} from "./deliveries.js?v=1";
+export {mountDeliveryStatuses, validateDeliveryStatus, validateDeliveryCollection, deliveryStatusPresentation} from "./deliveries.js?v=1";
 export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
 export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=2";
 import {createAsyncQuestions, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
@@ -276,6 +278,8 @@ export function createConversationClient(options) {
         error.status = response.status;
         error.code = typeof payload.code === "string" ? payload.code : "";
         error.notSent = payload.notSent === true;
+        error.notQueued = payload.notQueued === true;
+        error.proof = payload.proof;
         error.retryable = payload.retryable === true;
         error.pending = payload.pending === true;
         error.clientUserMessageId = typeof payload.clientUserMessageId === "string" ? payload.clientUserMessageId : "";
@@ -298,6 +302,9 @@ export function createConversationClient(options) {
     retryNow: (token) => request("retry/now", {method: "POST", body: JSON.stringify({token})}),
     stopRetry: (token) => request("retry/stop", {method: "POST", body: JSON.stringify({token})}),
     pending: async (options) => (await read("pending", options)) || [],
+    deliveries: (options) => read("deliveries", options),
+    delivery: (id, options) => read(`deliveries/${encodeOpaquePathSegment(id, "delivery id")}`, options),
+    admitDelivery: (input) => request("deliveries", {method: "POST", body: JSON.stringify(input)}),
     models: async (options) => (await read("models", options)) || [],
     modes: async (options) => (await read("collaboration-modes", options)) || [],
     queue: async (options) => (await read("queue", options)) || [],
@@ -919,6 +926,22 @@ export function createDurableSender(options) {
   };
 }
 
+export function createDurableDeliverySender(options) {
+  const clientTarget = conversationTargetIdentities.get(options.client);
+  const explicit = options.basePath !== undefined || options.conversationPath !== undefined || options.durableNamespace !== undefined;
+  if (!clientTarget && !explicit) throw new TypeError("a custom conversation client requires an explicit durable target");
+  const target = explicit ? conversationTarget(options) : clientTarget;
+  if (clientTarget && target.durableNamespace !== clientTarget.durableNamespace) throw new TypeError("durable sender target does not match the conversation client");
+  if (clientTarget && options.id !== undefined && options.id !== clientTarget.id) throw new TypeError("durable sender id does not match the conversation client");
+  const store = createDurableAttemptStore({storage: options.storage,
+    prefix: `codex-web:delivery:${target.durableNamespace}:${encodeURIComponent(options.scope)}:`,
+    decode: (id, value) => value?.version === 1 && value.clientUserMessageId === id && typeof value.message === "string" &&
+      /^[0-9a-f]{64}$/.test(value.selection) && ["", "steer", "followUp"].includes(value.delivery) && Array.isArray(value.attachmentIds) ? {id, ...value} : null,
+    encode: ({id, ...value}) => value,
+  });
+  return createDeliverySender({...options, store});
+}
+
 export function mountConversation(root, options) {
   if (!(root instanceof Element)) throw new TypeError("conversation root must be an Element");
   const abort = new AbortController();
@@ -935,6 +958,7 @@ export function mountConversation(root, options) {
     respond: true,
     eventStream: true,
     retry: false,
+    durableDelivery: false,
     ...(options?.capabilities || {}),
   };
   if (!capabilities.read) throw new TypeError("the mounted conversation requires read capability");
@@ -1056,6 +1080,30 @@ export function mountConversation(root, options) {
   children.push(dock);
   root.replaceChildren(...children);
   const retryUI = retryControls ? mountRetryControls(retryControls, {client}) : null;
+  let durableDeliverySender = null, deliveryView = null, deliveryMetadata = null, deliveryBaseline = null;
+  let deliveryConfirmation = 0;
+  let deliveryDraftRevision = 0;
+  textarea.addEventListener("input", () => { deliveryDraftRevision++; });
+  if (capabilities.durableDelivery) {
+    const panel = createElement("section", {class: "codex-delivery-statuses", "aria-label": "Message delivery"});
+    dock.insertBefore(panel, form);
+    deliveryView = mountDeliveryStatuses(panel, {client,
+      onMetadata: value => {
+        deliveryMetadata = value;
+        if (value?.canEnqueue && !deliveryBaseline) deliveryBaseline = {scope:value.scope,selection:value.selection};
+        if (!value || durableDeliverySender) return;
+        let storage; try { storage = options?.storage || globalThis.localStorage; } catch (_) {}
+        durableDeliverySender = createDurableDeliverySender({...options, client, storage, scope: value.scope});
+        if (!sender?.pending() && !sender?.pendingQueue() && durableDeliverySender.pending().length) {
+          void durableDeliverySender.recover().then(() => deliveryView.refresh()).catch(error => {
+            if (!abort.signal.aborted) { submissionStatus.hidden = false; submissionStatus.textContent = error.message; }
+          });
+        }
+      },
+      onCopy: entry => { if (!textarea.value) { deliveryDraftRevision++; textarea.value = entry.message; textarea.focus(); } },
+      isCurrent: () => !abort.signal.aborted,
+    });
+  }
   let uploads = null;
   if (options?.uploadBasePath && (capabilities.send || capabilities.queue)) {
     const uploadRoot = document.createElement("div");
@@ -1587,6 +1635,40 @@ export function mountConversation(root, options) {
   });
   const refresh = () => sync.refresh();
 
+  const confirmDeliverySelection = async expected => {
+    const revision = ++deliveryConfirmation, scope = deliveryBaseline?.scope, thread = currentThread?.threadId, settingsRevision = settingsGeneration;
+    if (!scope) return false;
+    try {
+      const value = validateDeliveryCollection(await client.deliveries(), scope);
+      if (abort.signal.aborted || revision !== deliveryConfirmation || settingsGeneration !== settingsRevision || currentThread?.threadId !== thread || !value.canEnqueue ||
+          value.settings?.model !== expected.model || (value.settings?.reasoningEffort || "") !== expected.reasoningEffort ||
+          expected.collaborationMode !== undefined && (value.settings?.collaborationMode || "") !== expected.collaborationMode) return false;
+      deliveryBaseline = {scope:value.scope,selection:value.selection}; deliveryMetadata = value;
+      return true;
+    } catch (_) { return false; }
+  };
+
+  const submitDurable = async requestedMode => {
+    if (sender.pending() || sender.pendingQueue()) throw new Error("Resolve the original message before starting durable delivery.");
+    const displayed = {selection: deliveryBaseline?.selection, scope: deliveryBaseline?.scope,
+      model: confirmedModel || currentThread?.model, effort: confirmedEffort || currentThread?.reasoningEffort || "",
+      mode: currentThread?.collaborationMode || (capabilities.settings ? mode.value : undefined)};
+    const text = textarea.value, files = uploads?.ids() || [], revision = deliveryDraftRevision, threadId = currentThread?.threadId;
+    const metadata = await deliveryView.refresh();
+    if (!metadata?.canEnqueue || !durableDeliverySender || metadata.selection !== displayed.selection || metadata.scope !== displayed.scope ||
+        metadata.settings?.model !== displayed.model || (metadata.settings?.reasoningEffort || "") !== displayed.effort ||
+        displayed.mode !== undefined && (metadata.settings?.collaborationMode || "") !== displayed.mode) throw new Error("Refresh the selected settings before sending.");
+    const delivery = requestedMode === undefined ? (metadata.deliveryModes.includes("") ? "" : metadata.deliveryModes.includes("steer") ? "steer" : null) : requestedMode;
+    if (delivery === null || !metadata.deliveryModes.includes(delivery)) throw new Error("The selected delivery mode is unavailable.");
+    const status = await durableDeliverySender.send(text, files, {selection: metadata.selection, delivery});
+    if (currentThread?.threadId === threadId && revision === deliveryDraftRevision && textarea.value === text && sameAttachments(uploads?.ids() || [], files)) {
+      textarea.value = ""; uploads?.clear();
+    }
+    const presentation = deliveryStatusPresentation(status);
+    submissionStatus.hidden = false; submissionStatus.textContent = [presentation.label, presentation.description].filter(Boolean).join(". ");
+    await deliveryView.refresh();
+  };
+
   const submitSend = async (retryID = null) => {
     if (settingsSaving) return;
     send.disabled = true;
@@ -1594,6 +1676,7 @@ export function mountConversation(root, options) {
     const threadId = currentThread?.threadId;
     let submittedAttempt, submittedAttachments = [];
     try {
+      if (capabilities.durableDelivery && !retryID && !sender.pending() && !sender.pendingQueue()) { await submitDurable(); return; }
       const retained = retryID ? sender.pending() : null;
       if (retryID && retained?.id !== retryID) return;
       submittedAttachments = retained ? retained.attachmentIds || [] : uploads?.ids() || [];
@@ -1630,7 +1713,7 @@ export function mountConversation(root, options) {
   if (capabilities.settings) settingsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (settingsSaving || currentThread?.status !== "idle") return;
-    const selected = {model: model.value, reasoningEffort: effort.value};
+    const selected = {model: model.value, reasoningEffort: effort.value, ...(capabilities.durableDelivery && currentThread?.collaborationMode ? {collaborationMode:mode.value} : {})};
     if (!modelCatalog.some(entry => entry.model === selected.model &&
         entry.supportedReasoningEfforts?.some(option => option.reasoningEffort === selected.reasoningEffort))) return;
     settingsGeneration++;
@@ -1639,17 +1722,19 @@ export function mountConversation(root, options) {
     settingsError.textContent = "Saving settings…";
     try {
       const saved = await client.settings(selected.model, selected.reasoningEffort, currentThread?.collaborationMode ? mode.value : undefined);
-      if (saved.model !== selected.model || saved.reasoningEffort !== selected.reasoningEffort) throw new Error("The settings update could not be confirmed.");
+      if (saved.model !== selected.model || saved.reasoningEffort !== selected.reasoningEffort || selected.collaborationMode !== undefined && saved.collaborationMode !== selected.collaborationMode) throw new Error("The settings update could not be confirmed.");
       confirmedModel = saved.model; confirmedEffort = saved.reasoningEffort;
       settingsGeneration++;
       settingsDialog.close(); await refresh();
+      if (capabilities.durableDelivery) await confirmDeliverySelection({...saved, collaborationMode:selected.collaborationMode});
     } catch (error) {
       try {
         const observed = await client.thread();
-        if (observed.model === selected.model && observed.reasoningEffort === selected.reasoningEffort) {
+        if (observed.model === selected.model && observed.reasoningEffort === selected.reasoningEffort && (selected.collaborationMode === undefined || observed.collaborationMode === selected.collaborationMode)) {
           confirmedModel = observed.model; confirmedEffort = observed.reasoningEffort;
           settingsGeneration++;
-          settingsDialog.close(); void refresh();
+          settingsDialog.close(); await refresh();
+          if (capabilities.durableDelivery) await confirmDeliverySelection({model:observed.model,reasoningEffort:observed.reasoningEffort,collaborationMode:selected.collaborationMode});
         } else settingsError.textContent = error.message;
       } catch (_) { settingsError.textContent = error.message; }
     } finally {
@@ -1665,6 +1750,7 @@ export function mountConversation(root, options) {
     const threadId = currentThread?.threadId;
     let submittedAttempt, submittedAttachments = [];
     try {
+      if (capabilities.durableDelivery && !sender.pending() && !sender.pendingQueue()) { await submitDurable("followUp"); return; }
       submittedAttachments = uploads?.ids() || [];
       uploads?.lock(true);
       const submission = sender.queue(message, submittedAttachments);
@@ -1694,6 +1780,7 @@ export function mountConversation(root, options) {
 
   return () => {
     destroyed = true;
+    deliveryView?.destroy();
     deliveryRetries?.destroy();
     suspendLanes();
     globalThis.document?.removeEventListener?.("visibilitychange", onVisibility);
