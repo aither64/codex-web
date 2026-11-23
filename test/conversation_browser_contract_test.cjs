@@ -132,6 +132,14 @@ class MemoryStorage {
   assert.equal(providerRequest.options.method, undefined);
   providerRead.abort();
   assert.equal(providerRequest.options.signal.aborted, true);
+  const primaryRead = new AbortController();
+  await client.primarySettings({signal: primaryRead.signal});
+  const primaryRequest = requests.pop();
+  assert.equal(primaryRequest.path, "/shared/conversations/opaque/primary-settings");
+  assert.equal(primaryRequest.options.method, undefined);
+  assert.equal(primaryRequest.options.body, undefined);
+  primaryRead.abort();
+  assert.equal(primaryRequest.options.signal.aborted, true);
   await client.thread();
   await client.threadPage();
   await client.threadPage({cursor: "A/B?=+"});

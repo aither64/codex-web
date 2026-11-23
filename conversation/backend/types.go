@@ -266,6 +266,49 @@ type CollaborationMode struct {
 	Mode string `json:"mode"`
 }
 
+// MemberPrimary is a public projection of one worker's primary settings.
+// AccountRef identifies a bound public account, never a credential or proof of use.
+type MemberPrimary struct {
+	ProviderID      string `json:"providerId"`
+	ProviderLabel   string `json:"providerLabel"`
+	AccountRef      string `json:"accountRef"`
+	Model           string `json:"model"`
+	ReasoningEffort string `json:"reasoningEffort"`
+}
+
+// DesiredMemberPrimary describes where the desired selection was captured.
+type DesiredMemberPrimary struct {
+	MemberPrimary
+	Source            string `json:"source"` // session_default, member_override, frozen_add
+	Origin            string `json:"origin"` // creation, fork, policy, add
+	PolicyRevision    uint64 `json:"policyRevision"`
+	SelectionRevision uint64 `json:"selectionRevision"`
+}
+
+// EffectiveMemberPrimary is an independent observation of the same worker's
+// settings and revisions, not proof of account entitlement or provider use on a
+// specific turn.
+type EffectiveMemberPrimary struct {
+	MemberPrimary
+	SettingsRevision uint64 `json:"settingsRevision"`
+	PolicyVersion    string `json:"policyVersion"`
+}
+
+// MemberPrimarySettings is read-only. Observation is match when independently
+// verified effective settings confirm the desired tuple and selected policy
+// revision. A revision mismatch is a mismatch even when public fields agree.
+// Unknown omits Effective and requires verified worker scope and positive
+// evidence that no effective observation is available. Ambiguity or a failed
+// read must return an error instead. Version is opaque and binds the exact
+// worker and generation, desired source and revisions, and verified native
+// revisions (or proven absence). It does not grant authorization.
+type MemberPrimarySettings struct {
+	Desired     DesiredMemberPrimary    `json:"desired"`
+	Effective   *EffectiveMemberPrimary `json:"effective,omitempty"`
+	Observation string                  `json:"observation"`
+	Version     string                  `json:"version"`
+}
+
 // Settings is a conversation presentation value.
 type Settings struct {
 	Model             string       `json:"model,omitempty"`

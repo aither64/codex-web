@@ -186,6 +186,11 @@ func (handler *Handler) ServeHTTP(response http.ResponseWriter, request *http.Re
 		writeError(response, http.StatusForbidden, "request origin is not allowed")
 		return
 	}
+	if operation == "primary-settings" && request.Method != http.MethodGet {
+		response.Header().Set("Allow", http.MethodGet)
+		writeError(response, http.StatusMethodNotAllowed, "method is not allowed")
+		return
+	}
 	if operation != "events" || request.Method != http.MethodGet {
 		operationContext, cancel := context.WithTimeout(request.Context(), handler.operationTimeout)
 		defer cancel()
@@ -409,6 +414,21 @@ func (handler *Handler) serveOperation(
 			return
 		}
 		writeJSON(response, http.StatusOK, nonNilPrompts(prompts))
+	case "primary-settings":
+		if !target.Capabilities.Settings {
+			handler.rejectOperation(response, request)
+			return
+		}
+		if !handler.requireSupport(response, request, target.Operations.MemberPrimary != nil) {
+			return
+		}
+		settings, err := target.Operations.MemberPrimary.ReadMemberPrimary(ctx, target.Identity)
+		if err != nil {
+			handler.readError(response, request, err)
+			return
+		}
+		response.Header().Set("Cache-Control", "no-store")
+		writeJSON(response, http.StatusOK, settings)
 	case "models":
 		if request.Method != http.MethodGet || !target.Capabilities.Settings {
 			handler.rejectOperation(response, request)

@@ -61,6 +61,16 @@ type PendingRevisionProvider interface{ PendingRevision(Identity) uint64 }
 type ActivityProvider interface {
 	ReadActivity(context.Context, Identity) (ActivitySnapshot, error)
 }
+
+// MemberPrimaryReader supports GET primary-settings for one resolved worker.
+// The handler checks Settings authorization separately; a nil reader means
+// unsupported. Revalidate worker scope before projecting settings and return an
+// error, not partial data, if verification fails. Do not probe account usage or
+// change desired or native state.
+type MemberPrimaryReader interface {
+	ReadMemberPrimary(context.Context, Identity) (MemberPrimarySettings, error)
+}
+
 type ProviderInfoReader interface {
 	ReadProvider(context.Context, Identity) (ProviderInfo, error)
 }
@@ -89,6 +99,7 @@ type Operations struct {
 	PendingRevision PendingRevisionProvider
 	Activity        ActivityProvider
 	ProviderInfo    ProviderInfoReader
+	MemberPrimary   MemberPrimaryReader
 }
 
 type SendRequest struct {

@@ -1168,6 +1168,37 @@ zero balances without parsing or rounding. A nil balance means no balance was
 reported; an absent credits snapshot means no credit information was reported.
 `ProviderUsage` continues to describe the read's availability and staleness.
 
+### Member primary settings
+
+`GET /codex/conversations/{id}/primary-settings` reads one resolved worker's
+primary settings. The handler requires the existing `Capabilities.Settings`
+authorization and separately checks for `Operations.MemberPrimary`, the optional
+`ReadMemberPrimary(ctx, Identity)` reader. Missing authorization refuses the
+request; a missing reader returns 501 for an authorized worker. The browser
+calls `client.primarySettings({signal})`. The route accepts only GET and never
+changes settings, lists choices or looks up credentials or account usage.
+
+A successful `no-store` response carries `desired`, optional `effective`,
+`observation` and an opaque `version`. Settings use public provider IDs and labels, a public
+account reference, the physical model and reasoning effort. `desired` includes
+the selected source (`session_default`, `member_override`, or `frozen_add`),
+capture origin and the policy and selection revisions. `effective` includes
+independently verified settings and native policy revisions for the same
+worker. Its account reference describes a binding, not account entitlement or
+proof of use on a turn.
+
+`match` requires verified effective values and confirmation of the desired
+selection revision. Use `mismatch` when the effective tuple or revision differs,
+even if the public fields agree. `unknown` omits `effective` and is valid only
+when the adapter has verified the exact worker scope and can positively
+establish that no effective observation is available. If authorization,
+identity or evidence is ambiguous, or verification or reading fails, return an
+error without a partial response. Bind `version` to the exact worker and
+execution generation, the desired source and revisions, and the verified
+native revisions or proven absence. The version does not grant access.
+
+### Legacy adapter compatibility
+
 `NewHandler(Options)` and the existing exported `Client`, `Target`, optional
 interfaces, retry and upload APIs remain source-compatible. The legacy adapter
 runs `TransformTranscript`, attachment observation and `PresentTranscript` on

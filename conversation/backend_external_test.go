@@ -16,6 +16,75 @@ import (
 	"github.com/aither64/codex-web/conversation/backend"
 )
 
+type memberPrimaryReaderFunc func(context.Context, backend.Identity) (backend.MemberPrimarySettings, error)
+
+func (f memberPrimaryReaderFunc) ReadMemberPrimary(ctx context.Context, id backend.Identity) (backend.MemberPrimarySettings, error) {
+	return f(ctx, id)
+}
+
+func TestMemberPrimaryReadUsesResolvedSettingsCapability(t *testing.T) {
+	id := backend.Identity{BackendID: "test", ScopeKey: "member-incarnation", ConversationID: "worker", Directory: "/trusted", Generation: "generation"}
+	desired := backend.DesiredMemberPrimary{MemberPrimary: backend.MemberPrimary{ProviderID: "service", ProviderLabel: "Service", AccountRef: "bound", Model: "physical", ReasoningEffort: "low"}, Source: "frozen_add", Origin: "add", PolicyRevision: 3, SelectionRevision: 1}
+	for _, row := range []struct {
+		name, method, origin     string
+		allowed, support, failed bool
+		want, resolves, reads    int
+	}{
+		{"supported", "GET", "https://fixture.invalid", true, true, false, 200, 1, 1},
+		{"failed read", "GET", "https://fixture.invalid", true, true, true, 503, 1, 1},
+		{"denied", "GET", "https://fixture.invalid", false, true, false, 403, 1, 0},
+		{"unsupported", "GET", "https://fixture.invalid", true, false, false, 501, 1, 0},
+		{"write absent", "POST", "https://fixture.invalid", true, true, false, 405, 0, 0},
+		{"wrong origin", "GET", "https://other.invalid", true, true, false, 403, 0, 0},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			resolves, reads := 0, 0
+			handler, err := conversation.NewBackendHandler(conversation.BackendOptions{
+				AllowedOrigins: []string{"https://fixture.invalid"}, BasePath: "/codex",
+				Resolver: conversation.BackendResolverFunc(func(_ context.Context, req conversation.ResolveRequest) (conversation.BackendTarget, error) {
+					resolves++
+					if req.ID != "opaque" || req.Operation != "primary-settings" || req.Method != "GET" || req.Mutation {
+						t.Fatalf("unexpected resolution: %+v", req)
+					}
+					ops := backend.Operations{Verify: &independentBackend{}}
+					if row.support {
+						ops.MemberPrimary = memberPrimaryReaderFunc(func(_ context.Context, got backend.Identity) (backend.MemberPrimarySettings, error) {
+							reads++
+							if got != id {
+								t.Fatalf("identity = %+v", got)
+							}
+							value := backend.MemberPrimarySettings{Desired: desired, Observation: "unknown", Version: "opaque-version"}
+							if row.failed {
+								return value, errors.New("unverified")
+							}
+							return value, nil
+						})
+					}
+					return conversation.BackendTarget{Identity: id, Operations: ops, Capabilities: conversation.Capabilities{Settings: row.allowed}}, nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(row.method, "/codex/conversations/opaque/primary-settings", nil)
+			r.Header.Set("Origin", row.origin)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+			if w.Code != row.want || resolves != row.resolves || reads != row.reads {
+				t.Fatalf("status=%d resolves=%d reads=%d: %s", w.Code, resolves, reads, w.Body)
+			}
+			if w.Code == 200 {
+				var got backend.MemberPrimarySettings
+				if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || got.Desired != desired || got.Effective != nil || got.Observation != "unknown" || got.Version != "opaque-version" || w.Header().Get("Cache-Control") != "no-store" {
+					t.Fatalf("wrong projection: %s (%v)", w.Body, err)
+				}
+			} else if strings.Contains(w.Body.String(), "opaque-version") {
+				t.Fatal("denied response disclosed settings")
+			}
+		})
+	}
+}
+
 // This backend fixture deliberately imports no native client, types or transport.
 type independentBackend struct {
 	identities  []backend.Identity

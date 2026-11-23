@@ -291,6 +291,7 @@ export function createConversationClient(options) {
     threadPage: ({cursor, signal} = {}) => read(cursor ? `thread/page?cursor=${encodeURIComponent(cursor)}` : "thread/page", {signal}),
     activity: (options) => read("activity", options),
     provider: (options) => read("provider", options),
+    primarySettings: (options) => read("primary-settings", options),
     retry: (options) => read("retry", options),
     setRetryEnabled: (enabled) => request("retry/enabled", {method: "POST", body: JSON.stringify({enabled})}),
     cancelRetry: () => request("retry/cancel", {method: "POST", body: "{}"}),
