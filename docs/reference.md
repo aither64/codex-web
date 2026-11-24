@@ -1654,6 +1654,94 @@ model adherence to naming instructions with a real provider or native tool-effec
 isolation. The consuming application's positive naming canary uses its exact
 packaged child and instructions within its original naming deadline.
 
+### Native provider-fork reference fixture
+
+`TestNativeProviderFork0172` exercises ordinary A-to-B-to-A history forks through
+the real client and the official complete Codex 0.172.0 musl release. Each fork
+creates a new native thread ID. Synthetic Responses endpoints inspect inherited
+user and assistant messages in model requests, provider routing while another A
+conversation runs, paginated history and retained settings. The fixture also
+checks provider mismatch on a loaded same-ID resume and invalid or in-progress cutoffs,
+managed provider requirements, and continuation after a same-version restart.
+It stops at the first unexpected failure.
+
+Each fresh root receives one public `Client.SetName` call with its private
+fixture name: `N172 A0`, `N172 Aother` or `N172 managed-A`. Naming is an explicit
+metadata operation; persisting a rollout alone does not establish its metadata
+index. After acknowledgement, the fixture requires the exact thread ID, working
+directory and saved name, paginated history mode, and successful, explicitly
+empty turns and items pages. A lost or failed naming response or failed validation
+stops the fixture before sending, without retry. Every marked turn then uses
+ordinary `Send`, and later history checks still require pagination. This private
+initialization does not establish the production portal's fresh-send or
+uncertain-result recovery compatibility.
+
+For a B override on the still-loaded A root, the fixture requires the client's
+exact requested-B/effective-A mismatch and undecoded result. Provider counts,
+complete history, thread identity, settings and policy must remain unchanged
+across the request. Before and after lifecycle observations use `thread/resume`
+with only `threadId` and `excludeTurns`, so they do not reapply expected settings.
+This covers a loaded rejoin; cold-resume behavior needs separate evidence.
+The unavailable-provider case uses `thread/fork` to exercise native configuration
+resolution and requires the exact invalid-request error. Other native refusal
+checks retain their strict error requirements.
+
+To check a requirement that fixes the provider to A, the fixture requests B once
+through `config.model_provider` and omits top-level `modelProvider`. This supported
+configuration form lets the same public client decode the native response and
+its exact child ID. The response must identify a new, nonancestor child of the
+requested source with provider A, the requested model, `high` effort, the same
+working directory, `never` approval and read-only sandboxing.
+
+The fixture reads that child's complete paginated history and compares it with
+the source. Source identity, settings, policy, history and provider counts must
+remain unchanged. It sends nothing to the child. An error, uncertain reply or
+failed read stops the check without searching stored threads or retrying. The
+separate top-level client guard and native refusal checks remain required.
+
+This fixture tests upstream behavior. Acceptance of a consuming workspace's
+package and portal binding/recovery behavior requires separate checks against
+its selected packaged runtime. Packaging fixes from numtide/llm-agents.nix remain
+compatible with that requirement; custom Codex provider, TUI or settings behavior
+changes are outside this fixture's reference contract. It invokes neither the
+daemon/updater commands nor a real model service.
+
+Supply absolute `CODEX_PROVIDER_FORK_PACKAGE`, `CODEX_PROVIDER_FORK_BINARY`
+(the package's `bin/codex`) and `CODEX_PROVIDER_FORK_IP` paths, the measured
+`CODEX_PROVIDER_FORK_SHA256`, the exact reviewed
+`CODEX_PROVIDER_FORK_CLIENT_REVISION`, and nonempty artifact
+`CODEX_PROVIDER_FORK_PROVENANCE`. The reference archive SHA256 is
+`40e15ab97830b71a642a4b7328ca4c301bf0b5e0faafe68aaa6e1a94b04ff15f`;
+its `bin/codex` SHA256 is
+`ad83b94c093f0cdd8176a6bc8005a461bdf23a759863e157d40f562b8a9d664d`.
+Retain the complete package and record its acquisition and signature-verification
+status. Matching digests alone do not establish signature verification.
+Missing prerequisites fail the selected test rather than skip it.
+
+Run the quick controls in the repository's Nix environment before independent
+review:
+
+```sh
+go test -mod=readonly -tags=codex_integration ./codex -run '^TestNativeProviderFork0172Projection$' -count=1
+go test -mod=readonly -tags=codex_integration ./codex -run '^TestEphemeralIntegrationNamespace(OwnershipGuard|Stop)$' -count=1
+```
+
+After the required review, run the native fixture:
+
+```sh
+go test -mod=readonly -tags=codex_integration ./codex -run '^TestNativeProviderFork0172$' -count=1 -timeout=180s -v
+```
+
+The fixture reuses private user, network, mount and PID namespaces, a private
+`/etc`, synthetic homes and an allowlisted child environment. Only loopback is
+enabled. Its native context has a 150-second deadline, individual RPCs and turns
+have 20 seconds, and startup has 10 seconds. Cleanup joins native process owners
+and reaps the namespace within the existing stop bound. Test output records
+phases, settings, thread IDs, request counts and process-join evidence; private
+synthetic request captures remain at the printed path. Pure assertion controls
+test the fixture's validation, not native semantics. This fixture does not cover
+queue, tool or goal transfer, terminal reattachment, downgrade or portal recovery.
+
 ## Web citations
 
 Assistant transcript entries can include `citations` and `citationsPending`.
