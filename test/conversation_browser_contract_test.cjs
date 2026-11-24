@@ -1654,6 +1654,43 @@ class MemoryStorage {
     dispose();
   }
 
+  // Drive the actual mount's independent collection/transcript and POST paths.
+  for (const order of ["collection-first", "transcript-first", "post-first", "post-last"]) {
+    const root=new FakeElement("main"), storage=new MemoryStorage(), id="44444444-4444-4444-8444-444444444444";
+    const selection="a".repeat(64), scope="observed-scope", user={kind:"userMessage",itemId:"native-user",turnId:"native-user",clientUserMessageId:id,text:"observed input"};
+    let rows=order.startsWith("post")?[]:[{version:1,scope,selection,clientUserMessageId:id,state:"sent",receipt:{clientUserMessageId:id,turnId:"native-user"},message:user.text,delivery:"steer",sequence:1,createdAtMs:1,updatedAtMs:1}];
+    let page={threadId:"observed-native",status:"idle",model:"model-b",reasoningEffort:"xhigh",entries:order.startsWith("post")?[]:[user]};
+    let releaseTranscript, releaseCollection, releasePost, events, calls=0, reads=0;
+    class ObservedEvents {constructor(){events=this;}addEventListener(){}close(){}}
+    const snapshot=()=>({...page,entries:[...page.entries]});
+    const metadata=()=>({version:1,scope,selection,canEnqueue:true,deliveryModes:["steer"],settings:{model:"model-b",reasoningEffort:"xhigh"},entries:rows});
+    const client={...mountedClient,
+      async thread(){reads++;if(order==="collection-first"&&reads===1)return new Promise(resolve=>{releaseTranscript=()=>resolve(snapshot())});return snapshot()},
+      async deliveries(){if(order==="transcript-first"&&!releaseCollection)return new Promise(resolve=>{releaseCollection=()=>resolve(metadata())});return metadata()},
+      async admitDelivery(input){calls++;if(order==="post-last")await new Promise(resolve=>{releasePost=resolve});return rows=[{...input,scope,state:"sent",receipt:{clientUserMessageId:id,turnId:"native-user"},sequence:1,createdAtMs:1,updatedAtMs:1}],rows[0]},
+      async acknowledgeMessages(){return {acknowledgedClientUserMessageIds:[]}},
+    };
+    const dispose=mountConversation(root,{id:"observed",basePath:"/codex",client,storage,EventSource:ObservedEvents,randomUUID:()=>id,refreshPolicy:{eventDebounceMs:0},
+      capabilities:{pending:false,queueRead:false,send:true,queue:false,settings:false,interrupt:false,respond:false,eventStream:true,durableDelivery:true}});
+    const settle=()=>new Promise(resolve=>setTimeout(resolve,5)),cards=()=>root.descendants().filter(node=>node.className==="codex-delivery-row");
+    try{
+      await settle();
+      if(order==="collection-first"){assert.equal(cards().length,1);releaseTranscript();}
+      if(order==="transcript-first"){assert.equal(cards().length,0);releaseCollection();}
+      if(order.startsWith("post")){
+        const textarea=root.descendants().find(node=>node.attributes["aria-label"]==="Message");textarea.value=user.text;
+        const form=root.descendants().find(node=>node.attributes.class==="codex-conversation-form");
+        const sending=form.listeners.get("submit")({preventDefault(){}});await settle();
+        if(order==="post-last"){page={...page,entries:[user]};events.onmessage();await settle();releasePost();}
+        await sending;
+        if(order==="post-first"){assert.equal(cards().length,1);page={...page,entries:[user]};events.onmessage();}
+      }
+      await settle();assert.equal(cards().length,0,order);assert.equal(rows.length,1,"collection retains sent row");assert.equal(calls,order.startsWith("post")?1:0);
+      events.onmessage();await settle();assert.equal(cards().length,0,"same successful status stays retired");
+      page={...page,threadId:"replacement-native"};events.onmessage();await settle();assert.equal(cards().length,1,"thread rebind restores raw status and fences retirement");
+    }finally{dispose()}
+  }
+
   assert.throws(() => mountConversation(new FakeElement("main"), {
     id: "opaque", client: mountedClient, basePath: "/codex", EventSource: null,
   }), /Durable browser storage is unavailable/);

@@ -8,8 +8,8 @@ import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {mountRetryControls} from "./retry.js?v=1";
 export {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
 import {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
-import {createDeliverySender, mountDeliveryStatuses, deliveryStatusPresentation, validateDeliveryCollection} from "./deliveries.js?v=2";
-export {mountDeliveryStatuses, validateDeliveryStatus, validateDeliveryCollection, deliveryStatusPresentation} from "./deliveries.js?v=2";
+import {createDeliverySender, mountDeliveryStatuses, deliveryStatusPresentation, validateDeliveryCollection} from "./deliveries.js?v=3";
+export {mountDeliveryStatuses, validateDeliveryStatus, validateDeliveryCollection, deliveryStatusPresentation} from "./deliveries.js?v=3";
 export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
 export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=2";
 import {createAsyncQuestions, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
@@ -1090,6 +1090,7 @@ export function mountConversation(root, options) {
     deliveryView = mountDeliveryStatuses(panel, {client,
       onMetadata: value => {
         deliveryMetadata = value;
+        if (value) observeDeliveryTranscript();
         if (value?.canEnqueue && !deliveryBaseline) deliveryBaseline = {scope:value.scope,selection:value.selection};
         if (!value || durableDeliverySender) return;
         let storage; try { storage = options?.storage || globalThis.localStorage; } catch (_) {}
@@ -1409,6 +1410,12 @@ export function mountConversation(root, options) {
       }
     }).catch(error => { status.textContent = error.message; });
   };
+  const observeDeliveryTranscript = () => {
+    if (!destroyed && !paused && !abort.signal.aborted && typeof currentThread?.threadId === "string" &&
+        currentThread.threadId && currentThread.threadId === history.threadId) {
+      deliveryView?.observeTranscript(history.entries, deliveryMetadata?.scope, currentThread.threadId);
+    }
+  };
   const renderThread = (page, isCurrent = () => true, kind = "newest") => {
     if (!isCurrent()) return;
     const update = kind === "older" ? history.applyOlder(page) :
@@ -1444,6 +1451,7 @@ export function mountConversation(root, options) {
         /^[0-9a-f]{64}$/.test(entry.clientUserMessageDigest || ""))) {
       confirmSubmission(submissionFailure.action, {id: submissionFailure.attemptId}, page.threadId);
     }
+    observeDeliveryTranscript();
     acknowledgeRetained(page.threadId);
     renderHistoryControls();
     scheduleHistoryRepair();

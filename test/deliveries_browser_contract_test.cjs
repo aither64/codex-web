@@ -159,3 +159,44 @@ test("wrong scope and destroyed views never expose late results",async()=>{
   client.deliveries=()=>new Promise(resolve=>{release=resolve});const pending=view.refresh();await turn();view.destroy();release(collection([delivery()]));await pending;
   assert.equal(view.present(delivery()),false);assert.equal(root.hidden,true);
 });
+
+test("only exact applied user identities retire sent rows without changing metadata or requests",async()=>{
+  const {mountDeliveryStatuses}=await import("../conversation/assets/deliveries.js");
+  const root=mountedRoot();let entries=[delivery("sent"),delivery("unknown",2)],metadata,reads=0,current=true;
+  const view=mountDeliveryStatuses(root,{client:{deliveries:async()=>{reads++;return collection(entries)}},isCurrent:()=>current,onMetadata:value=>{metadata=value},interval:60000});
+  const user={kind:"userMessage",clientUserMessageId:entries[0].clientUserMessageId,turnId:"turn",text:entries[0].message};
+  try {
+    await view.refresh();const unknown=root.children[1],check=unknown.children[2];check.focus();
+    for(const [row,scope] of [[user,"foreign"],[user,undefined],[{...user,kind:"agentMessage"},"one"],[{...user,clientUserMessageId:"f".repeat(32)},"one"],[{...user,turnId:"other"},"one"],[{...user,clientUserMessageId:""},"one"],[{...user,turnId:""},"one"]]){
+      view.observeTranscript([row],scope,"native");assert.equal(root.children[0].dataset.clientUserMessageId,user.clientUserMessageId);
+    }
+    current=false;view.observeTranscript([user],"one","native");assert.equal(root.children.length,3);current=true;
+    view.observeTranscript([user],"one","native");assert.equal(root.children[0],unknown);assert.equal(root.ownerDocument.activeElement,check);
+    assert.equal(reads,1);assert.equal(metadata.entries.length,2);assert.equal(metadata.entries[0],entries[0]);
+    await view.refresh();assert.equal(root.children[0],unknown);assert.equal(metadata.entries.length,2);
+    view.present({...delivery("sent"),receipt:{...delivery("sent").receipt,turnId:"changed"}});assert.equal(root.children[0].children[1].textContent,"Accepted");
+    for(const state of ["queued","dispatching","pending","not_sent","unknown"]){view.present(delivery(state));assert.equal(root.children[0].dataset.deliveryState,state)}
+    view.present({...delivery("unknown"),retired:true});assert.equal(root.children[0].dataset.deliveryState,"unknown");
+    view.present(delivery("sent"));assert.equal(root.children[0],unknown);
+    view.observeTranscript([],"one","native");assert.equal(root.children[0],unknown,"same-thread history reset retains observed tuple");
+    entries=[delivery("sent")];await view.refresh();assert.equal(root.hidden,true);
+    view.destroy();assert.equal(view.observeTranscript([user],"one","native"),false);
+  }finally{view.destroy()}
+});
+
+test("thread rebinding clears and fences observation while failed reads retain exact positive observation",async()=>{
+  const {mountDeliveryStatuses}=await import("../conversation/assets/deliveries.js");
+  const root=mountedRoot();let fail=false,metadata;
+  const view=mountDeliveryStatuses(root,{client:{deliveries:async()=>{if(fail)throw Error("offline");return collection([delivery("sent")])}},onMetadata:value=>{metadata=value},interval:60000});
+  const user={kind:"userMessage",clientUserMessageId:delivery().clientUserMessageId,turnId:"turn"};
+  try{
+    assert.equal(view.observeTranscript([user],"one","native"),false,"collection scope must be established first");
+    await view.refresh();view.observeTranscript([user],"one","native");assert.equal(root.hidden,true);
+    fail=true;await view.refresh();assert.equal(root.hidden,false);assert.equal(root.children.length,1);assert.equal(root.children[0].hidden,false);assert.equal(metadata,null);
+    fail=false;await view.refresh();assert.equal(root.hidden,true);
+    view.observeTranscript([user],"foreign","other");assert.equal(root.hidden,true,"foreign scope cannot rebind");
+    assert.equal(view.observeTranscript([user],"one","other"),false);assert.equal(root.hidden,false);assert.equal(root.children[0].dataset.deliveryState,"sent");
+    assert.equal(view.observeTranscript([user],"one","native"),false);assert.equal(root.children[0].dataset.deliveryState,"sent");
+    await view.refresh();assert.equal(root.children[0].dataset.deliveryState,"sent");
+  }finally{view.destroy()}
+});

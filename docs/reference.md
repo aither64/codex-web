@@ -1262,6 +1262,19 @@ and show it immediately, then `refresh()` to read the authoritative collection.
 An older in-flight read cannot overwrite the presented result. `destroy()` prevents
 late reads from updating the view. Accepted means the runtime confirmed the input;
 a response may still be pending.
+
+The view can retire a successful status after its original input appears in an
+already applied transcript. Pass only entries from a current, successful page for
+the mounted scope and thread. Retirement requires the same original message ID
+and turn ID. It changes the view only; collection metadata, stored receipts and
+sending behavior are unchanged. Observations last for the mounted view and are
+cleared when it is destroyed.
+
+Call `observeTranscript(entries, scope, threadId)` with the current applied entries;
+matching entries have `kind: "userMessage"`, `clientUserMessageId` and `turnId`.
+The first observed thread is pinned. A different thread clears observations and
+disables retirement until a new view is mounted.
+
 `mountConversation` opts in with `capabilities.durableDelivery: true`, preserving
 legacy pending attempts on their original endpoint. It clears only an unchanged
 submitted draft after the server owns the input; later edits remain intact.

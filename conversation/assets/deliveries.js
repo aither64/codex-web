@@ -86,11 +86,16 @@ export function createDeliverySender({client, store, scope, randomUUID = () => g
 // Shared status view; all writes use text nodes. Reads never drive native work.
 export function mountDeliveryStatuses(root, {client, onMetadata, onCopy, isCurrent = () => true, interval = 2000}) {
   let stopped = false, active = null, timer = null, scope = null, generation = 0, dirty = false;
-  const document = root.ownerDocument, rows = new Map();
+  const document = root.ownerDocument, rows = new Map(), observed = new Set();
+  let retainedEntries = [], transcriptBinding = null, retirementDisabled = false;
   const feedback = document.createElement("small");
   feedback.className = "codex-delivery-feedback"; feedback.hidden = true;
   root.hidden = true;
-  const render = entries => {
+  const observedKey = (id, turn) => JSON.stringify([id, turn]);
+  const render = values => {
+    retainedEntries = values;
+    const entries = values.filter(entry => retirementDisabled || entry.state !== "sent" ||
+      !observed.has(observedKey(entry.clientUserMessageId, entry.receipt.turnId)));
     const ids = new Set(entries.map(entry => entry.clientUserMessageId));
     for (const [id, row] of rows) if (!ids.has(id)) { row.card.remove(); rows.delete(id); }
     entries.forEach((entry, index) => {
@@ -124,7 +129,7 @@ export function mountDeliveryStatuses(root, {client, onMetadata, onCopy, isCurre
       if (root.children[index] !== row.card) root.insertBefore(row.card, root.children[index] || null);
     });
     if (feedback.parentElement !== root) root.append(feedback);
-    root.hidden = !entries.length;
+    root.hidden = !entries.length && feedback.hidden;
   };
   const refresh = () => {
     if (stopped || !isCurrent() || document.hidden) return Promise.resolve(null);
@@ -138,7 +143,7 @@ export function mountDeliveryStatuses(root, {client, onMetadata, onCopy, isCurre
       onMetadata?.(collection); render(collection.entries); return collection;
     }).catch(error => {
       if (!stopped && isCurrent() && readGeneration === generation) {
-        onMetadata?.(null, error); feedback.textContent = "Could not refresh delivery status."; feedback.hidden = false;
+        onMetadata?.(null, error); feedback.textContent = "Could not refresh delivery status."; feedback.hidden = false; root.hidden = false;
       }
       return null;
     }).then(result => {
@@ -156,12 +161,28 @@ export function mountDeliveryStatuses(root, {client, onMetadata, onCopy, isCurre
     if (!scope) throw new Error("Delivery scope is unavailable");
     const entry = validateDeliveryStatus(value, scope);
     generation++; if (active) dirty = true;
-    const entries = [...rows.values()].map(row => row.entry), index = entries.findIndex(row => row.clientUserMessageId === entry.clientUserMessageId);
+    const entries = [...retainedEntries], index = entries.findIndex(row => row.clientUserMessageId === entry.clientUserMessageId);
     if (index < 0) entries.push(entry); else entries[index] = entry;
     feedback.hidden = true; render(entries); return true;
+  };
+  const observeTranscript = (entries, currentScope, threadId) => {
+    if (stopped || !isCurrent() || !scope || currentScope !== scope || !Array.isArray(entries) ||
+        typeof threadId !== "string" || !threadId || retirementDisabled) return false;
+    if (transcriptBinding && transcriptBinding !== threadId) {
+      observed.clear(); retirementDisabled = true; render(retainedEntries); return false;
+    }
+    transcriptBinding = threadId;
+    for (const entry of entries) {
+      if (entry?.kind === "userMessage" && typeof entry.clientUserMessageId === "string" &&
+          entry.clientUserMessageId && typeof entry.turnId === "string" && entry.turnId) {
+        observed.add(observedKey(entry.clientUserMessageId, entry.turnId));
+      }
+    }
+    render(retainedEntries);
+    return true;
   };
   const visible = () => { if (!document.hidden) void refresh(); };
   document.addEventListener?.("visibilitychange", visible);
   void refresh();
-  return {refresh, present, destroy() { stopped = true; clearTimeout(timer); document.removeEventListener?.("visibilitychange", visible); }};
+  return {refresh, present, observeTranscript, destroy() { stopped = true; observed.clear(); transcriptBinding = null; retainedEntries = []; clearTimeout(timer); document.removeEventListener?.("visibilitychange", visible); }};
 }
