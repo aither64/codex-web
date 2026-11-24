@@ -25,8 +25,8 @@ export function validateDeliveryCollection(value, scope = value?.scope) {
 }
 
 export function deliveryStatusPresentation(entry) {
-  const label = {queued: "Queued", dispatching: "Sending…", pending: "Queued", sent: "Sent", not_sent: "Not sent", unknown: "Outcome unknown"}[entry.state];
-  return {label: label || "Outcome unknown", description: entry.failure || (entry.state === "unknown" ?
+  const label = {queued: "Queued", dispatching: "Sending", pending: "Awaiting acceptance", sent: "Accepted", not_sent: "Not sent", unknown: "Unconfirmed"}[entry.state];
+  return {label: label || "Unconfirmed", description: entry.failure || (entry.state === "sent" ? "The runtime confirmed this input. A response may still be pending." : entry.state === "unknown" ?
     "Check delivery to confirm whether this message was sent." : entry.state === "not_sent" ? "Copy this message to the draft, then send it as a new message." : "")};
 }
 
@@ -85,45 +85,83 @@ export function createDeliverySender({client, store, scope, randomUUID = () => g
 
 // Shared status view; all writes use text nodes. Reads never drive native work.
 export function mountDeliveryStatuses(root, {client, onMetadata, onCopy, isCurrent = () => true, interval = 2000}) {
-  let stopped = false, active = null, timer = null, scope = null;
-  const document = root.ownerDocument;
-  const render = collection => {
-    const nodes = collection.entries.map(entry => {
-      const card = document.createElement("article");
-      const text = document.createElement("p"), status = document.createElement("p");
+  let stopped = false, active = null, timer = null, scope = null, generation = 0, dirty = false;
+  const document = root.ownerDocument, rows = new Map();
+  const feedback = document.createElement("small");
+  feedback.className = "codex-delivery-feedback"; feedback.hidden = true;
+  root.hidden = true;
+  const render = entries => {
+    const ids = new Set(entries.map(entry => entry.clientUserMessageId));
+    for (const [id, row] of rows) if (!ids.has(id)) { row.card.remove(); rows.delete(id); }
+    entries.forEach((entry, index) => {
+      let row = rows.get(entry.clientUserMessageId);
+      if (!row) {
+        const card = document.createElement("article"), text = document.createElement("span"), status = document.createElement("small");
+        card.className = "codex-delivery-row"; text.className = "codex-delivery-message"; status.className = "codex-delivery-state";
+        card.dataset.clientUserMessageId = entry.clientUserMessageId;
+        status.setAttribute("role", "status"); status.setAttribute("aria-live", "polite"); status.setAttribute("aria-atomic", "true");
+        card.append(text, status); row = {card, text, status, action: null, entry}; rows.set(entry.clientUserMessageId, row);
+      }
+      row.entry = entry;
       const presentation = deliveryStatusPresentation(entry);
-      text.textContent = entry.message;
-      status.textContent = [presentation.label, presentation.description].filter(Boolean).join(". ");
-      card.dataset.clientUserMessageId = entry.clientUserMessageId;
-      card.append(text, status);
-      if (entry.state === "unknown") {
-        const check = document.createElement("button"); check.type = "button"; check.textContent = "Check delivery";
-        check.addEventListener("click", () => void refresh()); card.append(check);
+      row.card.dataset.deliveryState = entry.state;
+      if (row.text.textContent !== entry.message) row.text.textContent = entry.message;
+      if (row.status.textContent !== presentation.label) row.status.textContent = presentation.label;
+      if (row.description !== presentation.description) { row.status.title = presentation.description; row.description = presentation.description; }
+      const announcement = [presentation.label, presentation.description].filter(Boolean).join(". ");
+      if (row.announcement !== announcement) { row.status.setAttribute("aria-label", announcement); row.announcement = announcement; }
+      const action = entry.state === "unknown" ? "check" : entry.state === "not_sent" && onCopy ? "copy" : null;
+      if (action !== row.actionKind) {
+        row.action?.remove(); row.action = null; row.actionKind = action;
+        if (action) {
+          row.action = document.createElement("button"); row.action.type = "button";
+          row.action.textContent = action === "check" ? "Check delivery" : "Copy to draft";
+          row.action.addEventListener("click", () => action === "check" ? void refresh() : onCopy(row.entry));
+          row.card.append(row.action);
+        }
       }
-      if (entry.state === "not_sent" && onCopy) {
-        const copy = document.createElement("button"); copy.type = "button"; copy.textContent = "Copy to draft";
-        copy.addEventListener("click", () => onCopy(entry)); card.append(copy);
-      }
-      return card;
+      // Keep surviving action nodes mounted so ordinary polling preserves focus.
+      if (root.children[index] !== row.card) root.insertBefore(row.card, root.children[index] || null);
     });
-    root.replaceChildren(...nodes);
+    if (feedback.parentElement !== root) root.append(feedback);
+    root.hidden = !entries.length;
   };
   const refresh = () => {
     if (stopped || !isCurrent() || document.hidden) return Promise.resolve(null);
     if (active) return active;
     clearTimeout(timer);
+    const readGeneration = generation;
     active = Promise.resolve().then(() => client.deliveries()).then(value => {
       const collection = validateDeliveryCollection(value, scope || value.scope);
-      if (stopped || !isCurrent()) return null;
-      scope = collection.scope; onMetadata?.(collection); render(collection); return collection;
+      if (stopped || !isCurrent() || readGeneration !== generation) return null;
+      scope = collection.scope; feedback.hidden = true;
+      onMetadata?.(collection); render(collection.entries); return collection;
     }).catch(error => {
-      if (!stopped && isCurrent()) { onMetadata?.(null, error); root.setAttribute("aria-label", error.message); }
+      if (!stopped && isCurrent() && readGeneration === generation) {
+        onMetadata?.(null, error); feedback.textContent = "Could not refresh delivery status."; feedback.hidden = false;
+      }
       return null;
-    }).finally(() => { active = null; if (!stopped) timer = setTimeout(refresh, interval); });
+    }).then(result => {
+      active = null;
+      // A POST invalidates a read already in flight. Join exactly one fresh
+      // follow-up through this same read path; later collections stay authoritative.
+      if (!stopped && dirty) { dirty = false; return refresh(); }
+      if (!stopped) timer = setTimeout(refresh, interval);
+      return result;
+    });
     return active;
+  };
+  const present = value => {
+    if (stopped || !isCurrent()) return false;
+    if (!scope) throw new Error("Delivery scope is unavailable");
+    const entry = validateDeliveryStatus(value, scope);
+    generation++; if (active) dirty = true;
+    const entries = [...rows.values()].map(row => row.entry), index = entries.findIndex(row => row.clientUserMessageId === entry.clientUserMessageId);
+    if (index < 0) entries.push(entry); else entries[index] = entry;
+    feedback.hidden = true; render(entries); return true;
   };
   const visible = () => { if (!document.hidden) void refresh(); };
   document.addEventListener?.("visibilitychange", visible);
   void refresh();
-  return {refresh, destroy() { stopped = true; clearTimeout(timer); document.removeEventListener?.("visibilitychange", visible); }};
+  return {refresh, present, destroy() { stopped = true; clearTimeout(timer); document.removeEventListener?.("visibilitychange", visible); }};
 }

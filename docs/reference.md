@@ -1256,7 +1256,12 @@ unchanged. Reload the page, or complete an explicit settings/mode save followed 
 a fresh same-scope confirmation, to use a new selection. Failed or late reads
 cannot confirm it. Saved original requests retain their existing recovery path.
 
-`mountDeliveryStatuses` renders typed statuses and status/copy actions.
+`mountDeliveryStatuses` displays each message with its delivery status and available
+actions. Call `present(status)` to validate a POST result against the mounted scope
+and show it immediately, then `refresh()` to read the authoritative collection.
+An older in-flight read cannot overwrite the presented result. `destroy()` prevents
+late reads from updating the view. Accepted means the runtime confirmed the input;
+a response may still be pending.
 `mountConversation` opts in with `capabilities.durableDelivery: true`, preserving
 legacy pending attempts on their original endpoint. It clears only an unchanged
 submitted draft after the server owns the input; later edits remain intact.

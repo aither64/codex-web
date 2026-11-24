@@ -97,3 +97,65 @@ test("only a complete matching durable negative proof releases the original admi
   await sender.send("draft",[],{selection:"b".repeat(64),delivery:"steer"});
   assert.notEqual(requests[3].clientUserMessageId,requests[0].clientUserMessageId);
 });
+
+// Minimal mounted DOM, including node identity/focus and live text writes.
+function mountedRoot() {
+  const document = new EventTarget(); document.hidden = false; document.activeElement = null;
+  class Node {
+    constructor(tag) { this.tagName=tag; this.children=[]; this.dataset={}; this.ownerDocument=document; this.listeners={}; this.writes=0; this._text=""; }
+    set textContent(value) { this._text=value; this.writes++; }
+    get textContent() { return this._text; }
+    setAttribute(key,value) { (this.attributes ||= {})[key]=value; }
+    append(...nodes) { nodes.forEach(node=>this.insertBefore(node,null)); }
+    insertBefore(node,before) { node.remove(); const i=this.children.indexOf(before); this.children.splice(i<0?this.children.length:i,0,node); node.parentElement=this; }
+    remove() { if(this.parentElement){const list=this.parentElement.children;list.splice(list.indexOf(this),1);this.parentElement=null;} }
+    focus() { document.activeElement=this; }
+    addEventListener(type,fn) { this.listeners[type]=fn; }
+  }
+  document.createElement=tag=>new Node(tag);
+  return new Node("section");
+}
+const turn=()=>new Promise(resolve=>setImmediate(resolve));
+const delivery=(state="queued",n=1)=>({version:1,scope:"one",selection:"a".repeat(64),clientUserMessageId:n.toString(16).padStart(32,"0"),state,message:"literal <b>input</b>\ncomplete",delivery:"steer",sequence:n,createdAtMs:1,updatedAtMs:1,...(state==="sent"?{receipt:{turnId:"turn",clientUserMessageId:n.toString(16).padStart(32,"0")}}:{})});
+const collection=entries=>({version:1,scope:"one",selection:"a".repeat(64),canEnqueue:true,deliveryModes:["steer"],entries});
+
+test("mounted delivery rows keep identity, focus and status-only announcements",async()=>{
+  const {mountDeliveryStatuses}=await import("../conversation/assets/deliveries.js");
+  const root=mountedRoot(); let entries=[delivery("unknown"),delivery("not_sent",2)],reads=0,copied;
+  const view=mountDeliveryStatuses(root,{client:{deliveries:async()=>{reads++;return collection(entries)}},onCopy:value=>{copied=value},interval:60000});
+  try {
+    await view.refresh();const row=root.children[0],status=row.children[1],check=row.children[2]; check.focus();const writes=status.writes;
+    await view.refresh();assert.equal(root.children[0],row);assert.equal(root.ownerDocument.activeElement,check);assert.equal(status.writes,writes);
+    assert.equal(row.children[0].textContent,entries[0].message);assert.equal(status.attributes.role,"status");assert.equal(row.attributes?.role,undefined);
+    assert.equal(status.textContent,"Unconfirmed");assert.match(status.title,/confirm/);
+    root.children[1].children[2].listeners.click();assert.equal(copied.clientUserMessageId,entries[1].clientUserMessageId);
+    check.listeners.click();await turn();assert.equal(reads,3);
+    view.present(delivery("sent"));assert.equal(root.children[0],row);assert.equal(status.textContent,"Accepted");
+    assert.equal(status.title,"The runtime confirmed this input. A response may still be pending.");assert.equal(row.children.length,2);
+    for(const [state,label] of Object.entries({queued:"Queued",dispatching:"Sending",pending:"Awaiting acceptance",not_sent:"Not sent",unknown:"Unconfirmed"})) {view.present(delivery(state));assert.equal(status.textContent,label)}
+    assert.throws(()=>view.present({...delivery(),scope:"foreign"}),/Invalid/);
+    assert.throws(()=>view.present({...delivery(),state:"sent"}),/Invalid/);
+    entries=[];await view.refresh();assert.equal(root.hidden,true);assert.equal(root.children.length,1); // Hidden feedback only, no blank card.
+  } finally {view.destroy()}
+});
+
+test("POST presentation survives an older GET and failed fresh follow-up",async()=>{
+  const {mountDeliveryStatuses}=await import("../conversation/assets/deliveries.js");
+  const root=mountedRoot();let release,reads=0,fail=false;
+  const view=mountDeliveryStatuses(root,{client:{deliveries:()=>{reads++;if(reads===1)return collection([]);if(reads===2)return new Promise(resolve=>{release=resolve});if(fail)throw Error("offline");return collection([delivery("sent")])}},interval:60000});
+  try {
+    await view.refresh();const old=view.refresh();await turn();view.present(delivery());const row=root.children[0];
+    fail=true;release(collection([]));await old;assert.equal(reads,3);assert.equal(root.children[0],row);assert.equal(row.children[1].textContent,"Queued");
+    assert.equal(root.children.at(-1).hidden,false);assert.match(root.children.at(-1).textContent,/Could not refresh/);
+    fail=false;await view.refresh();assert.equal(row.children[1].textContent,"Accepted");assert.equal(root.children.at(-1).hidden,true);
+  } finally {view.destroy()}
+});
+
+test("wrong scope and destroyed views never expose late results",async()=>{
+  const {mountDeliveryStatuses}=await import("../conversation/assets/deliveries.js");
+  const root=mountedRoot();let current=true,release;
+  const client={deliveries:async()=>collection([])};const view=mountDeliveryStatuses(root,{client,isCurrent:()=>current,interval:60000});
+  await view.refresh();current=false;assert.equal(view.present(delivery()),false);current=true;
+  client.deliveries=()=>new Promise(resolve=>{release=resolve});const pending=view.refresh();await turn();view.destroy();release(collection([delivery()]));await pending;
+  assert.equal(view.present(delivery()),false);assert.equal(root.hidden,true);
+});

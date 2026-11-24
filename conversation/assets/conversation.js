@@ -8,8 +8,8 @@ import {refreshPolicy, createRefreshNotice} from "./refresh.js?v=1";
 import {mountRetryControls} from "./retry.js?v=1";
 export {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
 import {createDeliveryRetryScheduler} from "./delivery_retry.js?v=1";
-import {createDeliverySender, mountDeliveryStatuses, deliveryStatusPresentation, validateDeliveryCollection} from "./deliveries.js?v=1";
-export {mountDeliveryStatuses, validateDeliveryStatus, validateDeliveryCollection, deliveryStatusPresentation} from "./deliveries.js?v=1";
+import {createDeliverySender, mountDeliveryStatuses, deliveryStatusPresentation, validateDeliveryCollection} from "./deliveries.js?v=2";
+export {mountDeliveryStatuses, validateDeliveryStatus, validateDeliveryCollection, deliveryStatusPresentation} from "./deliveries.js?v=2";
 export {mountRetryControls, retryStatusText} from "./retry.js?v=1";
 export {mountRetryActivity, retryActivityPresentation} from "./retry_activity.js?v=2";
 import {createAsyncQuestions, bindQuestionAnswerKeyboard} from "./questions.js?v=4";
@@ -1095,7 +1095,7 @@ export function mountConversation(root, options) {
         let storage; try { storage = options?.storage || globalThis.localStorage; } catch (_) {}
         durableDeliverySender = createDurableDeliverySender({...options, client, storage, scope: value.scope});
         if (!sender?.pending() && !sender?.pendingQueue() && durableDeliverySender.pending().length) {
-          void durableDeliverySender.recover().then(() => deliveryView.refresh()).catch(error => {
+          void durableDeliverySender.recover().then(statuses => { statuses.forEach(status => deliveryView.present(status)); return deliveryView.refresh(); }).catch(error => {
             if (!abort.signal.aborted) { submissionStatus.hidden = false; submissionStatus.textContent = error.message; }
           });
         }
@@ -1661,11 +1661,11 @@ export function mountConversation(root, options) {
     const delivery = requestedMode === undefined ? (metadata.deliveryModes.includes("") ? "" : metadata.deliveryModes.includes("steer") ? "steer" : null) : requestedMode;
     if (delivery === null || !metadata.deliveryModes.includes(delivery)) throw new Error("The selected delivery mode is unavailable.");
     const status = await durableDeliverySender.send(text, files, {selection: metadata.selection, delivery});
+    if (abort.signal.aborted) return;
     if (currentThread?.threadId === threadId && revision === deliveryDraftRevision && textarea.value === text && sameAttachments(uploads?.ids() || [], files)) {
       textarea.value = ""; uploads?.clear();
     }
-    const presentation = deliveryStatusPresentation(status);
-    submissionStatus.hidden = false; submissionStatus.textContent = [presentation.label, presentation.description].filter(Boolean).join(". ");
+    deliveryView.present(status);
     await deliveryView.refresh();
   };
 

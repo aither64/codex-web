@@ -218,3 +218,13 @@
   .codex-retry-activity-actions button { min-height: 2.5rem; }
   .codex-retry-activity-dismiss { width: 2.5rem; min-height: 2.5rem; }
 }
+
+/* Durable delivery receipts share one compact message/status row in all hosts. */
+.codex-delivery-statuses { display: grid; gap: .4rem; margin-block: .5rem; }
+.codex-delivery-statuses[hidden], .codex-delivery-feedback[hidden] { display: none; }
+.codex-delivery-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: .25rem .65rem; min-width: 0; padding: .4rem .65rem; border: 1px solid var(--line, color-mix(in srgb, currentColor 25%, transparent)); border-radius: .5rem; background: var(--panel, transparent); font-size: .8rem; }
+.codex-delivery-message { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.codex-delivery-state { flex: none; max-width: 100%; overflow-wrap: anywhere; color: var(--muted, currentColor); font-size: inherit; }
+.codex-delivery-row[data-delivery-state="sent"] .codex-delivery-state { color: var(--accent, currentColor); }
+.codex-delivery-row button { flex: none; max-width: 100%; margin: 0; padding: .15rem .4rem; font: inherit; }
+.codex-delivery-feedback { color: var(--muted, currentColor); font-size: .8rem; }

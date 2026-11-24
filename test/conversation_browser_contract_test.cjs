@@ -584,6 +584,7 @@ class MemoryStorage {
   class FakeElement {
     constructor(name) {
       this.name = name;
+      this.className = "";
       this.attributes = {};
       this.children = [];
       this.listeners = new Map();
@@ -1600,18 +1601,18 @@ class MemoryStorage {
 
   // Exercise the actual shared mount: durable statuses are not legacy receipts,
   // unsupported modes do not fall back, and edits during admission survive.
-  for (const [deliveryState, action, modes] of [["queued","send",["steer","followUp"]], ["not_sent","send",["steer","followUp"]], ["unknown","send",["steer","followUp"]], ["queued","followUp",["steer","followUp"]], ["queued","refuse",["followUp"]], ["queued","legacy",["steer","followUp"]], ["queued","changed",["steer","followUp"]], ["queued","mode",["steer","followUp"]], ["queued","scope",["steer","followUp"]], ["queued","poll",["steer","followUp"]]]) {
+  for (const [deliveryState, action, modes] of [["sent","send",["steer","followUp"]], ["queued","error",["steer","followUp"]], ["queued","destroy",["steer","followUp"]], ["queued","send",["steer","followUp"]], ["not_sent","send",["steer","followUp"]], ["unknown","send",["steer","followUp"]], ["queued","followUp",["steer","followUp"]], ["queued","refuse",["followUp"]], ["queued","legacy",["steer","followUp"]], ["queued","changed",["steer","followUp"]], ["queued","mode",["steer","followUp"]], ["queued","scope",["steer","followUp"]], ["queued","poll",["steer","followUp"]]]) {
     const storage = new MemoryStorage(), root = new FakeElement("main");
     const requests = [], selection = "a".repeat(64);
     let release, entered;
-    const legacyCalls=[]; let metadataReads = 0;
+    const legacyCalls=[]; let metadataReads = 0, admitted = null;
     const started = new Promise(resolve => { entered = resolve; });
     const client = {...mountedClient, async thread() { return {threadId:"durable",status:"idle",model:"model-b",reasoningEffort:"xhigh",...(action === "mode" ? {collaborationMode:"plan"} : {}),entries:[]}; },
-      async deliveries() { metadataReads++; return {version:1,scope: action === "scope" && metadataReads > 1 ? "other-scope" : "durable-scope",canEnqueue:true,selection: ["changed","poll"].includes(action) && metadataReads > 1 ? "b".repeat(64) : selection,deliveryModes:modes,settings:{model:"model-b",reasoningEffort:"xhigh",...(action === "mode" ? {collaborationMode:metadataReads > 1 ? "default" : "plan"} : {})},entries:action === "poll" ? [{version:1,scope:"durable-scope",selection,clientUserMessageId:"33333333-3333-4333-8333-333333333333",state:"unknown",message:"older",delivery:"steer",sequence:1,createdAtMs:1,updatedAtMs:1}] : []}; },
+      async deliveries() { metadataReads++; return {version:1,scope: action === "scope" && metadataReads > 1 ? "other-scope" : "durable-scope",canEnqueue:true,selection: ["changed","poll"].includes(action) && metadataReads > 1 ? "b".repeat(64) : selection,deliveryModes:modes,settings:{model:"model-b",reasoningEffort:"xhigh",...(action === "mode" ? {collaborationMode:metadataReads > 1 ? "default" : "plan"} : {})},entries:action === "poll" ? [{version:1,scope:"durable-scope",selection,clientUserMessageId:"33333333-3333-4333-8333-333333333333",state:"unknown",message:"older",delivery:"steer",sequence:1,createdAtMs:1,updatedAtMs:1}] : admitted ? [admitted] : []}; },
       async message(message,id,retry) {legacyCalls.push({message,id,retry});return {clientUserMessageId:id,turnId:"legacy-turn",steered:false};},
       async acknowledgeMessages() {return {acknowledgedClientUserMessageIds:[]};},
       async admitDelivery(input) { requests.push(input); entered(); await new Promise(resolve => { release = resolve; });
-        return {...input,scope:"durable-scope",sequence:1,state:deliveryState,createdAtMs:1,updatedAtMs:1}; },
+        return admitted = {...input,scope:"durable-scope",sequence:1,state:deliveryState,createdAtMs:1,updatedAtMs:1,...(deliveryState==="sent"?{receipt:{turnId:"synthetic-turn",clientUserMessageId:input.clientUserMessageId}}:{})}; },
     };
     if (action === "legacy") {
       const {createDurableSender} = await import("../conversation/assets/conversation.js");
@@ -1637,11 +1638,19 @@ class MemoryStorage {
       dispose(); continue;
     }
     await started;
+    const noticeDuringSend=root.descendants().find(node=>node.attributes.class==="codex-submission-status");
+    if(action==="error"){noticeDuringSend.hidden=false;noticeDuringSend.textContent="Newer unrelated failure";}
+    if(action==="destroy")dispose();
     textarea.value="edited draft"; textarea.listeners.get("input")(); release(); await submitted;
+    if(action==="destroy"){assert.equal(root.descendants().some(node=>node.className==="codex-delivery-row"),false);continue;}
     assert.equal(textarea.value,"edited draft");
     assert.equal(requests[0].delivery,action === "followUp" ? "followUp" : "steer");
     const notice=root.descendants().find(node=>node.attributes.class==="codex-submission-status");
-    assert.equal(notice.textContent.startsWith({queued:"Queued",not_sent:"Not sent",unknown:"Outcome unknown"}[deliveryState]),true);
+    assert.equal(notice.hidden,action!=="error");
+    assert.equal(notice.textContent,action==="error"?"Newer unrelated failure":"");
+    const receiptRow = root.descendants().find(node => node.className === "codex-delivery-row");
+    assert.equal(receiptRow.children[0].textContent,"saved input");
+    assert.equal(receiptRow.children[1].textContent,{queued:"Queued",sent:"Accepted",not_sent:"Not sent",unknown:"Unconfirmed"}[deliveryState]);
     dispose();
   }
 
