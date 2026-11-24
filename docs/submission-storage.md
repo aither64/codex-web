@@ -11,6 +11,11 @@ database transactions. Applications acknowledge or retire accepted receipts;
 unresolved attempts are never removed by age. `ExportSubmissionAttempts` returns
 a consistent schema-3 snapshot of one thread, independently of the backend.
 
+Clients serialize first-connection WAL setup and schema initialization through a
+private `<database>.lock` file. The context-aware lock is released before
+predecessor-ledger migration locks, ordinary transactions or native requests.
+Open connections do not reacquire it for normal operations.
+
 ## Delivery boundaries
 
 A send reserves its exact text digest, action context and options before

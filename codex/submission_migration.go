@@ -113,20 +113,20 @@ func lockSubmissionPredecessors(ctx context.Context, paths []string) (func(), er
 }
 
 func initializeSubmissionDatabase(ctx context.Context, store *submissionDatabase, primary, legacy, database string) error {
-	if primary == database || legacy == database {
+	if primary == database || legacy == database || primary == database+".lock" || legacy == database+".lock" {
 		return errors.New("submission database must differ from predecessor paths")
 	}
-	var version int
-	if err := store.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+	// A new connection runs its WAL PRAGMAs before any SQL transaction. Serialize
+	// that first open and schema bootstrap across clients, including an empty DB.
+	// Release this lock before acquiring predecessor locks for migration below.
+	releaseInitialization, err := lockSubmissionPredecessors(ctx, []string{database})
+	if err != nil {
 		return err
 	}
-	if version != 0 && version != 1 {
-		return fmt.Errorf("unsupported submission database schema %d", version)
-	}
-	if version == 0 {
-		if err := createSubmissionSchema(ctx, store.db); err != nil {
-			return err
-		}
+	err = initializeSubmissionSchema(ctx, store.db)
+	releaseInitialization()
+	if err != nil {
+		return err
 	}
 	phase, err := submissionMetadata(ctx, store.db, "migration_phase")
 	if err != nil {
@@ -135,6 +135,26 @@ func initializeSubmissionDatabase(ctx context.Context, store *submissionDatabase
 	if phase == "ready" {
 		return verifySubmissionFences(ctx, store.db, database, primary, legacy)
 	}
+	return migrateSubmissionDatabase(ctx, store, primary, legacy, database)
+}
+
+func initializeSubmissionSchema(ctx context.Context, db *sql.DB) error {
+	var version int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return fmt.Errorf("open submission database: %w", err)
+	}
+	if version != 0 && version != 1 {
+		return fmt.Errorf("unsupported submission database schema %d", version)
+	}
+	if version == 0 {
+		if err := createSubmissionSchema(ctx, db); err != nil {
+			return fmt.Errorf("initialize submission schema: %w", err)
+		}
+	}
+	return nil
+}
+
+func migrateSubmissionDatabase(ctx context.Context, store *submissionDatabase, primary, legacy, database string) error {
 	paths := []string{primary}
 	if legacy != "" && legacy != primary {
 		paths = append(paths, legacy)
@@ -144,7 +164,7 @@ func initializeSubmissionDatabase(ctx context.Context, store *submissionDatabase
 		return err
 	}
 	defer release()
-	phase, err = submissionMetadata(ctx, store.db, "migration_phase")
+	phase, err := submissionMetadata(ctx, store.db, "migration_phase")
 	if err != nil {
 		return err
 	}
