@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -11,13 +12,17 @@ import (
 )
 
 type deliveryFixture struct {
-	status   backend.DeliveryStatus
-	requests []backend.DeliveryRequest
-	err      error
-	entries  []backend.DeliveryStatus
+	status     backend.DeliveryStatus
+	requests   []backend.DeliveryRequest
+	err        error
+	entries    []backend.DeliveryStatus
+	collection *backend.DeliveryCollection
 }
 
 func (f *deliveryFixture) Deliveries(context.Context, backend.Identity) (backend.DeliveryCollection, error) {
+	if f.collection != nil {
+		return *f.collection, f.err
+	}
 	entries := f.entries
 	if entries == nil {
 		entries = []backend.DeliveryStatus{f.status}
@@ -128,5 +133,92 @@ func TestDurableDeliveryValidationAndSafeErrors(t *testing.T) {
 	f.err = &backend.DeliveryError{Code: "delivery_selection_changed"}
 	if w := callNeutral(h, "GET", "deliveries", ""); w.Code != 409 || !strings.Contains(w.Body.String(), "delivery_selection_changed") {
 		t.Fatal(w.Code, w.Body.String())
+	}
+}
+
+func TestDurableDeliveryCollectionOmitsSentOnlyAfterFullValidation(t *testing.T) {
+	h, b, target, _ := neutralFixture(t)
+	base := backend.DeliveryStatus{Version: 1, Scope: target.Identity.ScopeKey, Selection: strings.Repeat("a", 64), ClientUserMessageID: attempt, Sequence: 1, State: "sent", Message: "original", Delivery: "steer", CreatedAtMS: 1, UpdatedAtMS: 1, Receipt: &backend.SendReceipt{ClientUserMessageID: attempt, TurnID: "original-turn"}}
+	entries := []backend.DeliveryStatus{base}
+	for i, state := range []string{"queued", "dispatching", "pending", "not_sent", "unknown", "unknown"} {
+		row := base
+		row.ClientUserMessageID = fmt.Sprintf("%032x", i+1)
+		row.Sequence = uint64(i + 2)
+		row.State = state
+		row.Receipt = nil
+		row.Retired = i == 5
+		entries = append(entries, row)
+	}
+	original := backend.DeliveryCollection{Version: 1, Scope: base.Scope, Selection: base.Selection, CanEnqueue: true, DeliveryModes: []string{"steer", "followUp"}, Settings: backend.Settings{Model: "saved-model"}, Entries: entries}
+	f := &deliveryFixture{status: base, collection: &original}
+	target.Operations.Deliveries = f
+	target.Capabilities.DurableDelivery = true
+	before, _ := json.Marshal(original)
+	w := callNeutral(h, "GET", "deliveries", "")
+	var got backend.DeliveryCollection
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String(), err)
+	}
+	expected := original
+	expected.Entries = entries[1:]
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatal(got, expected)
+	}
+	after, _ := json.Marshal(original)
+	if string(before) != string(after) {
+		t.Fatal("provider collection mutated")
+	}
+	input, _ := json.Marshal(backend.DeliveryRequest{Version: 1, ClientUserMessageID: attempt, Message: base.Message, Delivery: base.Delivery, Selection: base.Selection})
+	for _, method := range []string{"GET", "POST", "POST"} {
+		route, body := "deliveries/"+attempt, ""
+		if method == "POST" {
+			route, body = "deliveries", string(input)
+		}
+		response := callNeutral(h, method, route, body)
+		var status backend.DeliveryStatus
+		if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil || !reflect.DeepEqual(status, base) {
+			t.Fatal(response.Code, response.Body.String(), err)
+		}
+	}
+	if len(b.sends) != 0 || len(f.requests) != 2 {
+		t.Fatal("status recovery used native send")
+	}
+	original.Entries = []backend.DeliveryStatus{base}
+	w = callNeutral(h, "GET", "deliveries", "")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"entries":[]`) {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	for _, name := range []string{"receipt", "duplicate", "scope", "count", "outstanding"} {
+		t.Run(name, func(t *testing.T) {
+			bad := original
+			bad.Entries = []backend.DeliveryStatus{base}
+			switch name {
+			case "receipt":
+				bad.Entries[0].Receipt = nil
+			case "duplicate":
+				bad.Entries = append(bad.Entries, base)
+			case "scope":
+				bad.Scope = "foreign"
+			case "count":
+				for i := 1; i < 121; i++ {
+					row := base
+					row.ClientUserMessageID = fmt.Sprintf("%032x", i)
+					bad.Entries = append(bad.Entries, row)
+				}
+			case "outstanding":
+				for i := 1; i < 22; i++ {
+					row := base
+					row.ClientUserMessageID = fmt.Sprintf("%032x", i)
+					row.State = "queued"
+					row.Receipt = nil
+					bad.Entries = append(bad.Entries, row)
+				}
+			}
+			f.collection = &bad
+			response := callNeutral(h, "GET", "deliveries", "")
+			if response.Code != 503 {
+				t.Fatal(response.Code, response.Body.String())
+			}
+		})
 	}
 }

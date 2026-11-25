@@ -86,16 +86,14 @@ export function createDeliverySender({client, store, scope, randomUUID = () => g
 // Shared status view; all writes use text nodes. Reads never drive native work.
 export function mountDeliveryStatuses(root, {client, onMetadata, onCopy, isCurrent = () => true, interval = 2000}) {
   let stopped = false, active = null, timer = null, scope = null, generation = 0, dirty = false;
-  const document = root.ownerDocument, rows = new Map(), observed = new Set();
-  let retainedEntries = [], transcriptBinding = null, retirementDisabled = false;
+  const document = root.ownerDocument, rows = new Map();
+  let retainedEntries = [];
   const feedback = document.createElement("small");
   feedback.className = "codex-delivery-feedback"; feedback.hidden = true;
   root.hidden = true;
-  const observedKey = (id, turn) => JSON.stringify([id, turn]);
   const render = values => {
     retainedEntries = values;
-    const entries = values.filter(entry => retirementDisabled || entry.state !== "sent" ||
-      !observed.has(observedKey(entry.clientUserMessageId, entry.receipt.turnId)));
+    const entries = values.filter(entry => entry.state !== "sent");
     const ids = new Set(entries.map(entry => entry.clientUserMessageId));
     for (const [id, row] of rows) if (!ids.has(id)) { row.card.remove(); rows.delete(id); }
     entries.forEach((entry, index) => {
@@ -165,24 +163,10 @@ export function mountDeliveryStatuses(root, {client, onMetadata, onCopy, isCurre
     if (index < 0) entries.push(entry); else entries[index] = entry;
     feedback.hidden = true; render(entries); return true;
   };
-  const observeTranscript = (entries, currentScope, threadId) => {
-    if (stopped || !isCurrent() || !scope || currentScope !== scope || !Array.isArray(entries) ||
-        typeof threadId !== "string" || !threadId || retirementDisabled) return false;
-    if (transcriptBinding && transcriptBinding !== threadId) {
-      observed.clear(); retirementDisabled = true; render(retainedEntries); return false;
-    }
-    transcriptBinding = threadId;
-    for (const entry of entries) {
-      if (entry?.kind === "userMessage" && typeof entry.clientUserMessageId === "string" &&
-          entry.clientUserMessageId && typeof entry.turnId === "string" && entry.turnId) {
-        observed.add(observedKey(entry.clientUserMessageId, entry.turnId));
-      }
-    }
-    render(retainedEntries);
-    return true;
-  };
+  // Compatibility with shipped consumers; successful statuses need no transcript observation.
+  const observeTranscript = () => false;
   const visible = () => { if (!document.hidden) void refresh(); };
   document.addEventListener?.("visibilitychange", visible);
   void refresh();
-  return {refresh, present, observeTranscript, destroy() { stopped = true; observed.clear(); transcriptBinding = null; retainedEntries = []; clearTimeout(timer); document.removeEventListener?.("visibilitychange", visible); }};
+  return {refresh, present, observeTranscript, destroy() { stopped = true; retainedEntries = []; clearTimeout(timer); document.removeEventListener?.("visibilitychange", visible); }};
 }

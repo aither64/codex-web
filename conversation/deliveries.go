@@ -82,6 +82,14 @@ func (h *Handler) deliveries(w http.ResponseWriter, r *http.Request, target Back
 			h.serverError(w, r, errors.New("invalid delivery collection"))
 			return
 		}
+		// Validate every provider row before selecting the outstanding status view.
+		entries := make([]backend.DeliveryStatus, 0, len(collection.Entries))
+		for _, entry := range collection.Entries {
+			if entry.State != "sent" {
+				entries = append(entries, entry)
+			}
+		}
+		collection.Entries = entries
 		writeJSON(w, http.StatusOK, collection)
 		return
 	}

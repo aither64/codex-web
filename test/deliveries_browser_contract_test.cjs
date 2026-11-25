@@ -130,9 +130,9 @@ test("mounted delivery rows keep identity, focus and status-only announcements",
     assert.equal(status.textContent,"Unconfirmed");assert.match(status.title,/confirm/);
     root.children[1].children[2].listeners.click();assert.equal(copied.clientUserMessageId,entries[1].clientUserMessageId);
     check.listeners.click();await turn();assert.equal(reads,3);
-    view.present(delivery("sent"));assert.equal(root.children[0],row);assert.equal(status.textContent,"Accepted");
-    assert.equal(status.title,"The runtime confirmed this input. A response may still be pending.");assert.equal(row.children.length,2);
-    for(const [state,label] of Object.entries({queued:"Queued",dispatching:"Sending",pending:"Awaiting acceptance",not_sent:"Not sent",unknown:"Unconfirmed"})) {view.present(delivery(state));assert.equal(status.textContent,label)}
+    view.present(delivery("sent"));assert.equal(row.parentElement,null);
+    view.present(delivery());const nextStatus=root.children[0].children[1];
+    for(const [state,label] of Object.entries({queued:"Queued",dispatching:"Sending",pending:"Awaiting acceptance",not_sent:"Not sent",unknown:"Unconfirmed"})) {view.present(delivery(state));assert.equal(nextStatus.textContent,label)}
     assert.throws(()=>view.present({...delivery(),scope:"foreign"}),/Invalid/);
     assert.throws(()=>view.present({...delivery(),state:"sent"}),/Invalid/);
     entries=[];await view.refresh();assert.equal(root.hidden,true);assert.equal(root.children.length,1); // Hidden feedback only, no blank card.
@@ -147,7 +147,7 @@ test("POST presentation survives an older GET and failed fresh follow-up",async(
     await view.refresh();const old=view.refresh();await turn();view.present(delivery());const row=root.children[0];
     fail=true;release(collection([]));await old;assert.equal(reads,3);assert.equal(root.children[0],row);assert.equal(row.children[1].textContent,"Queued");
     assert.equal(root.children.at(-1).hidden,false);assert.match(root.children.at(-1).textContent,/Could not refresh/);
-    fail=false;await view.refresh();assert.equal(row.children[1].textContent,"Accepted");assert.equal(root.children.at(-1).hidden,true);
+    fail=false;await view.refresh();assert.equal(row.parentElement,null);assert.equal(root.hidden,true);assert.equal(root.children.at(-1).hidden,true);
   } finally {view.destroy()}
 });
 
@@ -160,43 +160,30 @@ test("wrong scope and destroyed views never expose late results",async()=>{
   assert.equal(view.present(delivery()),false);assert.equal(root.hidden,true);
 });
 
-test("only exact applied user identities retire sent rows without changing metadata or requests",async()=>{
+test("successful statuses never need transcript memory and keep raw metadata and surviving actions",async()=>{
   const {mountDeliveryStatuses}=await import("../conversation/assets/deliveries.js");
-  const root=mountedRoot();let entries=[delivery("sent"),delivery("unknown",2)],metadata,reads=0,current=true;
-  const view=mountDeliveryStatuses(root,{client:{deliveries:async()=>{reads++;return collection(entries)}},isCurrent:()=>current,onMetadata:value=>{metadata=value},interval:60000});
-  const user={kind:"userMessage",clientUserMessageId:entries[0].clientUserMessageId,turnId:"turn",text:entries[0].message};
-  try {
-    await view.refresh();const unknown=root.children[1],check=unknown.children[2];check.focus();
-    for(const [row,scope] of [[user,"foreign"],[user,undefined],[{...user,kind:"agentMessage"},"one"],[{...user,clientUserMessageId:"f".repeat(32)},"one"],[{...user,turnId:"other"},"one"],[{...user,clientUserMessageId:""},"one"],[{...user,turnId:""},"one"]]){
-      view.observeTranscript([row],scope,"native");assert.equal(root.children[0].dataset.clientUserMessageId,user.clientUserMessageId);
-    }
-    current=false;view.observeTranscript([user],"one","native");assert.equal(root.children.length,3);current=true;
-    view.observeTranscript([user],"one","native");assert.equal(root.children[0],unknown);assert.equal(root.ownerDocument.activeElement,check);
-    assert.equal(reads,1);assert.equal(metadata.entries.length,2);assert.equal(metadata.entries[0],entries[0]);
-    await view.refresh();assert.equal(root.children[0],unknown);assert.equal(metadata.entries.length,2);
-    view.present({...delivery("sent"),receipt:{...delivery("sent").receipt,turnId:"changed"}});assert.equal(root.children[0].children[1].textContent,"Accepted");
-    for(const state of ["queued","dispatching","pending","not_sent","unknown"]){view.present(delivery(state));assert.equal(root.children[0].dataset.deliveryState,state)}
-    view.present({...delivery("unknown"),retired:true});assert.equal(root.children[0].dataset.deliveryState,"unknown");
-    view.present(delivery("sent"));assert.equal(root.children[0],unknown);
-    view.observeTranscript([],"one","native");assert.equal(root.children[0],unknown,"same-thread history reset retains observed tuple");
-    entries=[delivery("sent")];await view.refresh();assert.equal(root.hidden,true);
-    view.destroy();assert.equal(view.observeTranscript([user],"one","native"),false);
-  }finally{view.destroy()}
+  let entries=[delivery("sent"),delivery("sent",2),delivery("unknown",3),delivery("not_sent",4)],reads=0,fail=false,metadata;
+  for(let mount=0;mount<2;mount++){
+    const root=mountedRoot(),view=mountDeliveryStatuses(root,{client:{deliveries:async()=>{reads++;if(fail)throw Error("offline");return collection(entries)}},onMetadata:value=>{metadata=value},onCopy:()=>{},interval:60000});
+    try{
+      await view.refresh();assert.equal(root.children.length,3);assert.equal(metadata.entries,entries);assert.equal(metadata.entries.length,4);
+      const unknown=root.children[0],check=unknown.children[2];check.focus();const before=reads;
+      assert.equal(view.observeTranscript([],"one","thread"),false);assert.equal(view.observeTranscript([{kind:"userMessage"}],"foreign","other"),false);assert.equal(reads,before);
+      await view.refresh();assert.equal(root.children[0],unknown);assert.equal(root.ownerDocument.activeElement,check);
+      assert.throws(()=>view.present({...delivery("sent"),receipt:null}),/Invalid/);
+      fail=true;await view.refresh();assert.equal(metadata,null);assert.equal(root.children[0],unknown);assert.equal(root.children.at(-1).hidden,false);
+      fail=false;await view.refresh();assert.equal(root.children.at(-1).hidden,true);
+    }finally{view.destroy()}
+  }
 });
 
-test("thread rebinding clears and fences observation while failed reads retain exact positive observation",async()=>{
+test("sent POST removes a pending row despite an old GET and failed followup",async()=>{
   const {mountDeliveryStatuses}=await import("../conversation/assets/deliveries.js");
-  const root=mountedRoot();let fail=false,metadata;
-  const view=mountDeliveryStatuses(root,{client:{deliveries:async()=>{if(fail)throw Error("offline");return collection([delivery("sent")])}},onMetadata:value=>{metadata=value},interval:60000});
-  const user={kind:"userMessage",clientUserMessageId:delivery().clientUserMessageId,turnId:"turn"};
+  const root=mountedRoot();let release,reads=0;
+  const view=mountDeliveryStatuses(root,{client:{deliveries:()=>{reads++;if(reads===1)return collection([delivery("pending")]);if(reads===2)return new Promise(resolve=>{release=resolve});throw Error("offline")}},interval:60000});
   try{
-    assert.equal(view.observeTranscript([user],"one","native"),false,"collection scope must be established first");
-    await view.refresh();view.observeTranscript([user],"one","native");assert.equal(root.hidden,true);
-    fail=true;await view.refresh();assert.equal(root.hidden,false);assert.equal(root.children.length,1);assert.equal(root.children[0].hidden,false);assert.equal(metadata,null);
-    fail=false;await view.refresh();assert.equal(root.hidden,true);
-    view.observeTranscript([user],"foreign","other");assert.equal(root.hidden,true,"foreign scope cannot rebind");
-    assert.equal(view.observeTranscript([user],"one","other"),false);assert.equal(root.hidden,false);assert.equal(root.children[0].dataset.deliveryState,"sent");
-    assert.equal(view.observeTranscript([user],"one","native"),false);assert.equal(root.children[0].dataset.deliveryState,"sent");
-    await view.refresh();assert.equal(root.children[0].dataset.deliveryState,"sent");
+    await view.refresh();const old=view.refresh();await turn();view.present(delivery("sent"));assert.equal(root.hidden,true);
+    release(collection([delivery("pending")]));await old;assert.equal(reads,3);assert.equal(root.children.length,1);assert.equal(root.children[0].hidden,false);
+    view.present(delivery("queued",2));assert.equal(root.children[0].dataset.deliveryState,"queued");
   }finally{view.destroy()}
 });

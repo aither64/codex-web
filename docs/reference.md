@@ -1192,11 +1192,13 @@ remain unchanged. An unsupported inbox returns HTTP 501 with
 `durable_delivery_unavailable`; it cannot select another backend.
 
 `GET deliveries` returns a version-1 collection with opaque scope and selection,
-`canEnqueue`, supported `deliveryModes`, display settings and entries. Reading
-saved statuses can remain authorized when new admission is unavailable. The
-collection includes at most 20 outstanding entries and a combined window of 100
-recent terminal or retired entries. `GET deliveries/:clientUserMessageId` reads
-the status for an older ID.
+`canEnqueue`, supported `deliveryModes`, display settings and outstanding or
+actionable statuses. Reading saved statuses can remain authorized when new
+admission is unavailable. The handler validates the provider's complete collection,
+bounded to 20 outstanding entries and 100 recent terminal or retired entries,
+before omitting successful `sent` entries. `GET deliveries/:clientUserMessageId`
+still returns the original status and receipt, including for successful or older
+inputs. An absent collection entry does not authorize resending.
 
 `POST deliveries` accepts `{version: 1, clientUserMessageId, message,
 attachmentIds, delivery, selection}`. The application derives the selection
@@ -1208,7 +1210,7 @@ conflicts. IDs retain their exact lowercase UUID or compact 32-hex spelling.
 
 HTTP 202 returns a `DeliveryStatus`, rather than a native receipt. Its `state` is
 `queued`, `dispatching`, `pending`, `sent`, `not_sent` or `unknown`. Only `sent`
-contains an exact native receipt and may display Sent. Queued acknowledges durable
+contains an exact native receipt. Queued acknowledges durable
 application ownership; pending acknowledges native enqueue. Neither confirms
 native consumption or completed execution. A confirmed `not_sent` result permits
 an explicit new submission; `unknown` requires checking the original ID. The
@@ -1256,24 +1258,18 @@ unchanged. Reload the page, or complete an explicit settings/mode save followed 
 a fresh same-scope confirmation, to use a new selection. Failed or late reads
 cannot confirm it. Saved original requests retain their existing recovery path.
 
-`mountDeliveryStatuses` displays each message with its delivery status and available
-actions. Call `present(status)` to validate a POST result against the mounted scope
-and show it immediately, then `refresh()` to read the authoritative collection.
-An older in-flight read cannot overwrite the presented result. `destroy()` prevents
-late reads from updating the view. Accepted means the runtime confirmed the input;
-a response may still be pending.
+`mountDeliveryStatuses` displays outstanding or actionable inputs with their status
+and available actions. Call `present(status)` to validate a POST result against
+the mounted scope, then `refresh()` to read the authoritative collection. Validated
+`sent` results leave the list immediately; successful entries from older servers
+are also hidden. This behavior does not depend on loaded history or browser
+memory. Stored receipts and sending behavior are unchanged. Acceptance confirms
+the input, not completion of the assistant's response. An older in-flight read
+cannot overwrite the presented result. `destroy()` prevents late reads from
+updating the view.
 
-The view can retire a successful status after its original input appears in an
-already applied transcript. Pass only entries from a current, successful page for
-the mounted scope and thread. Retirement requires the same original message ID
-and turn ID. It changes the view only; collection metadata, stored receipts and
-sending behavior are unchanged. Observations last for the mounted view and are
-cleared when it is destroyed.
-
-Call `observeTranscript(entries, scope, threadId)` with the current applied entries;
-matching entries have `kind: "userMessage"`, `clientUserMessageId` and `turnId`.
-The first observed thread is pinned. A different thread clears observations and
-disables retirement until a new view is mounted.
+`observeTranscript(entries, scope, threadId)` remains a no-op returning `false`
+for existing consumers. New consumers do not need to call it.
 
 `mountConversation` opts in with `capabilities.durableDelivery: true`, preserving
 legacy pending attempts on their original endpoint. It clears only an unchanged

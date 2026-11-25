@@ -13,7 +13,7 @@ func TestStandaloneExampleUsesCurrentConversationAsset(t *testing.T) {
 	if err := page.Execute(&rendered, nil); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(rendered.String(), `import {mountConversation} from "/codex/assets/conversation.js?v=24"`) {
+	if !strings.Contains(rendered.String(), `import {mountConversation} from "/codex/assets/conversation.js?v=25"`) {
 		t.Fatal("standalone page must load the current mounted conversation asset")
 	}
 }

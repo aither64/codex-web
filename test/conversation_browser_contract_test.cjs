@@ -1649,8 +1649,9 @@ class MemoryStorage {
     assert.equal(notice.hidden,action!=="error");
     assert.equal(notice.textContent,action==="error"?"Newer unrelated failure":"");
     const receiptRow = root.descendants().find(node => node.className === "codex-delivery-row");
-    assert.equal(receiptRow.children[0].textContent,"saved input");
-    assert.equal(receiptRow.children[1].textContent,{queued:"Queued",sent:"Accepted",not_sent:"Not sent",unknown:"Unconfirmed"}[deliveryState]);
+    if(deliveryState==="sent")assert.equal(receiptRow,undefined);
+    else{assert.equal(receiptRow.children[0].textContent,"saved input");
+    assert.equal(receiptRow.children[1].textContent,{queued:"Queued",not_sent:"Not sent",unknown:"Unconfirmed"}[deliveryState]);}
     dispose();
   }
 
@@ -1675,7 +1676,7 @@ class MemoryStorage {
     const settle=()=>new Promise(resolve=>setTimeout(resolve,5)),cards=()=>root.descendants().filter(node=>node.className==="codex-delivery-row");
     try{
       await settle();
-      if(order==="collection-first"){assert.equal(cards().length,1);releaseTranscript();}
+      if(order==="collection-first"){assert.equal(cards().length,0);releaseTranscript();}
       if(order==="transcript-first"){assert.equal(cards().length,0);releaseCollection();}
       if(order.startsWith("post")){
         const textarea=root.descendants().find(node=>node.attributes["aria-label"]==="Message");textarea.value=user.text;
@@ -1683,12 +1684,33 @@ class MemoryStorage {
         const sending=form.listeners.get("submit")({preventDefault(){}});await settle();
         if(order==="post-last"){page={...page,entries:[user]};events.onmessage();await settle();releasePost();}
         await sending;
-        if(order==="post-first"){assert.equal(cards().length,1);page={...page,entries:[user]};events.onmessage();}
+        if(order==="post-first"){assert.equal(cards().length,0);page={...page,entries:[user]};events.onmessage();}
       }
       await settle();assert.equal(cards().length,0,order);assert.equal(rows.length,1,"collection retains sent row");assert.equal(calls,order.startsWith("post")?1:0);
       events.onmessage();await settle();assert.equal(cards().length,0,"same successful status stays retired");
-      page={...page,threadId:"replacement-native"};events.onmessage();await settle();assert.equal(cards().length,1,"thread rebind restores raw status and fences retirement");
+      page={...page,threadId:"replacement-native"};events.onmessage();await settle();assert.equal(cards().length,0,"successful statuses do not depend on transcript binding");
     }finally{dispose()}
+  }
+
+  // A fresh real consumer must not fetch older history to hide successful rows.
+  for(const server of ["current","older"]){
+    const scope="history-scope",selection="a".repeat(64),rows=[1,2].map(n=>({version:1,scope,selection,clientUserMessageId:n.toString(16).padStart(32,"0"),sequence:n,state:"sent",message:"same text",delivery:"steer",createdAtMs:1,updatedAtMs:1,receipt:{clientUserMessageId:n.toString(16).padStart(32,"0"),turnId:"old-"+n}}));
+    const storage=new MemoryStorage();let posts=0,olderReads=0;
+    for(let mount=0;mount<2;mount++){
+      const root=new FakeElement("main");
+      const dispose=mountConversation(root,{id:"old-success",basePath:"/codex",storage,EventSource:null,client:{...mountedClient,
+        async threadPage({cursor}={}){if(cursor)olderReads++;return {threadId:"history-thread",status:"idle",hasOlder:!cursor,olderCursor:cursor?null:"old-page",entries:cursor?rows.map(row=>({kind:"userMessage",itemId:row.receipt.turnId,turnId:row.receipt.turnId,clientUserMessageId:row.clientUserMessageId,text:row.message})):[{kind:"agentMessage",itemId:"new",turnId:"new",text:"recent"}]}},
+        async deliveries(){return {version:1,scope,selection,canEnqueue:true,deliveryModes:["steer"],entries:server==="older"?rows:[]}},
+        async admitDelivery(){posts++;throw Error("unexpected POST")},
+      },capabilities:{pending:false,queueRead:false,send:true,queue:false,settings:false,interrupt:false,respond:false,eventStream:false,durableDelivery:true}});
+      try{
+        await new Promise(resolve=>setImmediate(resolve));
+        const cards=()=>root.descendants().filter(node=>node.className==="codex-delivery-row");
+        assert.equal(cards().length,0,server+" fresh mount");assert.equal(olderReads,mount,"no automatic older read");
+        root.descendants().find(node=>node.textContent==="Load older").listeners.get("click")();await new Promise(resolve=>setImmediate(resolve));
+        assert.equal(olderReads,mount+1);assert.equal(cards().length,0);assert.equal(posts,0);assert.equal(storage.length,0);
+      }finally{dispose()}
+    }
   }
 
   assert.throws(() => mountConversation(new FakeElement("main"), {
