@@ -1609,11 +1609,19 @@ actual tool schemas and does not require absent native handlers or run the
 strict hostile-dispatch assertions. Separate labelled controls temporarily enable
 actual-ID questions to verify rejection and cancellation. The fixture also
 checks early events, cancellation/disconnect and an ordinary concurrent client.
-It holds synthetic inference open while dropping turn/start responses,
-requiring exact interruption and actual provider cancellation. It inspects
-pinned-source goal/memory stores and persistent synthetic state, using private
-Linux user/network/mount/PID namespaces with nftables egress restricted to the
-mock provider. The test process is namespace init. It verifies that private
+The lost-turn control holds synthetic inference open while withholding the
+turn/start response. It requires exact interruption using an identity observed
+by the helper and actual provider cancellation. The disconnect control cuts the
+private transport after a matching live provider request is held. It requires
+`ErrEphemeralServer`, no retry, completed proxy cleanup and ordinary-client
+continuity within the original call budget. Provider-stop
+observations are recorded separately: socket closure does not prove inference
+stopped, and IDs seen only by the proxy give the helper no cancellation authority.
+The fixture must still stop and join its owned native processes.
+
+The fixture inspects pinned-source goal/memory stores and persistent synthetic
+state, using private Linux user/network/mount/PID namespaces with nftables egress
+restricted to the mock provider. The test process is namespace init. It verifies that private
 ownership before each namespace-wide signal, waits for both native process
 owners, then reaps adopted descendants until ECHILD proves the domain empty.
 An ordinary completed turn can leave background writers, so the fixture proves

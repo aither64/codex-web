@@ -907,6 +907,10 @@ var integrationControlSentinels = [...]string{
 }
 
 func integrationControlRequest(request map[string]any, threadID, turnID string) bool {
+	return integrationInputRequest(request, threadID, turnID, integrationControlInput)
+}
+
+func integrationInputRequest(request map[string]any, threadID, turnID, text string) bool {
 	metadata, _ := request["client_metadata"].(map[string]any)
 	if threadID == "" || turnID == "" || metadata["thread_id"] != threadID || metadata["turn_id"] != turnID {
 		return false
@@ -920,7 +924,7 @@ func integrationControlRequest(request map[string]any, threadID, turnID string) 
 		content, _ := item["content"].([]any)
 		for _, value := range content {
 			part, _ := value.(map[string]any)
-			if part["type"] == "input_text" && part["text"] == integrationControlInput {
+			if part["type"] == "input_text" && part["text"] == text {
 				return true
 			}
 		}
@@ -1273,6 +1277,77 @@ type ephemeralIntegrationPhase struct {
 	CounterUnavailable              bool
 	CounterPending, CounterSampled  bool
 	ObservedMicros, CounterMicros   int64
+	Disconnect                      *ephemeralIntegrationDisconnectObservation `json:",omitempty"`
+}
+
+type ephemeralIntegrationDisconnectObservation struct {
+	MatchedPOST, HeldPOST, CutInvoked, CutDone, CutSucceeded bool
+	ProviderStopped                                          bool
+	ProviderContext, CallContext, CutResult                  string
+	RetryEvaluated, CanRetry, AcceptanceEvaluated            bool
+	AcceptanceResult                                         string
+	ProviderStopBudget                                       string
+	CallDeadlinePassed                                       bool
+	ReplyWithheld, ProxyJoined                               bool
+	CutCount                                                 int
+}
+
+func integrationContextSummary(ctx context.Context) string {
+	if ctx == nil {
+		return "absent"
+	}
+	return integrationDisconnectSummary(ctx.Err())
+}
+
+func integrationDisconnectSummary(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline-exceeded"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	// Only fixture-owned static categories may enter diagnostics.
+	switch err.Error() {
+	case "disconnect fault was not exercised":
+		return "fault-not-exercised"
+	case "disconnect transport did not close":
+		return "transport-not-closed"
+	case "disconnect outcome was not nonretryable server failure":
+		return "wrong-disconnect-outcome"
+	case "disconnect cleanup exceeded original call budget":
+		return "cleanup-budget-exceeded"
+	default:
+		return "failed"
+	}
+}
+
+func integrationChannelClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// Caller holds h.mu. Channel/context observations describe this instant only.
+func (h *ephemeralIntegrationHarness) disconnectObservation() *ephemeralIntegrationDisconnectObservation {
+	var deadline time.Time
+	var bounded bool
+	if h.diagnosticCallContext != nil {
+		deadline, bounded = h.diagnosticCallContext.Deadline()
+	}
+	return &ephemeralIntegrationDisconnectObservation{
+		MatchedPOST: h.disconnectPOST, HeldPOST: integrationChannelClosed(h.heldContinuation),
+		CutInvoked: h.disconnectCutInvoked, CutDone: integrationChannelClosed(h.disconnectCutDone),
+		CutSucceeded: h.disconnectCut, CutResult: h.disconnectCutResult, CutCount: h.disconnectCutCount,
+		ReplyWithheld: h.disconnectReplyWithheld, ProxyJoined: integrationChannelClosed(h.disconnectProxyDone),
+		ProviderStopped:    integrationChannelClosed(h.continuationStopped),
+		ProviderStopBudget: h.disconnectProviderStopBudget, CallDeadlinePassed: bounded && !time.Now().Before(deadline),
+		ProviderContext: integrationContextSummary(h.disconnectProviderContext), CallContext: integrationContextSummary(h.diagnosticCallContext),
+	}
 }
 
 func integrationRPCSummary(failure *rpcError) string {
@@ -1329,11 +1404,14 @@ func (h *ephemeralIntegrationHarness) capturePhase(generation uint64, phase, dir
 	event := ephemeralIntegrationPhase{Phase: phase, Direction: direction, Method: method, Summary: integrationRPCSummary(failure),
 		ThreadID: h.diagnosticThread, TurnID: h.diagnosticTurn, ProviderPOSTs: len(h.requests), ProviderUpgrades: h.utilityUpgrades,
 		ObservedMicros: time.Since(h.diagnosticStarted).Microseconds()}
+	if h.mode == "disconnect" && (phase == "disconnect" || final) {
+		event.Disconnect = h.disconnectObservation()
+	}
 	if failure != nil {
 		event.ErrorCode = failure.Code
 	}
 	boundary := final || phase == "before-utility"
-	sample := boundary || !h.diagnosticReadActive
+	sample := boundary || phase != "disconnect" && !h.diagnosticReadActive
 	if sample {
 		event.CounterPending = true
 		if !boundary {
@@ -1704,6 +1782,18 @@ type ephemeralIntegrationHarness struct {
 	activeCancel                                                  context.CancelFunc
 	heldContinuation                                              chan struct{}
 	continuationStopped                                           chan struct{}
+	disconnectInput, disconnectThread, disconnectTurn             string
+	disconnectGeneration                                          uint64
+	disconnectBound                                               chan struct{}
+	disconnectCutDone                                             chan struct{}
+	disconnectProviderContext                                     context.Context
+	disconnectPOST, disconnectCut                                 bool
+	disconnectCutInvoked                                          bool
+	disconnectCutResult                                           string
+	disconnectProviderStopBudget                                  string
+	disconnectProxyDone                                           chan struct{}
+	disconnectReplyWithheld                                       bool
+	disconnectCutCount                                            int
 	interrupted                                                   bool
 	catalogConfirmed                                              bool
 	refreshDelivered                                              bool
@@ -2173,17 +2263,41 @@ func (h *ephemeralIntegrationHarness) respond(w http.ResponseWriter, r *http.Req
 		fmt.Fprintf(w, "event: response.failed\ndata: %s\n\n", data)
 		return
 	}
-	if mode == "lost-turn" {
+	if mode == "lost-turn" || mode == "disconnect" {
+		if mode == "disconnect" && !h.matchDisconnectPOST(r.Context(), generation, request) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if mode == "disconnect" {
+			h.capturePhase(generation, "disconnect", "provider", "matched-POST", nil, "", "")
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"held-response\"}}\n\n")
 		if flush, ok := w.(http.Flusher); ok {
 			flush.Flush()
 		}
 		close(held)
-		// Live tool-free inference can end only when the exact owned turn is
-		// interrupted; no natural provider completion hides a lost-reply leak.
+		if mode == "disconnect" {
+			h.capturePhase(generation, "disconnect", "provider", "held-POST", nil, "", "")
+		}
+		// The lost-turn control requires an exact interrupt. Disconnect records
+		// cessation separately; the fixture owner must still contain this request.
 		<-r.Context().Done()
+		if mode == "disconnect" {
+			h.mu.Lock()
+			if generation == h.disconnectGeneration {
+				h.disconnectProviderStopBudget = "at-or-after-call-end"
+				deadline, bounded := h.diagnosticCallContext.Deadline()
+				if bounded && time.Now().Before(deadline) && h.diagnosticCallContext.Err() == nil {
+					h.disconnectProviderStopBudget = "before-deadline"
+				}
+			}
+			h.mu.Unlock()
+		}
 		close(stopped)
+		if mode == "disconnect" {
+			h.capturePhase(generation, "disconnect", "provider", "provider-stopped", nil, "", "")
+		}
 		return
 	}
 	if mode == "timeout" {
@@ -2897,6 +3011,9 @@ func (h *ephemeralIntegrationHarness) seedSensitiveStores(t *testing.T) {
 func (h *ephemeralIntegrationHarness) proxy(t *testing.T, mode string, generation uint64) string {
 	t.Helper()
 	return serveUnixWebsocket(t, func(downstream *websocket.Conn) error {
+		if mode == "disconnect" && h.disconnectProxyDone != nil {
+			defer close(h.disconnectProxyDone)
+		}
 		transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			socket := h.utilitySocket
 			if mode == "dynamic-catalog" {
@@ -3152,8 +3269,12 @@ func (h *ephemeralIntegrationHarness) proxy(t *testing.T, mode string, generatio
 				}
 				mu.Unlock()
 				if disconnect {
-					upstream.CloseNow()
-					errorsChannel <- nil
+					h.mu.Lock()
+					if generation == h.disconnectGeneration {
+						h.disconnectReplyWithheld = true
+					}
+					h.mu.Unlock()
+					errorsChannel <- h.disconnectAfterPOST(ctx, generation, threadID, turnID, upstream.CloseNow)
 					return
 				}
 				if questionCancel != nil {
@@ -3294,6 +3415,508 @@ func TestEphemeralIntegrationQuestionCancellationTarget(t *testing.T) {
 	}
 }
 
+func (h *ephemeralIntegrationHarness) armDisconnect(generation uint64, input string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if generation != h.diagnosticGeneration || h.mode != "disconnect" || !h.diagnosticCallActive || h.diagnosticCallContext == nil || h.diagnosticCallContext.Err() != nil || input == "" || h.disconnectGeneration == generation && h.disconnectBound != nil {
+		return false
+	}
+	h.disconnectInput, h.disconnectThread, h.disconnectTurn = input, "", ""
+	h.disconnectGeneration = generation
+	h.disconnectBound = make(chan struct{})
+	h.disconnectCutDone = make(chan struct{})
+	h.disconnectProviderContext = nil
+	h.disconnectPOST, h.disconnectCut = false, false
+	h.disconnectCutInvoked, h.disconnectCutResult = false, "not-invoked"
+	h.disconnectProviderStopBudget = "not-observed"
+	h.disconnectReplyWithheld, h.disconnectCutCount = false, 0
+	h.disconnectProxyDone = make(chan struct{})
+	return true
+}
+
+func (h *ephemeralIntegrationHarness) matchDisconnectPOST(providerCtx context.Context, generation uint64, request map[string]any) bool {
+	h.mu.Lock()
+	bound, callCtx := h.disconnectBound, h.diagnosticCallContext
+	valid := generation == h.diagnosticGeneration && generation == h.disconnectGeneration && h.mode == "disconnect" && h.diagnosticCallActive && bound != nil && callCtx != nil
+	h.mu.Unlock()
+	if !valid {
+		return false
+	}
+	// A POST can arrive before the intercepted reply supplies the actual IDs.
+	select {
+	case <-bound:
+	case <-callCtx.Done():
+		return false
+	case <-providerCtx.Done():
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if generation != h.diagnosticGeneration || generation != h.disconnectGeneration || !h.diagnosticCallActive || callCtx.Err() != nil || providerCtx.Err() != nil || h.disconnectPOST || !integrationInputRequest(request, h.disconnectThread, h.disconnectTurn, h.disconnectInput) {
+		return false
+	}
+	h.disconnectPOST = true
+	h.disconnectProviderContext = providerCtx
+	return true
+}
+
+func (h *ephemeralIntegrationHarness) disconnectAfterPOST(transportCtx context.Context, generation uint64, threadID, turnID string, cut func() error) (err error) {
+	h.mu.Lock()
+	callCtx, held := h.diagnosticCallContext, h.heldContinuation
+	if generation != h.diagnosticGeneration || generation != h.disconnectGeneration || h.mode != "disconnect" || !h.diagnosticCallActive || callCtx == nil || h.disconnectBound == nil || h.disconnectThread != "" || !ephemeralID(threadID) || !ephemeralID(turnID) {
+		h.mu.Unlock()
+		return errors.New("disconnect call ownership unavailable")
+	}
+	h.disconnectThread, h.disconnectTurn = threadID, turnID
+	done := h.disconnectCutDone
+	close(h.disconnectBound)
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		if generation == h.disconnectGeneration {
+			h.disconnectCut = err == nil
+			h.disconnectCutResult = integrationDisconnectSummary(err)
+		}
+		close(done)
+		h.mu.Unlock()
+		h.capturePhase(generation, "disconnect", "transport", "cut-completed", nil, threadID, turnID)
+	}()
+	// Leave the reply unforwarded without blocking either transport/provider mutex.
+	select {
+	case <-held:
+	case <-callCtx.Done():
+		return callCtx.Err()
+	case <-transportCtx.Done():
+		return transportCtx.Err()
+	}
+	h.mu.Lock()
+	if generation != h.diagnosticGeneration || !h.diagnosticCallActive || callCtx.Err() != nil || transportCtx.Err() != nil || !h.disconnectPOST || h.disconnectProviderContext == nil || h.disconnectProviderContext.Err() != nil || h.disconnectCut {
+		h.mu.Unlock()
+		return errors.New("disconnect POST ownership lost")
+	}
+	h.disconnectCutInvoked = true
+	h.disconnectCutCount++
+	h.mu.Unlock()
+	h.capturePhase(generation, "disconnect", "transport", "cut-invoked", nil, threadID, turnID)
+	return cut()
+}
+
+// Transport loss proves no native stop. Acceptance requires the exact injected
+// fault and observable proxy cleanup; fixture containment remains a separate owner.
+func (h *ephemeralIntegrationHarness) disconnectAccepted(generation uint64, callErr error) error {
+	if !errors.Is(callErr, ErrEphemeralServer) || CanRetryEphemeralTurn(callErr) {
+		return errors.New("disconnect outcome was not nonretryable server failure")
+	}
+	h.mu.Lock()
+	callCtx, done, proxyDone := h.diagnosticCallContext, h.disconnectCutDone, h.disconnectProxyDone
+	matchedBody := false
+	for _, request := range h.requests {
+		if integrationInputRequest(request, h.disconnectThread, h.disconnectTurn, h.disconnectInput) {
+			matchedBody = true
+			break
+		}
+	}
+	valid := generation == h.diagnosticGeneration && generation == h.disconnectGeneration && h.mode == "disconnect" &&
+		h.disconnectPOST && matchedBody && integrationChannelClosed(h.heldContinuation) && h.disconnectReplyWithheld &&
+		h.disconnectProviderContext != nil && ephemeralID(h.disconnectThread) && ephemeralID(h.disconnectTurn) &&
+		callCtx != nil && done != nil && proxyDone != nil
+	h.mu.Unlock()
+	if !valid {
+		return errors.New("disconnect fault was not exercised")
+	}
+	select {
+	case <-done:
+	case <-callCtx.Done():
+		return callCtx.Err()
+	}
+	select {
+	case <-proxyDone:
+	case <-callCtx.Done():
+		return callCtx.Err()
+	}
+	h.mu.Lock()
+	cut := generation == h.diagnosticGeneration && generation == h.disconnectGeneration &&
+		h.disconnectCutInvoked && h.disconnectCutCount == 1 && h.disconnectCut
+	h.mu.Unlock()
+	if !cut {
+		return errors.New("disconnect transport did not close")
+	}
+	deadline, bounded := callCtx.Deadline()
+	if !bounded || !time.Now().Before(deadline) || callCtx.Err() != nil {
+		return errors.New("disconnect cleanup exceeded original call budget")
+	}
+	return nil
+}
+
+type ephemeralIntegrationCancelFlush struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (w *ephemeralIntegrationCancelFlush) Flush() {
+	w.cancel()
+	w.ResponseRecorder.Flush()
+}
+
+func TestEphemeralIntegrationDisconnectOrdering(t *testing.T) {
+	t.Setenv("CODEX_EPHEMERAL_TEST_MODEL", "gpt-6-luna")
+	t.Run("bounded diagnostic categories", func(t *testing.T) {
+		for _, test := range []struct {
+			err  error
+			want string
+		}{
+			{nil, "ok"}, {context.Canceled, "canceled"}, {context.DeadlineExceeded, "deadline-exceeded"},
+			{errors.New("disconnect fault was not exercised"), "fault-not-exercised"},
+			{errors.New("disconnect transport did not close"), "transport-not-closed"},
+			{errors.New("disconnect outcome was not nonretryable server failure"), "wrong-disconnect-outcome"},
+			{errors.New("disconnect cleanup exceeded original call budget"), "cleanup-budget-exceeded"},
+			{errors.New(strings.Repeat("PRIVATE", 1024)), "failed"},
+		} {
+			if got := integrationDisconnectSummary(test.err); got != test.want {
+				t.Fatalf("unsafe or incorrect diagnostic category %q", got)
+			}
+		}
+	})
+	const input = "RAW_UTILITY_PREFIX_SENTINEL: fix runtime session naming"
+	request := func(thread, turn, text string) map[string]any {
+		return map[string]any{
+			"model": "gpt-6-luna", "reasoning": map[string]any{"effort": "low"},
+			"store": false, "stream": true, "tools": []any{},
+			"client_metadata": map[string]any{"thread_id": thread, "turn_id": turn},
+			"input": []any{
+				map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": integrationPromptedInstructions}}},
+				map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": "GLOBAL_POLICY_SENTINEL"}}},
+				map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": text}}},
+			},
+		}
+	}
+	for _, mode := range []string{"matching POST", "original deadline", "transport closed", "cut failure", "provider closed before cut", "cut still pending"} {
+		t.Run(mode, func(t *testing.T) {
+			budget := 2 * time.Second
+			if mode == "original deadline" || mode == "cut still pending" {
+				budget = 25 * time.Millisecond
+			}
+			callCtx, cancel := context.WithTimeout(context.Background(), budget)
+			transportCtx, transportCancel := context.WithCancel(context.Background())
+			providerCtx, providerCancel := context.WithCancel(context.Background())
+			h := &ephemeralIntegrationHarness{mode: "disconnect", prompted: true, diagnosticGeneration: 7,
+				diagnosticCallContext: callCtx, diagnosticCallActive: true,
+				heldContinuation: make(chan struct{}), continuationStopped: make(chan struct{})}
+			if !h.armDisconnect(7, input) {
+				t.Fatal("could not arm original call")
+			}
+			var cuts atomic.Int32
+			var cutErr error
+			cutDone := make(chan struct{})
+			cutRelease := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseCut := func() { releaseOnce.Do(func() { close(cutRelease) }) }
+			var postDone chan struct{}
+			t.Cleanup(func() {
+				cancel()
+				transportCancel()
+				providerCancel()
+				releaseCut()
+				<-cutDone
+				if postDone != nil {
+					<-postDone
+				}
+			})
+			go func() {
+				cutErr = h.disconnectAfterPOST(transportCtx, 7, "owned-thread", "owned-turn", func() error {
+					cuts.Add(1)
+					if mode == "cut failure" {
+						return errors.New("synthetic transport close failed")
+					}
+					if mode == "cut still pending" {
+						<-cutRelease
+					}
+					return nil
+				})
+				close(cutDone)
+			}()
+			select {
+			case <-h.disconnectBound:
+			case <-cutDone:
+				t.Fatalf("ownership binding failed: %v", cutErr)
+			}
+			if cuts.Load() != 0 || h.matchDisconnectPOST(providerCtx, 6, request("owned-thread", "owned-turn", input)) {
+				t.Fatal("cut before matching POST or stale generation accepted")
+			}
+			if mode == "original deadline" || mode == "transport closed" {
+				if mode == "transport closed" {
+					transportCancel()
+				}
+				<-cutDone
+				if cutErr == nil || cuts.Load() != 0 || h.disconnectAccepted(7, ErrEphemeralServer) == nil {
+					t.Fatal("unreached fault passed deadline/transport failure")
+				}
+				if mode == "original deadline" && (!errors.Is(cutErr, context.DeadlineExceeded) || callCtx.Err() != context.DeadlineExceeded) {
+					t.Fatal("barrier did not use the original call deadline")
+				}
+				return
+			}
+			post := func(value map[string]any, ctx context.Context) *httptest.ResponseRecorder {
+				raw, _ := json.Marshal(value)
+				w := httptest.NewRecorder()
+				var writer http.ResponseWriter = w
+				if mode == "provider closed before cut" {
+					writer = &ephemeralIntegrationCancelFlush{w, providerCancel}
+				}
+				h.respond(writer, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(raw)).WithContext(ctx))
+				return w
+			}
+			if mode == "matching POST" {
+				for _, wrong := range []map[string]any{
+					request("foreign-thread", "owned-turn", input), request("owned-thread", "foreign-turn", input),
+					request("owned-thread", "owned-turn", "other input"), request("owned-thread", "owned-turn", integrationControlInput),
+				} {
+					if post(wrong, providerCtx).Code != http.StatusBadRequest || cuts.Load() != 0 {
+						t.Fatal("wrong-call/control POST unlocked disconnect")
+					}
+				}
+			}
+			postDone = make(chan struct{})
+			go func() {
+				post(request("owned-thread", "owned-turn", input), providerCtx)
+				close(postDone)
+			}()
+			if mode == "cut still pending" {
+				<-callCtx.Done()
+				if integrationChannelClosed(h.disconnectCutDone) || callCtx.Err() != context.DeadlineExceeded {
+					t.Fatal("pending transport close passed cleanup")
+				}
+				releaseCut()
+			}
+			<-cutDone
+			wantCuts := int32(1)
+			if mode == "provider closed before cut" {
+				wantCuts = 0
+			}
+			if cuts.Load() != wantCuts || (cutErr != nil) != (mode == "cut failure" || mode == "provider closed before cut") {
+				t.Fatalf("wrong cut count/result: %d %v", cuts.Load(), cutErr)
+			}
+			// Independent test containment is not the cut's behavior oracle.
+			providerCancel()
+			<-postDone
+
+			if h.disconnectAfterPOST(transportCtx, 7, "owned-thread", "owned-turn", func() error { cuts.Add(1); return nil }) == nil || cuts.Load() != wantCuts {
+				t.Fatal("disconnect cut twice")
+			}
+		})
+	}
+}
+
+func TestEphemeralIntegrationDisconnectProxy(t *testing.T) {
+	t.Setenv("CODEX_EPHEMERAL_TEST_MODEL", "gpt-5.5")
+	for _, scenario := range []string{"independent owner stops=true", "independent owner stops=false", "delayed diagnostics"} {
+		ownerStops := scenario == "independent owner stops=true"
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			providerCtx, providerCancel := context.WithCancel(context.Background())
+			defer providerCancel()
+			opts := ephemeralTestOptions(t)
+			h := &ephemeralIntegrationHarness{mode: "disconnect", catalog: opts.ModelCatalogFile,
+				heldContinuation: make(chan struct{}), continuationStopped: make(chan struct{}),
+				disconnectProxyDone: make(chan struct{}), diagnosticCounter: func() (uint64, error) { return 0, nil }}
+			generation := h.beginDiagnostics()
+			h.diagnosticCallContext, h.diagnosticCallActive = ctx, true
+			if !h.armDisconnect(generation, opts.Input) {
+				t.Fatal("could not arm proxy control")
+			}
+			replySent, upstreamClosed := make(chan struct{}), make(chan struct{})
+			fake := &ephemeralFake{turn: func(connection *websocket.Conn, call map[string]any) error {
+				defer close(upstreamClosed)
+				if err := ephemeralTurnResponse(connection, call); err != nil {
+					return err
+				}
+				close(replySent)
+				_, _, err := connection.Read(ctx)
+				if err == nil {
+					return errors.New("unexpected request before withheld reply disconnect")
+				}
+				return nil
+			}}
+			h.utilitySocket = fake.serve(t)
+			client := New(h.proxy(t, "disconnect", generation))
+			callDone := make(chan struct{})
+			var callErr error
+			go func() { _, callErr = client.RunEphemeralTurn(ctx, opts); close(callDone) }()
+			var providerDone chan struct{}
+			t.Cleanup(func() {
+				providerCancel()
+				cancel()
+				client.Close()
+				<-callDone
+				if providerDone != nil {
+					<-providerDone
+				}
+				<-upstreamClosed
+				<-h.disconnectProxyDone
+			})
+			select {
+			case <-replySent:
+			case <-ctx.Done():
+				t.Fatal("mock never sent the intercepted reply")
+			}
+			h.mu.Lock()
+			before := h.disconnectObservation()
+			h.mu.Unlock()
+			if before.CutInvoked || before.MatchedPOST || before.HeldPOST {
+				t.Fatal("proxy cut before this call's provider request")
+			}
+			provider := httptest.NewServer(http.HandlerFunc(h.respond))
+			defer func() { providerCancel(); provider.Close() }()
+			request := map[string]any{"model": "gpt-5.5", "reasoning": map[string]any{"effort": "low"},
+				"store": false, "stream": true, "tools": []any{},
+				"client_metadata": map[string]any{"thread_id": "utility-thread", "turn_id": "utility-turn"},
+				"input": []any{
+					map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": opts.Instructions}}},
+					map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": "GLOBAL_POLICY_SENTINEL"}}},
+					map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": opts.Input}}}}}
+			raw, _ := json.Marshal(request)
+			post, _ := http.NewRequestWithContext(providerCtx, http.MethodPost, provider.URL+"/v1/responses", bytes.NewReader(raw))
+			providerDone = make(chan struct{})
+			go func() {
+				defer close(providerDone)
+				response, err := provider.Client().Do(post)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, response.Body)
+					response.Body.Close()
+				}
+			}()
+			select {
+			case <-h.disconnectCutDone:
+			case <-ctx.Done():
+				t.Fatal("actual proxy did not complete its cut")
+			}
+			<-callDone
+			<-upstreamClosed
+			<-h.disconnectProxyDone
+			h.mu.Lock()
+			after := h.disconnectObservation()
+			h.mu.Unlock()
+			if !errors.Is(callErr, ErrEphemeralServer) || CanRetryEphemeralTurn(callErr) ||
+				!after.MatchedPOST || !after.HeldPOST || !after.CutInvoked || !after.CutDone || !after.CutSucceeded ||
+				after.ProviderStopped || after.ProviderContext != "ok" || after.CallContext != "ok" {
+				t.Fatalf("actual cut conflated transport loss and provider stop: %#v, %v", after, callErr)
+			}
+			if scenario == "independent owner stops=false" {
+				for _, fault := range []string{"stale generation", "wrong call", "unmatched", "unheld", "forwarded reply", "failed cut", "duplicate cut", "unfinished cut", "missing proxy join", "late proxy join", "expired budget", "retryable", "wrong outcome"} {
+					t.Run(fault, func(t *testing.T) {
+						proofCtx, proofCancel := context.WithTimeout(ctx, 25*time.Millisecond)
+						defer proofCancel()
+						proof := &ephemeralIntegrationHarness{mode: "disconnect", diagnosticGeneration: generation, disconnectGeneration: generation,
+							diagnosticCallContext: proofCtx, disconnectPOST: true, requests: h.requests,
+							heldContinuation: h.heldContinuation, disconnectReplyWithheld: true,
+							disconnectProviderContext: providerCtx, disconnectThread: "utility-thread", disconnectTurn: "utility-turn", disconnectInput: opts.Input,
+							disconnectCutDone: h.disconnectCutDone, disconnectProxyDone: h.disconnectProxyDone,
+							disconnectCutInvoked: true, disconnectCutCount: 1, disconnectCut: true}
+						outcome := callErr
+						var lateJoined chan struct{}
+						switch fault {
+						case "stale generation":
+							proof.diagnosticGeneration++
+						case "wrong call":
+							proof.disconnectTurn = "foreign-turn"
+						case "unmatched":
+							proof.disconnectPOST = false
+						case "unheld":
+							proof.heldContinuation = make(chan struct{})
+						case "forwarded reply":
+							proof.disconnectReplyWithheld = false
+						case "failed cut":
+							proof.disconnectCut = false
+						case "duplicate cut":
+							proof.disconnectCutCount = 2
+						case "unfinished cut":
+							proof.disconnectCutDone = make(chan struct{})
+						case "missing proxy join":
+							proof.disconnectProxyDone = make(chan struct{})
+						case "late proxy join":
+							proof.disconnectProxyDone = make(chan struct{})
+							lateJoined = make(chan struct{})
+							go func() { <-proofCtx.Done(); close(proof.disconnectProxyDone); close(lateJoined) }()
+						case "expired budget":
+							proofCancel()
+						case "retryable":
+							outcome = &ephemeralRetryError{category: ErrEphemeralServer, retryable: true}
+						case "wrong outcome":
+							outcome = ErrEphemeralProtocol
+						}
+						if proof.disconnectAccepted(generation, outcome) == nil {
+							t.Fatal("invalid disconnect proof accepted")
+						}
+						if lateJoined != nil {
+							<-lateJoined
+						}
+						if (fault == "unfinished cut" || fault == "missing proxy join" || fault == "late proxy join") && proofCtx.Err() != context.DeadlineExceeded {
+							t.Fatal("missing join did not retain its original deadline")
+						}
+					})
+				}
+			}
+			if ownerStops {
+				// This independent HTTP owner supplies containment, never the WS cut.
+				providerCancel()
+				<-providerDone
+			}
+			if scenario == "delayed diagnostics" {
+				// Delay the actual synchronous final-capture counter until the
+				// original call budget ends, without sleeping or extending it.
+				h.mu.Lock()
+				h.diagnosticCounter = func() (uint64, error) { <-ctx.Done(); return 0, nil }
+				h.mu.Unlock()
+				acceptedErr, frozen := h.finishUtilityCall(generation, "disconnect", callErr)
+				if acceptedErr != nil {
+					t.Fatalf("timely proof changed after final diagnostic delay: %v", acceptedErr)
+				}
+				if frozen.Disconnect.CallDeadlinePassed || frozen.Disconnect.CallContext != "ok" ||
+					frozen.Disconnect.AcceptanceResult != "ok" || ctx.Err() != context.DeadlineExceeded {
+					t.Fatalf("acceptance observation was not frozen before diagnostics: %#v", frozen.Disconnect)
+				}
+			} else if got := h.disconnectAccepted(generation, callErr); got != nil {
+				t.Fatalf("disconnect contract: %v", got)
+			}
+			h.mu.Lock()
+			accepted := h.disconnectObservation()
+			h.mu.Unlock()
+			if accepted.ProviderStopped != ownerStops || accepted.ProxyJoined != true || !accepted.ReplyWithheld || accepted.CutCount != 1 {
+				t.Fatalf("provider observation was confused with acceptance: %#v", accepted)
+			}
+			// Contain the still-live HTTP owner only AFTER acceptance is sampled.
+			providerCancel()
+			<-providerDone
+			<-h.continuationStopped
+			t.Logf("fixture HTTP-owner containment completed separately; provider stopped at acceptance=%t", ownerStops)
+
+		})
+	}
+}
+
+// Freeze acceptance and its matching observation before synchronous final
+// diagnostics can consume the original call budget.
+func (h *ephemeralIntegrationHarness) finishUtilityCall(generation uint64, mode string, callErr error) (error, ephemeralIntegrationPhase) {
+	var acceptanceErr error
+	var outcome ephemeralIntegrationPhase
+	if mode == "disconnect" {
+		acceptanceErr = h.disconnectAccepted(generation, callErr)
+		h.mu.Lock()
+		observation := h.disconnectObservation()
+		observation.RetryEvaluated, observation.CanRetry = true, CanRetryEphemeralTurn(callErr)
+		observation.AcceptanceEvaluated, observation.AcceptanceResult = true, integrationDisconnectSummary(acceptanceErr)
+		outcome = ephemeralIntegrationPhase{Phase: "disconnect", Direction: "assertion", Method: "acceptance",
+			ObservedMicros: time.Since(h.diagnosticStarted).Microseconds(), Disconnect: observation}
+		h.mu.Unlock()
+	}
+	h.mu.Lock()
+	h.diagnosticCallActive = false
+	h.mu.Unlock()
+	h.capturePhase(generation, "after-utility-teardown", "boundary", "none", nil, "", "")
+	return acceptanceErr, outcome
+}
+
 func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack string) {
 	h.mu.Lock()
 	h.mode, h.namespace, h.attack = mode, namespace, attack
@@ -3359,6 +3982,9 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	h.mu.Lock()
 	h.diagnosticCallContext, h.diagnosticCallActive = ctx, true
 	h.mu.Unlock()
+	if mode == "disconnect" && !h.armDisconnect(generation, opts.Input) {
+		t.Fatal("disconnect barrier could not be armed before utility call")
+	}
 	var result EphemeralTurnResult
 	var err error
 	if h.prompted {
@@ -3366,10 +3992,7 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 	} else {
 		result, err = client.RunEphemeralTurn(ctx, opts)
 	}
-	h.mu.Lock()
-	h.diagnosticCallActive = false
-	h.mu.Unlock()
-	h.capturePhase(generation, "after-utility-teardown", "boundary", "none", nil, "", "")
+	disconnectErr, disconnectOutcome := h.finishUtilityCall(generation, mode, err)
 	h.mu.Lock()
 	phases := append([]ephemeralIntegrationPhase(nil), h.phases...)
 	toolDiagnostic := h.toolDiagnostic
@@ -3406,9 +4029,17 @@ func (h *ephemeralIntegrationHarness) run(t *testing.T, mode, namespace, attack 
 			t.Fatalf("budget not preserved: %v", err)
 		}
 	case "disconnect":
+		retryable := disconnectOutcome.Disconnect.CanRetry
+		acceptanceErr, outcome := disconnectErr, disconnectOutcome
+		encoded, _ := json.Marshal(outcome)
+		t.Logf("disconnect outcome evidence: %s", encoded)
 		if !errors.Is(err, ErrEphemeralServer) {
 			t.Fatalf("disconnect adopted: %v", err)
 		}
+		if retryable || acceptanceErr != nil {
+			t.Fatal("disconnect lacked exact fault and completed proxy cleanup within budget")
+		}
+
 	case "question-at-cancel":
 		h.mu.Lock()
 		questionProof := h.questionObserved && h.questionDispatched && len(h.requests) > 0
