@@ -546,6 +546,12 @@ func TestPromptedEphemeral0165ProtocolIntegration(t *testing.T) {
 	runEphemeralProtocolIntegration(t, "0.165.0")
 }
 
+func TestPromptedEphemeral0172ProtocolIntegration(t *testing.T) {
+	runEphemeralProtocolIntegration(t, "0.172.0")
+}
+
+const integrationPrompted0172NativeHash = "f73aeb0f2b64a1b8ad9b45705722ad9fd34fc1a59ea3ed08460a010766fc7dcd"
+
 func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
 	prompted := nativeVersion != "0.163.0"
 	binary := integrationExecutable(t, "CODEX_EPHEMERAL_TEST_BINARY")
@@ -563,12 +569,18 @@ func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
 	if len(expected) != 64 || hex.EncodeToString(digest.Sum(nil)) != expected {
 		t.Fatal("candidate differs from reviewed CODEX_EPHEMERAL_TEST_SHA256")
 	}
+	if nativeVersion == "0.172.0" && expected != integrationPrompted0172NativeHash {
+		t.Fatal("0.172 candidate differs from the reviewed selected package")
+	}
 	version := "codex-cli 0.163.0"
 	selector := "TestEphemeralProtocolIntegration"
 	if prompted {
 		version, selector = "codex-cli "+nativeVersion, "TestPromptedEphemeralProtocolIntegration"
 		if nativeVersion == "0.165.0" {
 			selector = "TestPromptedEphemeral0165ProtocolIntegration"
+		}
+		if nativeVersion == "0.172.0" {
+			selector = "TestPromptedEphemeral0172ProtocolIntegration"
 		}
 		if integrationUtilityModel() != "gpt-6-luna" {
 			t.Fatal("prompted native naming requires CODEX_EPHEMERAL_TEST_MODEL=gpt-6-luna")
@@ -622,6 +634,9 @@ func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
 	if nativeVersion == "0.165.0" {
 		expectedSourceHash = "1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10"
 	}
+	if nativeVersion == "0.172.0" {
+		expectedSourceHash = "d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068"
+	}
 	if !unchanged || sourceHash != expectedSourceHash {
 		t.Fatal("candidate must retain original gpt-5.5 Direct/non-Lite metadata")
 	}
@@ -638,7 +653,7 @@ func runEphemeralProtocolIntegration(t *testing.T, nativeVersion string) {
 	if output, err := exec.Command(ip, "link", "set", "lo", "up").CombinedOutput(); err != nil {
 		t.Fatalf("cannot configure isolated loopback: %v %s", err, output)
 	}
-	harness := newEphemeralIntegrationHarness(t, binary, nft, owner)
+	harness := newEphemeralIntegrationHarness(t, binary, nft, owner, nativeVersion)
 	harness.prompted = prompted
 	defer harness.close()
 	harness.control(t)
@@ -1696,7 +1711,46 @@ type ephemeralIntegrationHarness struct {
 	nativeTurnStarts                                              int
 }
 
-func newEphemeralIntegrationHarness(t *testing.T, binary, nft string, owner ephemeralIntegrationNamespaceOwner) *ephemeralIntegrationHarness {
+func integrationValid0172Catalog(path, model string) bool {
+	if !validEphemeralCatalogForContract(path, model, ephemeralPrompted) {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	return err == nil && len(data) == 62432 && fmt.Sprintf("%x", sha256.Sum256(data)) == ephemeralLuna0172CatalogHash
+}
+
+func TestPromptedEphemeral0172IntegrationCatalog(t *testing.T) {
+	current, err := os.ReadFile("ephemeral_luna_models_0172.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := os.ReadFile("ephemeral_luna_models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, model string
+		data        []byte
+		want        bool
+	}{
+		{"selected", "gpt-6-luna", current, true},
+		{"retained catalog", "gpt-6-luna", retained, false},
+		{"wrong model", "gpt-5.5", current, false},
+		{"changed bytes", "gpt-6-luna", append(append([]byte(nil), current...), '\n'), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "models.json")
+			if err := os.WriteFile(path, test.data, 0444); err != nil {
+				t.Fatal(err)
+			}
+			if got := integrationValid0172Catalog(path, test.model); got != test.want {
+				t.Fatalf("selected catalog accepted=%v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func newEphemeralIntegrationHarness(t *testing.T, binary, nft string, owner ephemeralIntegrationNamespaceOwner, nativeVersion string) *ephemeralIntegrationHarness {
 	t.Helper()
 	root, err := os.MkdirTemp("/tmp", "epi-")
 	if err != nil {
@@ -1759,7 +1813,11 @@ func newEphemeralIntegrationHarness(t *testing.T, binary, nft string, owner ephe
 		catalogPath = os.Getenv("CODEX_EPHEMERAL_TEST_CATALOG")
 	}
 	h.catalog, err = filepath.EvalSymlinks(catalogPath)
-	if err != nil || !validEphemeralCatalog(h.catalog, integrationUtilityModel()) {
+	validCatalog := validEphemeralCatalog(h.catalog, integrationUtilityModel())
+	if nativeVersion == "0.172.0" {
+		validCatalog = integrationValid0172Catalog(h.catalog, integrationUtilityModel())
+	}
+	if err != nil || !validCatalog {
 		t.Fatal("immutable utility profile catalog unavailable")
 	}
 	h.utilitySocket = filepath.Join(root, "naming.sock")
