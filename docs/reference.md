@@ -1332,7 +1332,9 @@ mixed-version or downgrade safety. Recovery remains forward-only.
 `Client.RunEphemeralTurn(ctx, EphemeralTurnOptions)` provides the strict
 utility contract for Codex 0.163.0. `Client.RunPromptedEphemeralTurn(ctx,
 EphemeralTurnOptions)` provides a separate naming contract for raw Codex 0.164.0
-and 0.165.0.
+and 0.165.0. The prompted helper also accepts a separate Luna catalog derived
+from Codex 0.172.0. Using that release requires its exact experimental-schema
+and native checks.
 Both return `EphemeralTurnResult{Text: ...}` for one completed final answer and
 share the bounded private runner, sink, fixed restrictions and cleanup/retry
 proof. These Go APIs accept trusted application inputs; no browser route selects
@@ -1355,9 +1357,10 @@ the prompt for inference. An empty value uses the native server's default.
 Callers with their own provider selection must resolve and pass it on each call.
 
 The strict 0.163.0 profiles use `Effort: "low"`, with either
-`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted raw 0.164.0/0.165.0 naming supports
-only `Model: "gpt-6-luna"` with `Effort: "low"` or `Effort: "high"`. Each
-requires its matching immutable catalog below. Other pairs fail with
+`Model: "gpt-6-luna"` or `Model: "gpt-5.5"`. Prompted naming accepts the retained
+0.164.0/0.165.0 catalog or the exact 0.172.0 resource. It supports only
+`Model: "gpt-6-luna"` with `Effort: "low"` or `Effort: "high"`. Each requires its
+matching immutable catalog below. Other pairs fail with
 `ErrEphemeralSettings` before connecting. The server's `model/list` must also
 advertise the exact requested
 effort before the helper creates a thread; it never substitutes another effort.
@@ -1396,9 +1399,26 @@ in Codex 0.163.0 and 0.164.0; their separate provenance records describe that
 shared content. Codex 0.165 adds only GPT-6.1 Terra to the full catalog
 (SHA-256 `1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10`);
 its derived Luna resource remains byte-identical. The strict full-catalog fixture
-remains at 0.163. Hash validation proves catalog content, not the native release
-or its tool-isolation behavior. Both supported releases use the standard
-Responses shape. Strict 0.163 requires top-level `tools: []` and no
+remains at 0.163.
+
+For 0.172, the prompted helper accepts the separate
+`codex/ephemeral_luna_models_0172.json`: 62,432 bytes, SHA-256
+`8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8`.
+It derives from upstream tag `rust-v0.172.0`, commit
+`3d86e43b075adeba2193ec5c22ac92f55afd82e6`, whose full catalog is 667,893 bytes,
+SHA-256 `d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068`.
+The same three transformations preserve all other selected-source Luna metadata,
+including its updated priority and model messages. The refresh helper verifies
+both exact catalogs before writing the new resource and provenance. It leaves
+strict and retained prompted catalogs and provenance unchanged. Only the prompted
+helper admits this new resource; strict model/catalog pairs remain unchanged.
+
+Hash validation proves catalog content, not the native release, tool behavior or
+model availability. The consuming runtime must select and verify its exact
+executable. Source checks and fake transports do not establish native naming
+compatibility; 0.172 requires its experimental-schema and native checks. The
+retained 0.163/0.164 native fixtures use the standard Responses shape. Strict
+0.163 requires top-level `tools: []` and no
 `additional_tools` input role; the prompted 0.164 fixture records actual native
 tool schemas. Both releases send explicit base
 instructions as the first developer message in `input`, rather than a top-level

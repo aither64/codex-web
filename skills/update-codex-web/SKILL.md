@@ -12,9 +12,12 @@ changing the compatibility contract. Do not add a binary dependency to this
 repository's flake merely to select a release.
 
 The strict `RunEphemeralTurn` contract supports Codex 0.163.0 with both existing
-model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0 or 0.165.0
-and Luna with low or high effort. The strict profiles remain low-only. The
-prompted contract retains the bounded runner and fixed defenses. Its prompt
+model profiles. `RunPromptedEphemeralTurn` supports naming with raw Codex 0.164.0
+or 0.165.0 and Luna with low or high effort. It also accepts the separate exact
+0.172.0 Luna catalog. Before live use, run the experimental-schema and native
+checks against the selected 0.172.0 executable. The strict profiles remain
+low-only. The prompted contract retains the bounded runner and fixed defenses.
+Its prompt
 guides the model without establishing tool-effect isolation. Preserve both API
 contracts; do not relabel a prompted native pass as strict isolation evidence.
 The consuming runtime verifies the exact executable. Identical catalog bytes or
@@ -62,6 +65,21 @@ For `--version 0.165.0`, the helper validates the exact source catalog, the
 addition of Terra and unchanged retained metadata, then writes a separate 0.165
 provenance record. It preserves strict fixtures and the shared Luna resource.
 
+For `--version 0.172.0`, use upstream tag `rust-v0.172.0`, commit
+`3d86e43b075adeba2193ec5c22ac92f55afd82e6`. The helper requires the exact
+667,893-byte full catalog, SHA-256
+`d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068`, and
+62,432-byte derived Luna catalog, SHA-256
+`8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8`.
+It writes only `codex/ephemeral_luna_models_0172.json` and separate 0.172
+provenance. Select Luna and apply only the existing three transformations; keep
+all remaining selected-source metadata. Do not copy the new full catalog into
+the strict fixture or overwrite retained resources or provenance. The prompted
+helper accepts either the retained Luna catalog or this exact new resource,
+while the
+strict helper retains its original model/catalog pairs. Every other content or
+model combination fails; no caller supplies an acceptance hash.
+
 For `--version 0.163.0`, the helper regenerates the strict catalogs and their
 original provenance. For `--version 0.164.0`, it verifies that both generated
 catalogs match the existing canonical resources, then writes separate prompted
@@ -81,6 +99,15 @@ Run focused Go/browser checks, request corpus coverage and the exact schema and
 config-policy checks before final review. Follow the caller's normal commit,
 review and publication gates; when orchestrated, return the completed committed
 changes for its combined final review before long native tests.
+
+Catalog preparation can run focused fake-transport controls and
+`python3 test/codex_protocol_contract.py --coverage-only codex/client.go` without
+starting a native binary. The 0.172 catalog does not establish compatibility with
+an older native selector. Checked-in schemas omit experimental fields and cannot
+replace experimental-schema validation. Reuse exact existing schema evidence
+when available; otherwise generate the schemas once from the selected binary
+when native execution is authorized. Validate the full corpus and fixed config
+policy before running the affected native fixture.
 
 After review, follow docs/reference.md for namespace ownership and the native
 selector matching the supported contract. Strict 0.163 requires hostile-dispatch

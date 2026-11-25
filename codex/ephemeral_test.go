@@ -977,10 +977,13 @@ func TestEphemeralLunaUsesToolFreeCatalog(t *testing.T) {
 			}
 		}
 	}
-	for _, pair := range []struct{ model, catalog string }{{"gpt-6-luna", originalPath}, {"gpt-5.5", path}} {
+	newOpts, _ := promptedEphemeralFixtureWithCatalog(t, "ephemeral_luna_models_0172.json")
+	for _, pair := range []struct{ model, catalog string }{{"gpt-6-luna", originalPath}, {"gpt-5.5", path}, {"gpt-6-luna", newOpts.ModelCatalogFile}, {"gpt-5.5", newOpts.ModelCatalogFile}} {
 		opts.Model, opts.ModelCatalogFile = pair.model, pair.catalog
-		_, err := runEphemeralTest(t, New("/must-not-connect"), opts)
-		if !errors.Is(err, ErrEphemeralIsolation) {
+		client := New("/must-not-connect")
+		defer client.Close()
+		_, err := runEphemeralTest(t, client, opts)
+		if !errors.Is(err, ErrEphemeralIsolation) || client.generation != 0 {
 			t.Fatalf("mismatched model/catalog accepted: %v", err)
 		}
 	}

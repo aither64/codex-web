@@ -10,8 +10,9 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path, help="selected codex-rs source")
-    parser.add_argument("--version", required=True, choices=("0.163.0", "0.164.0", "0.165.0"),
-                        help="strict 0.163.0 or prompted 0.164.0/0.165.0 provenance")
+    parser.add_argument("--version", required=True,
+                        choices=("0.163.0", "0.164.0", "0.165.0", "0.172.0"),
+                        help="strict 0.163.0 or prompted 0.164.0/0.165.0/0.172.0 catalogs")
     args = parser.parse_args()
     original = (args.source / "models-manager/models.json").read_bytes()
     catalog = json.loads(original)
@@ -28,7 +29,15 @@ def main():
     root = Path(__file__).resolve().parents[3]
     full_path = root / "codex/testdata/ephemeral-models.json"
     luna_path = root / "codex/ephemeral_luna_models.json"
-    if args.version == "0.165.0":
+    if args.version == "0.172.0":
+        if (len(original) != 667893
+                or original_hash != "d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068"
+                or len(derived) != 62432
+                or derived_hash != "8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8"):
+            raise SystemExit("0.172 catalogs differ from reviewed source; inspect compatibility first")
+        luna_path = root / "codex/ephemeral_luna_models_0172.json"
+        luna_path.write_bytes(derived)
+    elif args.version == "0.165.0":
         # 0.165 adds Terra to the full catalog; every retained model is unchanged.
         old = json.loads(full_path.read_bytes())
         old_models = {model["slug"]: model for model in old["models"]}
@@ -53,6 +62,23 @@ def main():
             "Source selected by the runtime locked Codex input.\n"
             f"{len(original)} bytes; SHA-256\n{original_hash}\n"
             "Used for hermetic public helper preflight, with no metadata reductions.\n"
+        )
+    elif args.version == "0.172.0":
+        provenance = root / "codex/testdata/prompted-ephemeral-models-0.172.provenance"
+        provenance.write_text(
+            "Upstream Codex rust-v0.172.0, commit\n"
+            "3d86e43b075adeba2193ec5c22ac92f55afd82e6.\n"
+            "Source: codex-rs/models-manager/models.json (full catalog not copied).\n"
+            f"{len(original)} bytes; SHA-256 {original_hash}\n"
+            "Derived resource: codex/ephemeral_luna_models_0172.json.\n"
+            f"{len(derived)} bytes; SHA-256 {derived_hash}\n"
+            "Select only gpt-6-luna and change only tool_mode=direct,\n"
+            "experimental_supported_tools=[] and use_responses_lite=false.\n"
+            "All other selected-source Luna metadata and formatting are retained.\n"
+            "Old strict and prompted resources/provenance remain unchanged.\n"
+            "This records source compatibility, not native acceptance, model\n"
+            "availability or tool-effect isolation. The consuming runtime must\n"
+            "verify its exact executable and complete separate native checks.\n"
         )
     else:
         provenance = root / "codex/testdata/prompted-ephemeral-models.provenance"

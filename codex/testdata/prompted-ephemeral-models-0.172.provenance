@@ -1,0 +1,13 @@
+Upstream Codex rust-v0.172.0, commit
+3d86e43b075adeba2193ec5c22ac92f55afd82e6.
+Source: codex-rs/models-manager/models.json (full catalog not copied).
+667893 bytes; SHA-256 d50b6749506d97e5f334dbabcb666eb1689f423cf3e88cfabdcf3c536b873068
+Derived resource: codex/ephemeral_luna_models_0172.json.
+62432 bytes; SHA-256 8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8
+Select only gpt-6-luna and change only tool_mode=direct,
+experimental_supported_tools=[] and use_responses_lite=false.
+All other selected-source Luna metadata and formatting are retained.
+Old strict and prompted resources/provenance remain unchanged.
+This records source compatibility, not native acceptance, model
+availability or tool-effect isolation. The consuming runtime must
+verify its exact executable and complete separate native checks.

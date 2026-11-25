@@ -52,14 +52,15 @@ func (e *ephemeralRetryError) Unwrap() error { return e.category }
 const EphemeralInstructionFileContent = "Preserve the current utility task and its explicit instructions.\n"
 
 const (
-	ephemeralLunaCatalogHash = "049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1"
-	ephemeralCatalogHash     = "943ca7fe1d19ed019054158303f0dbbd80b3bef43b3aa425a71aa7cb3fb52c2b"
-	ephemeralCatalogLimit    = 1024 * 1024
-	ephemeralFrameLimit      = 256 * 1024
-	ephemeralEventLimit      = 256
-	ephemeralByteLimit       = 1024 * 1024
-	ephemeralOutputLimit     = 16 * 1024
-	ephemeralCleanup         = 250 * time.Millisecond
+	ephemeralLunaCatalogHash     = "049042aaadcf2f19722fa1e893f926d2bdbd4d0ff092d80704ff4256e2a45fb1"
+	ephemeralLuna0172CatalogHash = "8e13505e9735049a6fd25579d30525bb8c3a1d016b00d9a0cdf98d804fa579b8"
+	ephemeralCatalogHash         = "943ca7fe1d19ed019054158303f0dbbd80b3bef43b3aa425a71aa7cb3fb52c2b"
+	ephemeralCatalogLimit        = 1024 * 1024
+	ephemeralFrameLimit          = 256 * 1024
+	ephemeralEventLimit          = 256
+	ephemeralByteLimit           = 1024 * 1024
+	ephemeralOutputLimit         = 16 * 1024
+	ephemeralCleanup             = 250 * time.Millisecond
 )
 
 //go:embed ephemeral_policy.json
@@ -101,8 +102,10 @@ func (c *Client) RunEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 }
 
 // RunPromptedEphemeralTurn runs one bounded naming turn on a private connection
-// using gpt-6-luna with low or high effort and the fixed catalog with raw Codex
-// 0.164 and 0.165. Tools may be advertised or attempted: prompt instructions are guidance,
+// using gpt-6-luna with low or high effort and the matching immutable catalog.
+// Catalog support includes raw Codex 0.164, 0.165 and 0.172; each release still
+// needs its own native acceptance. Tools may be advertised or attempted:
+// prompt instructions are guidance,
 // not an enforced tool-effect isolation boundary. The caller verifies the
 // serving executable
 // and supplies explicit naming instructions, including the prohibition on tools.
@@ -138,7 +141,7 @@ func (c *Client) runEphemeralTurn(ctx context.Context, opts EphemeralTurnOptions
 	if opts.ModelProvider != "" && (!ephemeralID(opts.ModelProvider) || strings.TrimSpace(opts.ModelProvider) != opts.ModelProvider || strings.ContainsAny(opts.ModelProvider, "\x00\r\n\t ")) {
 		return result, ErrEphemeralSettings
 	}
-	valid := validEphemeralOptions(opts) && validEphemeralCatalog(opts.ModelCatalogFile, opts.Model)
+	valid := validEphemeralOptions(opts) && validEphemeralCatalogForContract(opts.ModelCatalogFile, opts.Model, contract)
 	if ctx.Err() != nil {
 		return result, ctx.Err()
 	}
@@ -469,6 +472,10 @@ func validEphemeralOptions(opts EphemeralTurnOptions) bool {
 // The catalog is public package metadata, not a private instruction file. The
 // trusted caller keeps this exact read-only resource for the daemon lifetime.
 func validEphemeralCatalog(path, model string) bool {
+	return validEphemeralCatalogForContract(path, model, ephemeralStrict)
+}
+
+func validEphemeralCatalogForContract(path, model string, contract ephemeralContract) bool {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return false
 	}
@@ -490,11 +497,16 @@ func validEphemeralCatalog(path, model string) bool {
 		return false
 	}
 	digest := sha256.Sum256(content)
-	expected := ephemeralCatalogHash
-	if model == "gpt-6-luna" {
-		expected = ephemeralLunaCatalogHash
+	hash := hex.EncodeToString(digest[:])
+	switch model {
+	case "gpt-5.5":
+		return contract == ephemeralStrict && hash == ephemeralCatalogHash
+	case "gpt-6-luna":
+		return (contract == ephemeralStrict || contract == ephemeralPrompted) &&
+			(hash == ephemeralLunaCatalogHash || (contract == ephemeralPrompted && hash == ephemeralLuna0172CatalogHash))
+	default:
+		return false
 	}
-	return hex.EncodeToString(digest[:]) == expected
 }
 
 func privateEphemeralPath(path string, directory bool) bool {
