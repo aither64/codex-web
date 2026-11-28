@@ -821,15 +821,16 @@ type Client struct {
 	pageRebuildBytes  uint64
 	pageRebuildTime   time.Duration
 
-	ensureMu       sync.Mutex
-	connectionMu   sync.Mutex
-	connection     *websocket.Conn
-	generation     uint64
-	ready          uint64
-	closed         bool
-	observerFrozen bool // connectionMu; irreversible for this client
-	writeMu        contextMutex
-	nextID         atomic.Uint64
+	ensureMu         sync.Mutex
+	connectionMu     sync.Mutex
+	connection       *websocket.Conn
+	connectionAccept string // connectionMu; validated downstream handshake
+	generation       uint64
+	ready            uint64
+	closed           bool
+	observerFrozen   bool // connectionMu; irreversible for this client
+	writeMu          contextMutex
+	nextID           atomic.Uint64
 
 	pendingMu         sync.Mutex
 	pending           map[uint64]pendingCall
@@ -875,6 +876,9 @@ type ClientInfo struct {
 type ClientOptions struct {
 	// DeliveryObserver receives stage timings without input or instruction text.
 	DeliveryObserver func(DeliveryEvent)
+	// ObserveRequest observes allocated RPCs. Callbacks must be bounded,
+	// memory-only and must not wait, perform I/O or call the client.
+	ObserveRequest func(context.Context, RequestObservation)
 	// HistoryReader optionally isolates history I/O; its owner must close it.
 	HistoryReader         HistoryReader
 	ClientInfo            ClientInfo
@@ -1022,7 +1026,7 @@ func (c *Client) Ensure(ctx context.Context) error {
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", c.socket)
 	}}
-	connection, _, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{
+	connection, response, err := websocket.Dial(ctx, "ws://localhost/", &websocket.DialOptions{
 		HTTPClient: &http.Client{Transport: transport},
 	})
 	if err != nil {
@@ -1036,6 +1040,9 @@ func (c *Client) Ensure(ctx context.Context) error {
 	c.generation++
 	generation := c.generation
 	c.connection = connection
+	if c.options.ObserveRequest != nil && response != nil {
+		c.connectionAccept = response.Header.Get("Sec-WebSocket-Accept")
+	}
 	var reader *ephemeralReader
 	if c.ephemeral != nil {
 		reader = &ephemeralReader{connection: connection, generation: generation, done: make(chan struct{})}
@@ -1156,6 +1163,7 @@ func (c *Client) requestConnectedAdmission(ctx context.Context, expectedGenerati
 	}
 	connection := c.connection
 	generation := c.generation
+	accept := c.connectionAccept
 	ready := c.ready
 	var disconnected context.Context
 	if c.observer != nil {
@@ -1189,15 +1197,19 @@ func (c *Client) requestConnectedAdmission(ctx context.Context, expectedGenerati
 		defer cancel()
 		ctx = admitted
 	}
+	var observation *RequestObservation
+	if c.options.ObserveRequest != nil {
+		observation = &RequestObservation{WebSocketAccept: accept, Generation: generation, Method: method}
+	}
 	params, provider, err := c.lifecycleParams(ctx, method, params)
 	if err != nil {
 		return err
 	}
 	if provider == "" {
-		return c.requestOnAdmission(ctx, connection, generation, method, params, result, admit)
+		return c.requestOnAdmission(ctx, connection, generation, method, params, result, admit, observation)
 	}
 	var response json.RawMessage
-	if err := c.requestOnAdmission(ctx, connection, generation, method, params, &response, admit); err != nil {
+	if err := c.requestOnAdmission(ctx, connection, generation, method, params, &response, admit, observation); err != nil {
 		return err
 	}
 	var routing struct {
@@ -1223,12 +1235,19 @@ func (c *Client) requestOn(
 	params any,
 	result any,
 ) error {
-	return c.requestOnAdmission(ctx, connection, generation, method, params, result, nil)
+	return c.requestOnAdmission(ctx, connection, generation, method, params, result, nil, nil)
 }
 
-func (c *Client) requestOnAdmission(ctx context.Context, connection *websocket.Conn, generation uint64, method string, params any, result any, admit func() error) (requestErr error) {
+func (c *Client) requestOnAdmission(ctx context.Context, connection *websocket.Conn, generation uint64, method string, params any, result any, admit func() error, observation *RequestObservation) (requestErr error) {
 	started := time.Now()
-	defer func() { c.observeDelivery(ctx, "rpc:"+method, started, requestErr) }()
+	observed := false
+	defer func() {
+		c.observeDelivery(ctx, "rpc:"+method, started, requestErr)
+		if observed {
+			observation.Phase, observation.Failed = RequestFinished, requestErr != nil
+			c.options.ObserveRequest(ctx, *observation)
+		}
+	}()
 	id := c.nextID.Add(1)
 	responseChannel := make(chan response, 1)
 	watchThread := ""
@@ -1248,6 +1267,11 @@ func (c *Client) requestOnAdmission(ctx context.Context, connection *websocket.C
 	message, err := json.Marshal(map[string]any{"id": id, "method": method, "params": params})
 	if err != nil {
 		return err
+	}
+	if observation != nil {
+		observation.Phase, observation.RequestID = RequestStarted, id
+		observed = true
+		c.options.ObserveRequest(ctx, *observation)
 	}
 	if err := c.writeOfferAdmission(ctx, connection, generation, message, nil, admit); err != nil {
 		return err
@@ -1710,6 +1734,7 @@ func (c *Client) markDisconnected(connection *websocket.Conn, generation uint64,
 // cutoff. Both paths invalidate the same pending calls, prompts and settings.
 func (c *Client) detachConnectionLocked(generation uint64, cause error) {
 	c.connection = nil
+	c.connectionAccept = ""
 	c.ready = 0
 	if c.observer != nil && c.observer.cancelConnection != nil {
 		c.observer.cancelConnection()

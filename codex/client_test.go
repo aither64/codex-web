@@ -4740,7 +4740,7 @@ func handshake(connection *websocket.Conn) error {
 	return err
 }
 
-func serveUnixWebsocket(t *testing.T, handler func(*websocket.Conn) error) string {
+func serveUnixWebsocket(t *testing.T, handler func(*websocket.Conn) error, accepted ...func(*http.Request)) string {
 	t.Helper()
 	directory, err := os.MkdirTemp("/tmp", "wpc-")
 	if err != nil {
@@ -4760,6 +4760,9 @@ func serveUnixWebsocket(t *testing.T, handler func(*websocket.Conn) error) strin
 			return
 		}
 		connection.SetReadLimit(readLimit)
+		for _, observe := range accepted {
+			observe(r)
+		}
 		go func() {
 			if err := handler(connection); err != nil {
 				errorsChannel <- err

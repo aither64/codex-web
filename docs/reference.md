@@ -53,6 +53,33 @@ transport failure. A mutation still needs its durable outcome reconciliation.
 If a failed request races with caller cancellation, its error chain retains
 both causes. Cancellation alone does not establish whether input was sent.
 
+`ClientOptions.ObserveRequest` observes allocated RPCs through an optional
+`func(context.Context, RequestObservation)` callback. `RequestStarted` runs
+after pending registration and envelope encoding, before the first request
+write. Its paired `RequestFinished` runs after pending removal and the RPC
+delivery callback, before the RPC returns. `Failed` reports whether that RPC
+returned an error, including a decoding error; it does not cover later
+lifecycle validation. Initialization and failures before start produce no pair.
+
+Each observation carries the actual uint64 wire `RequestID`, method,
+connection `Generation` and validated downstream `WebSocketAccept` handshake
+value captured for that request's connection. Treat the handshake value as
+private correlation data. It provides neither authentication nor proof of
+native receipt. Missing metadata makes correlation unavailable without
+changing the request error. Reconnection cannot relabel an earlier request
+with the new connection. Observations expose no parameters, response bodies,
+raw errors, durations or thread IDs.
+
+The supplied context is the effective RPC context, with its values,
+cancellation and deadline preserved; observer-only admission may shorten it.
+Callbacks are synchronous and may run concurrently for different requests.
+They run outside the connection, pending and writer locks, although a
+higher-level operation may hold other locks. Keep callbacks bounded and
+memory-only: do not perform I/O, wait, call the client recursively or gate
+transport. Release retained context and observation references at finish.
+The client retains no completed events, and private ephemeral clients do not
+inherit this option. Omitting the option preserves existing behavior.
+
 `RPCErrorData(err)` returns a copy of native structured error data through wrapped
 errors, with a presence boolean. Missing data and non-RPC errors return false;
 explicit JSON `null` remains present. Decode only the fields needed by the
